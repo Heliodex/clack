@@ -1,6 +1,6 @@
 {
   "dimension": "md-convert",
-  "slack": {"kind": "slack-js", "source": "fffk convertMarkdown with nTS+, Yu2X and 4NfZ on quill-delta 5.1.0", "build": "not recorded", "captured": "2026-11-11 (commit 4242a86b)", "notes": "The document as mdDescribe draws it (one kind|runs line per line, a run's formats as {b,i,u,s,c,a=URL}) and the selection after Mod+Shift+F. A collapsed caret converts the whole message, a selection only itself. The node harness (scratch composer-2 mdharness.cjs) is gone from disk, so this snapshot can't be refreshed until it is rebuilt."},
+  "slack": {"kind": "slack-js", "source": "fffk convertMarkdown with nTS+, Yu2X and 4NfZ on quill-delta 5.1.0", "build": "build not recorded", "captured": "2026-11-11 (commit 4242a86b)", "notes": "The document as mdDescribe draws it (one kind|runs line per line, a run's formats as {b,i,u,s,c,a=URL}) and the selection after Mod+Shift+F. A collapsed caret converts the whole message, a selection only itself. The node harness (scratch composer-2 mdharness.cjs) is gone from disk, so this snapshot can't be refreshed until it is rebuilt."},
   "cases": [
     {"name": "bold", "in": {"text": "make *this* bold", "anchor": 16, "caret": 16}, "slack": {"doc": "para|make {b}this{/} bold", "lo": 14, "hi": 14}},
     {"name": "italic", "in": {"text": "an _italic_ word", "anchor": 16, "caret": 16}, "slack": {"doc": "para|an {i}italic{/} word", "lo": 14, "hi": 14}},

@@ -15,19 +15,32 @@ python3 -I tools/parity.py --refresh emoji-rank  # rerun Slack's side, rewrite i
 python3 -I tools/parity.py --from DIR            # read go test -json files instead of running go
 ```
 
-The default run is `go test -json -run <the registered tests>` over their packages, then a comparison. Slack's side is committed, so nothing on this path starts node or touches the network, and Go's test cache answers for packages you didn't change. Run it after each change and it tells you whether you drifted from Slack. It prints one line per dimension:
+The default run is `go test -json -run <the registered tests>` over their packages, then a comparison. Slack's side is committed, so nothing on this path starts node or touches the network, and Go's test cache answers for packages you didn't change. Run it after each change and it tells you whether you drifted from Slack. It prints one line per dimension. This is CI's run of 2026-11-14 (ci run 43644570005), cut a little:
 
 ```
-parity: 9 of 10 dimensions the same as Slack (1 with known divergences); 23 of 24 checks, ...
+parity: 9 of 10 dimensions the same as Slack (1 with known divergences); 23 of 24 checks, 116 of 118 itemised cases.
   Only what these checks compare: 19 of the 28 areas of Slack's client have no check at all. This is not a parity percentage.
 emoji-rank         DIVERGES (known)  2 of 3 checks same
     internal/acrank TestEmojiAutocompleteSlackOracle: diverges (known), 2 of 13 cases are known differences
-      tu cold fallback model: known difference: Clack's standard emoji set has the 8 Unicode 17 emoji ...
+      tu cold fallback model: known difference: Clack's standard emoji set has the 8 Unicode 17 emoji (ballet_dancer, ...
         row 25: Slack person_in_tuxedo, Clack hairy_creature
+      tu with turtle picks, fallback model: known difference: the same reason
+        row 25: Slack person_in_tuxedo, Clack hairy_creature
+emoji-list         same              3 checks (2 partial), 9 cases
+fuzzy-match        same              1 check, 8 cases
 markdown           same              2 checks, 81 cases
-...
-not covered: Composer: sending, editing, drafts and scheduling; Messages: ...; Threads; ...
+link-slugs         same              2 checks (2 partial)
+snippet-truncate   same              1 check
+invite-tokens      same              3 checks
+theme-hct          same              3 checks
+window-bounds      same              3 checks
+notifications      same              3 checks
+slug-display       same              1 check, 57 cases  [fake server, not counted]
+not covered: Composer: sending, editing, drafts and scheduling; Messages: rich text, Block Kit, attachments and unfurls; Threads; ...
+different on purpose: The Windows toast's layout (Karim, 2026-11-12)
 ```
+
+A check without subtests gives one result, so "3 checks" with no case count means three whole tests passed. That CI run took 66 seconds, building the eight packages with a cold cache. Go's test cache replays the results of packages whose inputs didn't change, so a rerun after editing one package rebuilds and reruns only that one, and naming dimensions narrows it further.
 
 On swiss `go test` is refused, so use CI. The `parity` job in `ci.yml` runs the runner's own tests, then the default run. Its job summary is the full report, and the `parity-report` artifact has the markdown and JSON. The job is report-only: `continue-on-error`, and the runner exits 0 when Clack differs from Slack. `--strict` exits 1 instead, for when the team wants it to gate merges.
 

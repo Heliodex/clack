@@ -1,6 +1,6 @@
 {
   "dimension": "fuzzy-similarity",
-  "slack": {"kind": "slack-js", "source": "PositionAwareFuzzyMatcher (j8FV)", "build": "not recorded", "captured": "2026-11-09 (commit 8d58a812)", "notes": "Compared to 1e-8."},
+  "slack": {"kind": "slack-js", "source": "PositionAwareFuzzyMatcher (j8FV)", "build": "build not recorded", "captured": "2026-11-09 (commit 8d58a812)", "notes": "Compared to 1e-8."},
   "cases": [
     {"name": "kar vs karim", "in": {"q": "kar", "name": "karim"}, "slack": 0.898877105},
     {"name": "kar vs akari", "in": {"q": "kar", "name": "akari"}, "slack": 0.466084425},

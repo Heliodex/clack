@@ -530,11 +530,15 @@ def plural(n, word):
     return f'{n} {word}' + ('s' if n != 1 else '')
 
 
-def case_lines(x, indent='      ', full=False):
-    """What a case that isn't the same as Slack says, in a few lines (full: whole values)."""
+def case_lines(x, indent='      ', full=False, same_why=None):
+    """What a case that isn't the same as Slack says, in a few lines (full: whole values; same_why: the
+    reason the case before gave, which isn't repeated)."""
     word = {'diverge': 'differs', 'fail': 'fails', 'known': 'known difference', 'pending': 'no Slack output yet',
             'skip': 'skipped', 'not-run': 'no result'}[x['status']]
-    lines = [f'{indent}{x["name"]}: {word}' + (f': {short(x["why"], 150)}' if x.get('why') else '')]
+    why = x.get('why') or ''
+    if why and why == same_why:
+        why = 'the same reason'
+    lines = [f'{indent}{x["name"]}: {word}' + (f': {why if full else short(why, 150)}' if why else '')]
     if 'slack' in x and 'clack' in x:
         fd = first_difference(x['slack'], x['clack'])
         limit = 100000 if full else 160
@@ -585,8 +589,8 @@ def blunt(r, limit=5):
                 continue
             lines.append(f'    {c["package"]} {c["test"]}: {WORD[c["status"]].lower()}, {c["why"]}')
             bad = [x for x in c['cases'] if x['status'] != 'match']
-            for x in bad[:limit]:
-                lines += case_lines(x)
+            for i, x in enumerate(bad[:limit]):
+                lines += case_lines(x, same_why=bad[i - 1].get('why') if i else None)
             if len(bad) > limit:
                 lines.append(f'      … {len(bad) - limit} more (--out DIR for the full report)')
             if not c['cases'] and c.get('output'):
