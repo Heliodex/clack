@@ -119,14 +119,17 @@ func TestAutocompleteEmojiCustomAlias(t *testing.T) {
 		{"tux", more, "tux", remote, []string{"tux", "man_in_tuxedo", "woman_in_tuxedo", "person_in_tuxedo"}},
 	}
 	now := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	// one subtest per case: tools/parity.py counts them (docs/PARITY.md)
 	for _, c := range cases {
-		x := epBuild(epStandard(), "google", c.custom)
-		o := acrank.Options{Source: acrank.SourceTexty, Limit: 25, Weights: c.w, Now: now,
-			Passthrough: true, DemotePassthrough: true, EmojiExactBoost: true, ExactNameGroup: "treatment_5"}
-		got := epMatchNames(epAutocomplete(x, 1, c.q, o))
-		if strings.Join(got, " ") != strings.Join(c.want, " ") {
-			t.Errorf("%s: :%s\n got  %v\n want %v", c.name, c.q, got, c.want)
-		}
+		t.Run(c.name, func(t *testing.T) {
+			x := epBuild(epStandard(), "google", c.custom)
+			o := acrank.Options{Source: acrank.SourceTexty, Limit: 25, Weights: c.w, Now: now,
+				Passthrough: true, DemotePassthrough: true, EmojiExactBoost: true, ExactNameGroup: "treatment_5"}
+			got := epMatchNames(epAutocomplete(x, 1, c.q, o))
+			if strings.Join(got, " ") != strings.Join(c.want, " ") {
+				t.Errorf("%s: :%s\n got  %v\n want %v", c.name, c.q, got, c.want)
+			}
+		})
 	}
 
 	// the alias row is its target: thumbs-up's image, a custom emoji, put
