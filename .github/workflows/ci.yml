@@ -92,6 +92,39 @@ jobs:
       - name: every test ran in some shard
         run: python3 .github/scripts/test-shard.py check "$RUNNER_TEMP"/shards/test-shard-*
 
+  # Report-only (docs/PARITY.md): tools/parity.py runs the Slack-parity
+  # tests (tools/parity_checks.json) against Slack's committed output and
+  # says per dimension whether Clack is the same as Slack, what no check
+  # covers, and every divergence; the report is the job summary and the
+  # parity-report artifact. It starts at once instead of waiting for the
+  # linux-test shards. continue-on-error: it never fails ci yet, and the
+  # runner exits 0 on divergences (--strict would gate).
+  parity:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gio deps
+        run: sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" update -qq && sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" install -y -qq $GIO_DEPS
+      - name: runner tests
+        run: python3 -I tools/parity_test.py
+      - name: parity
+        if: ${{ !cancelled() }}
+        run: python3 -I tools/parity.py --out "$RUNNER_TEMP/parity"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ !cancelled() }}
+        with:
+          name: parity-report
+          path: ${{ runner.temp }}/parity
+          if-no-files-found: ignore
+          retention-days: 30
+
   # Gio patches on the vendored gioui.org, Xvfb and Mesa's llvmpipe
   linux-gio:
     runs-on: ubuntu-latest
