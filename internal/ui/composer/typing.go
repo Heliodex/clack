@@ -30,6 +30,9 @@ type typingState struct {
 	m     map[string]map[string]typer // draftKey(ch, ts) -> user id -> typer
 	hosts map[Host]bool
 	timer *time.Timer
+	// app names the typers as the line draws (typers); nil: the names
+	// the events carried
+	app *core.App
 }
 
 var typingHubs struct {
@@ -49,7 +52,7 @@ func typingHub(a *core.App) *typingState {
 	if typingHubs.m == nil {
 		typingHubs.m = map[*core.App]*typingState{}
 	}
-	s := &typingState{m: map[string]map[string]typer{}}
+	s := &typingState{m: map[string]map[string]typer{}, app: a}
 	typingHubs.m[a] = s
 	evs, _ := a.Subscribe()
 	go func() {
@@ -214,7 +217,12 @@ func (s *typingState) names(ch, ts, self string) []string {
 }
 
 // typers returns the user ids and names of who is typing in ch/ts
-// (excluding self), sorted by name (ids in the same order).
+// (excluding self), sorted by name (ids in the same order). A person's
+// name is read from the store as the line draws, as MessagePaneInput maps
+// its typers through getMemberById on every render (cRQG): one core can't
+// name yet is "" (the unknown stub's name; the read asks for them, and
+// the line names them once they're in), never the event's id. An app's
+// assistant status keeps the name its event carried.
 func (s *typingState) typers(ch, ts, self string) (ids, names []string) {
 	if s == nil {
 		return nil, nil
@@ -229,8 +237,15 @@ func (s *typingState) typers(ch, ts, self string) (ids, names []string) {
 			continue
 		}
 		if id != self {
+			name := t.name
+			if s.app != nil && t.status == "" {
+				name = ""
+				if u, ok := s.app.User(id); ok {
+					name = u.Name
+				}
+			}
 			ids = append(ids, id)
-			names = append(names, t.name)
+			names = append(names, name)
 		}
 	}
 	if len(names) > 1 {
@@ -255,11 +270,20 @@ func (b byName) Swap(i, j int) {
 
 // typingLine is Slack's TypingNames text (notification_bar):
 // "<b>{name}</b> is typing", "<b>{name}</b> and <b>{other_name}</b> are
-// typing", "Several people are typing", with no trailing ellipsis.
+// typing", "Several people are typing", with no trailing ellipsis. names
+// are sorted (typers): a typer core can't name yet sorts first with
+// getMemberById's unknown stub's name "", so MessagePaneInput passes no
+// firstTyper and there's no line until users/info answers, never an id.
 func typingLine(names []string) string {
 	switch len(names) {
 	case 0:
 		return ""
+	case 1, 2:
+		if names[0] == "" {
+			return ""
+		}
+	}
+	switch len(names) {
 	case 1:
 		return names[0] + " is typing"
 	case 2:

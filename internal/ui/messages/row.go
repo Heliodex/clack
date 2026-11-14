@@ -174,6 +174,11 @@ type row struct {
 	crTip          popups.TipState
 	crTipText      string // the badge tooltip's text while hovered
 
+	// a sender core can't name yet, or at all (missing_member.go): what
+	// resolve found, and BaseMissingMember's tooltip (made when first drawn)
+	miss    core.MemberState
+	missBar *missingTipState
+
 	// what the header drew last frame (CSS may replace both)
 	compactBL  int         // the compact time's baseline, gutter-local (tests)
 	nameBL     int         // the sender line's baseline, column-local (tests)
@@ -408,7 +413,7 @@ func (r *row) resolve(rc *rowCtx) {
 	// picture, badge); m.Name/m.Avatar only name user-less senders
 	// (core/sender.go).
 	r.name, r.avatar, r.statusURL, r.bot = m.Name, m.Avatar, "", m.IsBot || (m.BotID != "" && m.User == "")
-	r.huddle = ""
+	r.huddle, r.miss = "", core.MemberKnown
 	if m.User != "" {
 		r.name, r.avatar = "", ""
 	}
@@ -447,8 +452,13 @@ func (r *row) resolve(rc *rowCtx) {
 			if u.IsBot {
 				r.bot = true
 			}
-		} // else the lookup asked for the member: an unknown member (its
-		// id) until users/info answers and "names" resolves the row again
+		} else {
+			// the lookup asked for the member: getMemberById's unknown stub
+			// (BaseMissingMember's bar, never the id) until users/info
+			// answers and "names" resolves the row again, or a member it
+			// didn't return
+			r.miss = rc.h.Core().MissingMember(m.User)
+		}
 	}
 	// plugins' member patches (patchSlice('members'): Nicknames…), as
 	// Slack's sender reads the member from the store; a message's own
@@ -456,19 +466,15 @@ func (r *row) resolve(rc *rowCtx) {
 	if memPatched && (m.Name == "" || m.Name == coreName) {
 		if mf, ok := t.MemberView(m.User); ok {
 			if mf.Name != "" {
-				r.name = mf.Name
+				r.name, r.miss = mf.Name, core.MemberKnown // a member the plugin's slice has
 			}
 			if mf.Avatar != "" {
 				r.avatar = mf.Avatar
 			}
 		}
 	}
-	if r.name == "" {
-		if m.User != "" {
-			r.name = m.User
-		} else {
-			r.name = "Unknown"
-		}
+	if r.name == "" && m.User == "" {
+		r.name = "Unknown"
 	}
 	// getMsgSenderEntity's huddle sender: the status line, no badge, no
 	// profile, no custom status (huddle_msg.go)
@@ -1666,6 +1672,11 @@ func (r *row) layoutSender(gtx layout.Context, _ slackc.Props) layout.Dimensions
 // layoutBaseSender is BaseMessageSender: the name button, APP badge and
 // status emoji. Returns the width drawn and the name's baseline.
 func (r *row) layoutBaseSender(gtx layout.Context, p slackc.Props) layout.Dimensions {
+	if miss := r.senderMiss(); miss != core.MemberKnown {
+		// BaseMissingMember in place of span.c-message__sender (its name,
+		// button, badge and status), never the id (missing_member.go)
+		return r.senderBar(gtx, miss)
+	}
 	rc := r.rc
 	c := rc.c
 	st := senderClass.EnterClass(gtx, 0, 0, slackc.ExtraClass(p))
@@ -3146,11 +3157,20 @@ func reactionTipLine(h Host, re *core.Reaction, selfID string, cut bool) string 
 			}
 			continue
 		}
-		n := id
+		n := id // no core (tests): the id
 		if app := h.Core(); app != nil {
-			if u, ok := app.User(id); ok && u.Name != "" {
+			// TooltipMemberName (NZA6): the member's name, or the subtler
+			// BaseMissingMember (flowTip's bar) for the unknown stub, which
+			// the lookup asked for ("names" brings the name), and for a
+			// member users/info didn't return; never the id
+			switch u, ok := app.User(id); {
+			case ok:
 				n = u.Name
-			} // else asked for (the lookup); the id until "names"
+			case app.MissingMember(id) == core.MemberNonExistent:
+				n = tipMissingGone
+			default:
+				n = tipMissing
+			}
 		}
 		names = append(names, n)
 	}

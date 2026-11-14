@@ -324,8 +324,16 @@ const (
 	itPad
 )
 
+// decoMissing and decoMissingGone are MissingText's bar for a user
+// mention whose member the store can't name (msgcard.go missingMember):
+// the unknown stub's filled one and a non-existent member's outlined one.
+const (
+	decoMissing     uint8 = 5
+	decoMissingGone uint8 = 6
+)
+
 type deco struct {
-	kind   uint8 // 1 pill, 2 code, 3 highlight
+	kind   uint8 // 1 pill, 2 code, 3 highlight, 4 colour swatch, decoMissing, decoMissingGone
 	bg     color.NRGBA
 	border color.NRGBA
 	padL   float32
@@ -645,8 +653,14 @@ func (l *lay) addSpans(spans []richtext.Span, fs *flowStyle) {
 			case richtext.Usergroup:
 				kind = tUsergroup
 			case richtext.User:
-				// the member as plugins present it (Nicknames)
-				txt = l.mentionText(sp.ID, txt)
+				// the member as plugins present it (Nicknames); one the
+				// store can't name is MemberSlug's BaseMissingMember, and
+				// RollupName's "" in a system message (Muted)
+				var miss MemberMiss
+				if txt, miss = l.mentionText(sp.ID, txt); miss != MemberLoaded && !l.opts.Muted {
+					l.missingMember(miss, k) // msgcard.go
+					continue
+				}
 			}
 			if l.opts.Muted && sp.Kind == richtext.User {
 				// System messages show member names as plain text that
@@ -1033,6 +1047,16 @@ func (l *lay) flow(x0, y0, maxW int, fs *flowStyle) (h, wmax int) {
 				cy := int(bl+0.5) - sw + l.dp(1)
 				rr = image.Rect(int(r.x+0.5), cy, int(r.x+0.5)+sw, cy+sw)
 				d.boxes = append(d.boxes, box{kind: bBorder, r: rr, radius: dc.radius, fill: dc.bg, stroke: dc.border, bw: l.dp(1), target: -1})
+			case decoMissing, decoMissingGone:
+				// MissingText's bar (missingMember): 8px tall, its bottom
+				// on the baseline, the non-existent one outlined
+				base := int(bl + 0.5)
+				rr = image.Rect(int(r.x+0.5), base-l.dp(8), int(x1+0.5), base)
+				bx := box{kind: bFill, r: rr, radius: dc.radius, fill: dc.bg, target: -1}
+				if dc.kind == decoMissingGone {
+					bx.kind, bx.stroke, bx.bw = bBorder, dc.border, max(1, l.dp(1))
+				}
+				d.boxes = append(d.boxes, bx)
 			case 2:
 				d.boxes = append(d.boxes, box{kind: bBorder, r: rr, radius: dc.radius, fill: dc.bg, stroke: dc.border, bw: l.dp(1), target: -1, part: dc.part})
 			default:

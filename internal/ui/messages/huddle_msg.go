@@ -145,17 +145,17 @@ func huddleStatus(app *core.App, room *richtext.HuddleRoom, self string, dm, mis
 }
 
 // memberName is eBtJ's name for a member: the display name, else the
-// full name.
+// full name; "" for the unknown stub and a non-existent member (their
+// profiles have no names), never the id. The row reads it again at
+// "names" (huddleInfo is cached per users generation).
 func memberName(app *core.App, id string) string {
 	if u, ok := app.User(id); ok {
 		if u.Name != "" {
 			return u.Name
 		}
-		if u.RealName != "" {
-			return u.RealName
-		}
+		return u.RealName
 	}
-	return id
+	return ""
 }
 
 func containsID(l []string, id string) bool {
