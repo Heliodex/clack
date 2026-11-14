@@ -67,6 +67,10 @@ type colors struct {
 	// input's placeholder (--dt_color-content-ter) and its border
 	// (--dt_color-otl-ter)
 	FindMuted, FindBorder color.NRGBA
+	// MissingText's bar for a member core can't name (missing_member.go):
+	// .c-missing_text--unknown's --dt_color-base-ter and --non-existent's
+	// rgb(--sk_foreground_low_solid) border
+	Missing, MissingLine color.NRGBA
 }
 
 var lightColors = colors{
@@ -95,6 +99,8 @@ var lightColors = colors{
 	ActiveThread: rgb(0xfffae0),
 
 	FindMuted: rgb(0x5e5d60), FindBorder: rgba(0x5e5d60, 0x21/255.0),
+
+	Missing: rgb(0xeaeaea), MissingLine: rgb(0xdddddd),
 }
 
 var darkColors = colors{
@@ -123,6 +129,8 @@ var darkColors = colors{
 	ActiveThread: rgb(0x2f1e00),
 
 	FindMuted: rgb(0x9a9b9e), FindBorder: rgba(0x797c81, 0x4d/255.0),
+
+	Missing: rgb(0x212428), MissingLine: rgb(0x35373b),
 }
 
 func colorsFor(th *theme.Theme) *colors {

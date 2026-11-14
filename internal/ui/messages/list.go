@@ -1438,7 +1438,7 @@ func tooltipBox(gtx layout.Context, th *theme.Theme, c *colors, tip slackc.Style
 	ts := cssText(tip, textStyle{size: 13, weight: theme.Bold, col: c.TooltipText, lineH: 16.25})
 	padX, padY := dp(gtx, 12), dp(gtx, 8)
 	m := op.Record(gtx.Ops)
-	td := flowTip(gtx, th, []tipRun{{st: ts, txt: txt}}, dp(gtx, 200)-2*padX)
+	td := flowTip(gtx, th, []tipRun{{st: ts, txt: txt}}, dp(gtx, 200)-2*padX, tipBars{})
 	call := m.Stop()
 	bw, bh := td.X+2*padX, td.Y+2*padY
 	pl := theme.PlaceTooltip(gtx, target, image.Pt(bw, bh), bounds, theme.BaseTooltip(gtx, theme.TipTop))
@@ -1908,11 +1908,14 @@ func (s *listState) groupEntry(h Host, idx []int) entry {
 			users = append(users, u)
 		}
 	}
+	// RollupName (quVX): "" for a member core can't name yet (the unknown
+	// stub; richview names the span once it's known), never the id
 	name := func(id string) string {
 		if app := h.Core(); app != nil {
-			if u, ok := app.User(id); ok && u.Name != "" {
+			if u, ok := app.User(id); ok {
 				return u.Name
 			}
+			return ""
 		}
 		return id
 	}

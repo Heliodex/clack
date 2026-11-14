@@ -27,6 +27,71 @@ import (
 // look their people up as they draw (store.User), mentions included
 // (msgNames, richview's MemberRead), and "names" draws them again.
 
+// What a view draws while it waits (Slack's client, the CDN build of
+// 2026-11-14, chunks read without a session):
+//
+//   - getMemberById (gIKW) hands back the UnknownFetchManager's stub for a
+//     member the store doesn't hold (makeUnknownMember, MA/Q: isUnknown,
+//     no display or real name), and a non-existent member once users/info
+//     didn't return the id (makeNonExistentMember). vrX/ tells them apart
+//     (isUnknownMember, isNonExistentMember).
+//   - BaseMessageSender (/OeL), MemberSlug (ld4x, a user mention),
+//     MemberLink (25Rg) and TooltipMemberName (NZA6, the reaction tip) draw
+//     BaseMissingMember (FToV) for both: MissingText's bar (sSUQ, medium:
+//     120px), "Loading…" or "Private user info" in its tooltip. The sender
+//     checks the stub before an override of the name ("Name hidden");
+//     a huddle message's and a custom response's senders are usernames
+//     (getMsgSenderEntity, 33X/), no member. MemberSlug draws a
+//     non-existent member whose id doesn't look like a member's
+//     (looksLikeMemberId) as "@id".
+//   - Names in text (getPrefCompliantMemberNameById, Emmo; RollupName,
+//     quVX, in system messages) are the stub's name: "".
+//
+// None of them shows the id, and all draw again when the fetch upserts the
+// member: Clack's "names" event.
+
+// MemberState is a member as getMemberById answers a view: in the store,
+// the unknown stub (users/info is due or running), or non-existent.
+type MemberState uint8
+
+const (
+	MemberKnown       MemberState = iota // in the store
+	MemberUnknown                        // the unknown stub: BaseMissingMember "Loading…"
+	MemberNonExistent                    // users/info didn't return it: "Private user info"
+)
+
+// MissingMember is the state of member id once User found no member for
+// it: non-existent when users/info said so, else the unknown stub (the
+// lookup that missed asked for it, and "names" follows the answer).
+func (a *App) MissingMember(id string) MemberState {
+	if a.S.Nonexistent(id) {
+		return MemberNonExistent
+	}
+	return MemberUnknown
+}
+
+// MemberStateOf is member id's state, read as getMemberById reads it (a
+// hit is an access, a miss is asked for).
+func (a *App) MemberStateOf(id string) MemberState {
+	if _, ok := a.S.User(id); ok {
+		return MemberKnown
+	}
+	return a.MissingMember(id)
+}
+
+// LooksLikeMemberID is Slack's looksLikeMemberId (5oKS): Slackbot and
+// Slack's fixed members (USLACKBOT, USEARCH, UCHANNELEXPERT, USLACK,
+// UTBD), or "U" or "W" and eight or more of A-Z0-9, an "@" before it
+// allowed. getMemberById fetches only ids that look like this; any other
+// is a non-existent member at once.
+func LooksLikeMemberID(id string) bool {
+	switch id {
+	case "USLACKBOT", "USEARCH", "UCHANNELEXPERT", "USLACK", "UTBD":
+		return true
+	}
+	return navMemberID.MatchString(id)
+}
+
 // msgNames is the resolver message docs are built with: a user mention
 // takes the member's name if the store holds it, without asking for a
 // missing one; the mention asks when a view draws it (richview
