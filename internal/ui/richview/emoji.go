@@ -1,8 +1,6 @@
 package richview
 
 import (
-	"encoding/json"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -12,65 +10,21 @@ import (
 // Unicode emoji inside plain text (mrkdwn text, button labels, attachment
 // text) are drawn as Slack's CDN emoji images, like the web client and the
 // theme's label renderer; Lato has no emoji glyphs and the system color
-// font isn't Slack's set.
+// font isn't Slack's set. Only the standard set in use's emoji are
+// (emoji.Native): with emoji_v17 off a Unicode 17 emoji stays text, as
+// Slack's getAllNativeEmoji doesn't find it.
 
 type emojiSeg struct {
 	text string // plain text run, or the emoji's original characters
 	stem string // non-empty for an emoji: CDN image stem
 }
 
+// splitCache holds splitEmoji's answers per standard set ([0] 16.0, [1]
+// 17.0: emoji.V17): a Unicode 17 emoji is an image only in the 17.0 set.
 var (
-	emojiOnce   sync.Once
-	emojiIndex  map[string]string // rune sequence without VS16 -> image stem
-	emojiMaxLen int
-	splitMu     sync.Mutex
-	splitCache  = map[string][]emojiSeg{}
+	splitMu    sync.Mutex
+	splitCache = [2]map[string][]emojiSeg{{}, {}}
 )
-
-func loadEmojiIndex() {
-	var f struct {
-		Emoji []struct {
-			I string            `json:"i"`
-			U string            `json:"u"`
-			S map[string]string `json:"s"`
-		} `json:"emoji"`
-	}
-	_ = json.Unmarshal(emoji.StandardData(), &f)
-	emojiIndex = make(map[string]string, len(f.Emoji)*3)
-	add := func(hexSeq, stem string) {
-		var b strings.Builder
-		n := 0
-		for _, p := range strings.Split(hexSeq, "-") {
-			v, err := strconv.ParseUint(p, 16, 32)
-			if err != nil {
-				return
-			}
-			if v == 0xFE0F {
-				continue
-			}
-			b.WriteRune(rune(v))
-			n++
-		}
-		if n == 0 {
-			return
-		}
-		if _, ok := emojiIndex[b.String()]; !ok {
-			emojiIndex[b.String()] = stem
-		}
-		if n > emojiMaxLen {
-			emojiMaxLen = n
-		}
-	}
-	for _, e := range f.Emoji {
-		add(e.I, e.I)
-		if e.U != "" {
-			add(e.U, e.I)
-		}
-		for _, img := range e.S {
-			add(img, img)
-		}
-	}
-}
 
 func mayStartEmoji(r rune) bool {
 	return r >= 0x203C || r == '#' || r == '*' || (r >= '0' && r <= '9') || r == 0xA9 || r == 0xAE
@@ -88,13 +42,17 @@ func splitEmoji(s string) []emojiSeg {
 	if !has {
 		return nil
 	}
+	v17, si := emoji.V17(), 0
+	if v17 {
+		si = 1
+	}
 	splitMu.Lock()
-	if segs, ok := splitCache[s]; ok {
+	if segs, ok := splitCache[si][s]; ok {
 		splitMu.Unlock()
 		return segs
 	}
 	splitMu.Unlock()
-	emojiOnce.Do(loadEmojiIndex)
+	emojiIndex, emojiMaxLen := emoji.NativeFor(v17)
 	rs := []rune(s)
 	var segs []emojiSeg
 	var txt strings.Builder
@@ -136,10 +94,10 @@ func splitEmoji(s string) []emojiSeg {
 		segs = append(segs, emojiSeg{text: txt.String()})
 	}
 	splitMu.Lock()
-	if len(splitCache) > 4096 {
-		splitCache = map[string][]emojiSeg{}
+	if len(splitCache[si]) > 4096 {
+		splitCache[si] = map[string][]emojiSeg{}
 	}
-	splitCache[s] = segs
+	splitCache[si][s] = segs
 	splitMu.Unlock()
 	return segs
 }

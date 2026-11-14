@@ -173,7 +173,7 @@ func (r *row) groupTip(h Host, k int, selfID string) groupTip {
 		}
 		gt.urls = append(gt.urls, url)
 	}
-	if multiSkinTone[g.name] {
+	if isMultiSkintone(g.name) {
 		one := rs[g.idx[0]]
 		one.Name, one.Users = g.name, groupUsers(rs, g)
 		gt.lines = []string{reactionTipLine(h, &one, selfID, false)}

@@ -129,6 +129,17 @@ letter substrings score 2, but it is off for Hack Club.
   (thumbs-up), tuba, tube, tuff, tuna, tunk, stu, then tulip.
   `emoji_ac_test.go` and `emoji_slack_test.go` pin Slack's rows for
   synthetic custom sets.
+- **The standard set** (`emoji_v17`, client-boot 1PPX). Slack's ":" list,
+  like everything else that reads standard emoji, takes
+  getStandardEmojiData's table: `qU6j` with `emoji_v17` on, `IYuW`
+  without. Karim's account isn't in the experiment (2026-11-14), so the
+  eight Unicode 17 emoji (ballet_dancer, distorted_face, fight_cloud,
+  hairy_creature, landslide, orca, treasure_chest, trombone) never match,
+  and dancers and the wrestlers take no tone. Clack follows the group
+  (`emoji.V17`, set by core). Off, `:tu`'s row 25 with the fallback model
+  is person_in_tuxedo and `:orc` doesn't offer orca; on, hairy_creature
+  and orca take those places (the emoji-rank snapshot's `emoji_v17 on`
+  cases).
 - **List order.** The emoji are listed in `getConsolidatedEmoji` order
   (Ak7A), which the keyword file also stores. Two Inf scores compare as
   NaN in the sorter (`a.score − b.score`), and the sort treats NaN as a
@@ -223,8 +234,9 @@ wrap, Esc closes.
 
 ## Known gaps
 
-- **emoji_v17.** Clack's table has the 8 emoji that Slack only lists with
-  `emoji_v17` on (off for Karim), such as `hairy_creature` and `trombone`.
+- **skin-tone-2…6.** Slack's standard set lists the five tone swatches as
+  emoji in both of its tables (`:skin` offers them); Clack's table has no
+  rows for them. `emoji_v17` doesn't gate them.
 - **The exact-name lift rules** (J3WV,
   `search_autocomplete_promote_exact_name_matches` treatment_3 or
   treatment_5). Not ported. I didn't read the experiment's value for Karim.

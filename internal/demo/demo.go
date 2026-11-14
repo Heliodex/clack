@@ -134,7 +134,7 @@ func (s *Session) Fetch(ctx context.Context, raw string) ([]byte, error) {
 	if strings.HasPrefix(raw, s.FS.URL) {
 		return s.FS.Fetch(ctx, raw)
 	}
-	if strings.HasPrefix(raw, emoji.CDN) {
+	if _, std := emoji.TrimCDN(raw); std {
 		if b, ok := StandardEmoji(raw); ok {
 			return b, nil
 		}

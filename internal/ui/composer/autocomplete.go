@@ -850,16 +850,19 @@ var emojiShared struct {
 	sync.Mutex
 	idx  *emojiIndex
 	nCus int
+	v17  bool // the standard set it was built from (emoji.V17)
 }
 
 // sharedEmojiIndex returns the process-wide index, rebuilding it when the
-// custom emoji set changed size. Composers share it.
+// custom emoji set changed size or the standard set changed. Composers
+// share it.
 func sharedEmojiIndex(custom map[string]string) *emojiIndex {
 	emojiShared.Lock()
 	defer emojiShared.Unlock()
-	if emojiShared.idx == nil || emojiShared.nCus != len(custom) {
-		emojiShared.idx = buildEmojiIndex(emoji.StandardData(), custom)
+	if v := emoji.V17(); emojiShared.idx == nil || emojiShared.nCus != len(custom) || emojiShared.v17 != v {
+		emojiShared.idx = buildEmojiIndex(emoji.StandardDataFor(v), custom)
 		emojiShared.nCus = len(custom)
+		emojiShared.v17 = v
 	}
 	return emojiShared.idx
 }

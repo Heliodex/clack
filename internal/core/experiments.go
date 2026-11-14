@@ -45,6 +45,7 @@ func (a *App) setExperimentAssignments(as map[string]slack.ExperimentAssignment)
 	a.expLive = true
 	a.recomputeExperimentsLocked()
 	a.mu.Unlock()
+	a.followEmojiSet()
 	a.emit(Event{Type: "experiments"})
 	a.refreshTempMutes() // temp_mute decides what a temporary mute does
 }
@@ -73,6 +74,7 @@ func (a *App) installCachedExperiments() {
 	a.expServer = as
 	a.recomputeExperimentsLocked()
 	a.mu.Unlock()
+	a.followEmojiSet()
 	a.emit(Event{Type: "experiments"})
 	a.refreshTempMutes()
 }
@@ -199,6 +201,7 @@ func (a *App) SetExperimentGroups(groups map[string]*string) {
 	}
 	a.mu.Unlock()
 	if changed {
+		a.followEmojiSet()
 		a.emit(Event{Type: "experiments"})
 		a.recentsAfterExperiments()
 		a.refreshTempMutes()
@@ -342,6 +345,8 @@ var experimentReads = map[string][]string{
 	// prefs, status, focus, notifications, emoji picker
 	"emoji_skin_tone_picker_improvement": on, "focus_mode_custom_duration": {"treatment"},
 	"defer_notification_3p_streaming": on,
+	// the standard emoji set everything reads (emoji_set.go)
+	ExpEmojiV17: on,
 	// desktop notifications (ui/notify.go, huddleui/invite.go): Slack's
 	// notification ids and groups, translated buttons, an invite's Decline
 	"desktop_notification_actions": on,

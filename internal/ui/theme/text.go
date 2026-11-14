@@ -1,7 +1,6 @@
 package theme
 
 import (
-	"encoding/json"
 	"image"
 	"image/color"
 	"os"
@@ -530,60 +529,14 @@ type segment struct {
 	emoji string // image stem when this segment is an emoji
 }
 
+// splitCache holds splitEmoji's answers per standard set ([0] 16.0, [1]
+// 17.0: emoji.V17). Only the set in use's emoji are images
+// (emoji.Native): with emoji_v17 off a Unicode 17 emoji stays text, as
+// Slack's getAllNativeEmoji doesn't find it.
 var (
-	emojiOnce   sync.Once
-	emojiIndex  map[string]string // runes without VS16, as a string -> image stem
-	emojiMaxLen int
-
 	splitMu    sync.Mutex
-	splitCache = map[string][]segment{}
+	splitCache = [2]map[string][]segment{{}, {}}
 )
-
-func loadEmojiIndex() {
-	var f struct {
-		Emoji []struct {
-			I string            `json:"i"`
-			U string            `json:"u"`
-			S map[string]string `json:"s"`
-		} `json:"emoji"`
-	}
-	_ = json.Unmarshal(emoji.StandardData(), &f)
-	emojiIndex = make(map[string]string, len(f.Emoji)*3)
-	add := func(hexSeq, stem string) {
-		var b strings.Builder
-		n := 0
-		for _, p := range strings.Split(hexSeq, "-") {
-			v, err := strconv.ParseUint(p, 16, 32)
-			if err != nil {
-				return
-			}
-			if v == 0xFE0F {
-				continue
-			}
-			b.WriteRune(rune(v))
-			n++
-		}
-		if n == 0 {
-			return
-		}
-		k := b.String()
-		if _, ok := emojiIndex[k]; !ok {
-			emojiIndex[k] = stem
-		}
-		if n > emojiMaxLen {
-			emojiMaxLen = n
-		}
-	}
-	for _, e := range f.Emoji {
-		add(e.I, e.I)
-		if e.U != "" {
-			add(e.U, e.I)
-		}
-		for _, img := range e.S {
-			add(img, img)
-		}
-	}
-}
 
 // mayStartEmoji is a cheap pre-filter.
 func mayStartEmoji(r rune) bool {
@@ -594,11 +547,16 @@ func mayStartEmoji(r rune) bool {
 // at rs[i] (VS16 ignored) and the index just past it, or "" when none
 // starts there.
 func matchEmoji(rs []rune, i int) (stem string, end int) {
+	idx, maxLen := emoji.Native()
+	return matchEmojiIn(idx, maxLen, rs, i)
+}
+
+// matchEmojiIn is matchEmoji over one set's characters (emoji.NativeFor).
+func matchEmojiIn(emojiIndex map[string]string, emojiMaxLen int, rs []rune, i int) (stem string, end int) {
 	r := rs[i]
 	if !mayStartEmoji(r) || !(r >= 0x203C || (i+1 < len(rs) && (rs[i+1] == 0xFE0F || rs[i+1] == 0x20E3))) {
 		return "", 0
 	}
-	emojiOnce.Do(loadEmojiIndex)
 	var kb [16]rune
 	key := kb[:0]
 	for j := i; j < len(rs) && len(key) < emojiMaxLen; j++ {
@@ -630,20 +588,24 @@ func splitEmoji(s string) []segment {
 	if !has {
 		return nil
 	}
+	v17, si := emoji.V17(), 0
+	if v17 {
+		si = 1
+	}
 	splitMu.Lock()
-	if segs, ok := splitCache[s]; ok {
+	if segs, ok := splitCache[si][s]; ok {
 		splitMu.Unlock()
 		return segs
 	}
 	splitMu.Unlock()
-	emojiOnce.Do(loadEmojiIndex)
+	idx, maxLen := emoji.NativeFor(v17)
 	rs := []rune(s)
 	var segs []segment
 	var txt strings.Builder
 	found := false
 	for i := 0; i < len(rs); {
 		r := rs[i]
-		if best, bestEnd := matchEmoji(rs, i); best != "" {
+		if best, bestEnd := matchEmojiIn(idx, maxLen, rs, i); best != "" {
 			if txt.Len() > 0 {
 				segs = append(segs, segment{text: txt.String()})
 				txt.Reset()
@@ -662,10 +624,10 @@ func splitEmoji(s string) []segment {
 		segs = append(segs, segment{text: txt.String()})
 	}
 	splitMu.Lock()
-	if len(splitCache) > 4096 {
-		splitCache = map[string][]segment{}
+	if len(splitCache[si]) > 4096 {
+		splitCache[si] = map[string][]segment{}
 	}
-	splitCache[s] = segs
+	splitCache[si][s] = segs
 	splitMu.Unlock()
 	return segs
 }

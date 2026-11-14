@@ -805,6 +805,8 @@ def refresh_emoji_rank(cases, tmp):
             with open(f, 'w', encoding='utf-8') as fh:
                 json.dump(emoji_frecency(c['in']['frecency']), fh)
             argv.append(f)
+        # groups over Karim's assignments: emoji_v17 on runs Slack's 17.0 table
+        argv += [f'--exp={k}={v}' for k, v in sorted((c['in'].get('experiments') or {}).items())]
         p = subprocess.run(argv, cwd=os.path.dirname(oracle), capture_output=True, text=True, timeout=300)
         rows = None
         for line in reversed(p.stdout.splitlines()):

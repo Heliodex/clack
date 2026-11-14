@@ -167,6 +167,7 @@ func New(c *slack.Client, s *store.Store) *App {
 	s.SetMembersOnline(a.membersOnline)
 	appsByStore.Store(s, a)
 	store.ExperimentGroup = experimentForStore
+	a.followEmojiSet() // the defaults' set until the account's groups are in
 	return a
 }
 

@@ -102,10 +102,11 @@ var (
 // (emoji.StandardURL) locally: the demo is offline, so the common ones
 // have simple drawings of their own and everything else a neutral face.
 func StandardEmoji(raw string) ([]byte, bool) {
-	if !strings.HasPrefix(raw, emoji.CDN) {
+	rest, ok := emoji.TrimCDN(raw)
+	if !ok {
 		return nil, false
 	}
-	_, file, ok := strings.Cut(strings.TrimPrefix(raw, emoji.CDN), "/")
+	_, file, ok := strings.Cut(rest, "/")
 	if !ok || !strings.HasSuffix(file, ".png") {
 		return nil, false
 	}

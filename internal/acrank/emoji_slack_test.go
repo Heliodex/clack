@@ -23,14 +23,15 @@ import (
 // features, 94aK LinearModel, X46X fallback, J3WV rules,
 // boostExactMatches) and the AutocompleteFeatures defaults (1Fxd), with
 // Karim's experiments of 2026-11-14 (emoji_v17 off, emoji_exact_match_
-// boost on), at 2026-11-14 12:00 UTC. The candidates are Clack's set
-// (standard.json.gz) in Slack's consolidated order with Slack's English
-// keywords (52eK). The standard set's rows are a parity snapshot
-// (testdata/parity/emoji-rank.json, docs/PARITY.md) taken on Slack's own
-// set, which lacks the 8 Unicode 17 emoji Clack's has (emoji_v17 is off
-// for Karim): with the fallback model hairy_creature takes ":tu"'s row
-// 25 in Clack, so those two cases are known divergences. The custom
-// emoji cases below are still inline.
+// boost on), at 2026-11-14 12:00 UTC. The candidates are Clack's standard
+// set in use (emoji.StandardData: the 16.0 set, without the eight Unicode
+// 17 emoji, for an account without emoji_v17) in Slack's consolidated
+// order with Slack's English keywords (52eK). The standard set's rows are
+// a parity snapshot (testdata/parity/emoji-rank.json, docs/PARITY.md)
+// taken on Slack's own set; a case whose "experiments" turn emoji_v17 on
+// is ranked over Clack's 17.0 set and Slack's (qU6j), where hairy_creature
+// takes ":tu"'s row 25 with the fallback model and orca leads ":orc". The
+// custom emoji cases below are still inline.
 //
 // ":tu" never offers +1/thumbsup in Slack: a query under 3 letters may
 // skip no letters (scoreEmojiNameAgainstQuery), "thumbsup" has an "h"
@@ -41,9 +42,13 @@ import (
 var tSlackNow = time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
 
 // slackEmojiCands is popups.AutocompleteEmoji's candidate list without
-// its prefilters: every standard emoji in Slack's order, ids "E"+unicode,
-// keywords normalized.
-func slackEmojiCands(t *testing.T) []Cand {
+// its prefilters: every standard emoji of the set in use in Slack's
+// order, ids "E"+unicode, keywords normalized.
+func slackEmojiCands(t *testing.T) []Cand { return slackEmojiCandsFor(t, emoji.V17()) }
+
+// slackEmojiCandsFor is slackEmojiCands over the 17.0 set (v17) or the
+// 16.0 one.
+func slackEmojiCandsFor(t *testing.T, v17 bool) []Cand {
 	t.Helper()
 	var f struct {
 		Emoji []struct {
@@ -51,7 +56,7 @@ func slackEmojiCands(t *testing.T) []Cand {
 			Image string   `json:"i"`
 		} `json:"emoji"`
 	}
-	if err := json.Unmarshal(emoji.StandardData(), &f); err != nil {
+	if err := json.Unmarshal(emoji.StandardDataFor(v17), &f); err != nil {
 		t.Fatal(err)
 	}
 	type row struct {
@@ -84,11 +89,24 @@ func slackEmojiCands(t *testing.T) []Cand {
 
 // emojiRankIn is a case's input in testdata/parity/emoji-rank.json: the
 // query, the model ("remote": the search.autocomplete.model weights in
-// testdata; "fallback": FallbackWeights) and the frecency pref, if any.
+// testdata; "fallback": FallbackWeights), the frecency pref, if any, and
+// experiment groups over Karim's (only emoji_v17, which picks the
+// standard set; the harness takes them as --exp).
 type emojiRankIn struct {
-	Q        string         `json:"q"`
-	Model    string         `json:"model"`
-	Frecency []emojiRankUse `json:"frecency,omitempty"`
+	Q           string            `json:"q"`
+	Model       string            `json:"model"`
+	Frecency    []emojiRankUse    `json:"frecency,omitempty"`
+	Experiments map[string]string `json:"experiments,omitempty"`
+}
+
+// v17 reports whether the case's groups turn emoji_v17 on.
+func (in emojiRankIn) v17(t *testing.T) bool {
+	for k := range in.Experiments {
+		if k != "emoji_v17" {
+			t.Fatalf("experiment %s: the Go side only knows emoji_v17", k)
+		}
+	}
+	return in.Experiments["emoji_v17"] == "on"
 }
 
 // emojiRankUse is a frecency record: its key, the emoji's id, the count
@@ -130,12 +148,13 @@ func frecencyOf(t *testing.T, uses []emojiRankUse) *frecency.Cache {
 // --refresh emoji-rank` runs the harness again). "sh" has 135 matches:
 // frecency sorts before the model's cut to 75.
 func TestEmojiAutocompleteSlackOracle(t *testing.T) {
-	cands := slackEmojiCands(t)
-	if len(cands) < 1900 {
-		t.Fatalf("standard set: %d emoji", len(cands))
+	sets := map[bool][]Cand{false: slackEmojiCandsFor(t, false), true: slackEmojiCandsFor(t, true)}
+	if len(sets[false]) < 1900 || len(sets[true]) != len(sets[false])+8 {
+		t.Fatalf("standard sets: %d emoji, %d with emoji_v17", len(sets[false]), len(sets[true]))
 	}
 	remote := remoteWeights(t)
 	rank := func(t *testing.T, in emojiRankIn) []Result {
+		cands := sets[in.v17(t)]
 		w := remote
 		switch in.Model {
 		case "remote":
@@ -150,7 +169,7 @@ func TestEmojiAutocompleteSlackOracle(t *testing.T) {
 	s := paritytest.Load[emojiRankIn, []string](t, "testdata/parity/emoji-rank.json")
 	s.Run(t, paritytest.Check[emojiRankIn, []string]{
 		Clack: func(t *testing.T, in emojiRankIn) []string {
-			got := names(cands, rank(t, in))
+			got := names(sets[in.v17(t)], rank(t, in))
 			if in.Q == "tu" && (idx(got, "+1") >= 0 || idx(got, "thumbsup") >= 0) {
 				t.Errorf("Slack never offers +1 for :tu: %v", got)
 			}

@@ -139,15 +139,27 @@ func skinToneModifiable(name string) bool {
 }
 
 // multiSkinTone are the standard emoji whose skin tones are per person
-// (multiSkinTone in Slack's emoji data, client-boot IYuW): ReactionTip
-// shows one line for all of their tones.
-var multiSkinTone = map[string]bool{
-	"man-heart-man": true, "man-kiss-man": true, "woman-heart-man": true, "woman-heart-woman": true,
-	"woman-kiss-man": true, "woman-kiss-woman": true, "man_and_woman_holding_hands": true,
-	"two_men_holding_hands": true, "two_women_holding_hands": true, "couplekiss": true,
-	"couple_with_heart": true, "handshake": true, "people_holding_hands": true,
-	"women-with-bunny-ears-partying": true, "men-with-bunny-ears-partying": true, "dancers": true,
-	"woman-wrestling": true, "man-wrestling": true, "wrestlers": true,
+// (multiSkinTone in Slack's emoji data): client-boot IYuW's thirteen,
+// and with emoji_v17 on (qU6j) multiSkinTone17's six too, the emoji
+// Unicode 17 gave tones to. ReactionTip shows one line for all of their
+// tones (isMultiSkintone).
+var (
+	multiSkinTone = map[string]bool{
+		"man-heart-man": true, "man-kiss-man": true, "woman-heart-man": true, "woman-heart-woman": true,
+		"woman-kiss-man": true, "woman-kiss-woman": true, "man_and_woman_holding_hands": true,
+		"two_men_holding_hands": true, "two_women_holding_hands": true, "couplekiss": true,
+		"couple_with_heart": true, "handshake": true, "people_holding_hands": true,
+	}
+	multiSkinTone17 = map[string]bool{
+		"women-with-bunny-ears-partying": true, "men-with-bunny-ears-partying": true, "dancers": true,
+		"woman-wrestling": true, "man-wrestling": true, "wrestlers": true,
+	}
+)
+
+// isMultiSkintone is isMultiSkintoneCapable (Ak7A) in the standard set in
+// use (emoji.V17).
+func isMultiSkintone(name string) bool {
+	return multiSkinTone[name] || emoji.V17() && multiSkinTone17[name]
 }
 
 // toggleTargets is changeReactionFromUserAction for the pill's toggle

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/some-du6e/clack/internal/emoji"
 	"github.com/some-du6e/clack/internal/slack"
 )
 
@@ -838,6 +839,16 @@ func richEmoji(r Resolver, e *bk) Span {
 	name := e.Name
 	if e.SkinTone >= 2 && e.SkinTone <= 6 {
 		name += "::skin-tone-" + strconv.Itoa(e.SkinTone)
+	}
+	// Slack's Emoji component (vbPY) names an element's emoji from its
+	// unicode (getEmojiNameFromUnicodeString). A unicode the standard set
+	// in use doesn't list (a Unicode 17 emoji or tone with emoji_v17 off)
+	// gets no name, so Slack draws the characters (renderUnicodeAsEmoji),
+	// never the CDN image or a custom emoji that shares the name.
+	if emoji.Hidden(e.Unicode) {
+		if t := unicodeText(e.Unicode); t != "" {
+			return Span{Kind: Emoji, Text: t, ID: name}
+		}
 	}
 	if sp, ok := emojiSpan(r, name); ok {
 		return sp

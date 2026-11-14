@@ -93,6 +93,42 @@ item id and by the normalized text typed before the pick. Emoji ids are
 - Quick reactions "use frequently used" take the first three of the same
   list.
 
+## Which emoji (emoji_v17)
+
+Slack has two standard emoji sets, and the `emoji_v17` experiment picks
+one (client-boot `1PPX`, build bbd3a8c1f7bb6f10). The picker's groups are
+getTranslatedEmojiCategories (boot-shared `bEcp`): getStandardEmojiCategories'
+table (`52eK`: `6tVA` with the experiment on, `7Kvt` without) without its
+"Skin Tones" group, each group's emoji exactly as the table lists them.
+Search and the ":" list go over getStandardEmojiData's table (`qU6j` on,
+`IYuW` off). Images come from the CDN's 17.0 directories with it on and
+16.0 without (getEmojiVersion, `Ak7A`).
+
+- Off (Karim's account, 2026-11-14): no ballet_dancer, distorted_face,
+  fight_cloud, hairy_creature, landslide, orca, treasure_chest or
+  trombone anywhere, dancers and the three wrestlers have no tones, and
+  Objects has trumpet after musical_keyboard and coin after moneybag.
+  Smileys & People holds 503 emoji. A workspace's custom emoji with one
+  of those names (a custom `orca`) is a custom emoji then, in Custom.
+- On: the eight are in their groups (orca after dolphin, trombone after
+  trumpet, which moves up after saxophone, treasure_chest after
+  moneybag, which coin now precedes), and Smileys & People holds 507.
+- Either way, a standard emoji in no group is found only by search and
+  the ":" list: shrug, the gender-neutral people (person_frowning, bow,
+  face_palm, the neutral runner, surfer, swimmer…), 52 of them.
+- A received emoji whose unicode the set doesn't list (a Unicode 17 emoji
+  sent from an account with the experiment on) is drawn as its
+  characters (the Emoji component's renderUnicodeAsEmoji), not as the
+  CDN image or a custom emoji of the same name. A `:orca:` typed as text
+  is a custom `orca` when the workspace has one, else text.
+
+Clack follows the group: core calls `emoji.SetV17` whenever the
+experiments change, `internal/emoji` derives the 16.0 table from its
+17.0 one (`set.go`), and `categories.json.gz` is Slack's two category
+tables. Tests: `internal/emoji` `TestEmojiV17Sets`,
+`TestCategoriesFollowSet`; `internal/ui/popups` `TestEmojiV17PickerAndList`;
+`internal/ui/composer` `TestAutocompleteSlackEmojiV17`.
+
 ## Look
 
 - Card 361×518, radius 6. Background `rgb(var(--sk_primary_background))`
