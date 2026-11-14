@@ -40,7 +40,7 @@ not covered: Composer: sending, editing, drafts and scheduling; Messages: rich t
 different on purpose: The Windows toast's layout (Karim, 2026-11-12)
 ```
 
-A check without subtests gives one result, so "3 checks" with no case count means three whole tests passed. That CI run took 66 seconds, building the eight packages with a cold cache. Go's test cache replays the results of packages whose inputs didn't change, so a rerun after editing one package rebuilds and reruns only that one, and naming dimensions narrows it further.
+A check without subtests gives one result, so "3 checks" with no case count means three whole tests passed. That CI run took 66 seconds, building the eight packages with a cold cache; the next one (ci run 43645423249), with setup-go's cache warm, took 8.6 seconds. Go's test cache replays the results of packages whose inputs didn't change, so a rerun after editing one package rebuilds and reruns only that one, and naming dimensions narrows it further.
 
 On swiss `go test` is refused, so use CI. The `parity` job in `ci.yml` runs the runner's own tests, then the default run. Its job summary is the full report, and the `parity-report` artifact has the markdown and JSON. The job is report-only: `continue-on-error`, and the runner exits 0 when Clack differs from Slack. `--strict` exits 1 instead, for when the team wants it to gate merges.
 
@@ -54,7 +54,7 @@ Checks marked `partial` compare part of Slack's output, for example an element's
 
 Slack's side is frozen. Each snapshot and registry entry names the Slack build and the date its values were captured, and a match means Clack does what that build did on those inputs. Slack may have moved since.
 
-Coverage is listed, not summarised. The registry lists the 28 areas of Slack's client that Clack implements. The report names every area with no check, and for areas with checks it says what isn't compared there. It also lists the comparisons that run in other workflows and that this runner doesn't collect yet (`icon-shots`, `font-shots`, `compact-shots`, `activity-shots`, `threads-audit`, `emoji-picker`), and the differences Clack keeps on purpose.
+Coverage is listed, not summarised. The registry lists the 28 areas of Slack's client that Clack implements, each with its manual audit doc if `score.py` counts one (`audit`) and other notes (`docs`). The report names every area with no check, and for areas with checks it says what isn't compared there. It also lists the comparisons that run in other workflows and that this runner doesn't collect yet (`icon-shots`, `font-shots`, `compact-shots`, `activity-shots`, `threads-audit`, `emoji-picker`), and the differences Clack keeps on purpose.
 
 ## Snapshots and `--refresh`
 

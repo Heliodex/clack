@@ -118,6 +118,20 @@ class ParityTests(unittest.TestCase):
                     if case.get('known'):
                         self.assertIsNotNone(case.get('slack'), case['name'])
 
+    def test_area_docs_exist_and_audits_are_scored(self):
+        reg = parity.load_registry()
+        with open(os.path.join(parity.ROOT, 'docs', 'gaps', 'score.py'), encoding='utf-8') as f:
+            score = f.read()
+        for a in reg['areas']:
+            for key in ('audit', 'docs'):
+                if a.get(key):
+                    self.assertTrue(os.path.exists(os.path.join(parity.ROOT, a[key])), a[key])
+            if a.get('audit'):
+                stem = os.path.basename(a['audit'])[:-3]
+                # the report calls it "manual audit (score.py)": score.py must read it
+                self.assertTrue(f"'{stem[:-6]}'" in score if stem.endswith('-AUDIT') else a['audit'] in score,
+                                f'{a["id"]}: score.py does not read {a["audit"]}; put it under "docs"')
+
     def test_validate_finds_mistakes(self):
         repo = FakeRepo(CASES)
         try:

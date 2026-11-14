@@ -618,6 +618,12 @@ def slack_text(o):
     return ', '.join(parts)
 
 
+def area_docs(a):
+    """An area's docs: the manual audit score.py counts, and other notes."""
+    out = [f'manual audit `{a["audit"]}` (score.py)'] if a.get('audit') else []
+    return out + ([f'notes `{a["docs"]}`'] if a.get('docs') else [])
+
+
 MD_WORD = {'match': 'same', 'diverge': '**DIVERGES**', 'fail': '**FAILS**', 'known': '**DIVERGES (known)**',
            'not-run': '**NOT MEASURED**'}
 
@@ -675,8 +681,9 @@ def markdown(r, unregistered=None):
         a = areas[d['area']]
         tier = '' if d['tier'] == 'product' else ' Fake-server check: it measures a test double, not Clack, ' \
                                                  'so it is not in the totals.'
+        docs = area_docs(a)
         out += [f'### {d["id"]}: {MD_WORD[d["status"]]}', '',
-                f'{d["what"]} Area: {a["name"]}.{tier}', '',
+                f'{d["what"]} Area: {a["name"]}' + (f' ({"; ".join(docs)})' if docs else '') + f'.{tier}', '',
                 '| Test | Result | Cases | Compares | Slack side |', '|---|---|---|---|---|']
         for c in d['checks']:
             what = c['compares'] + (' Partial: compares part of the output.' if c['partial'] else '')
@@ -697,8 +704,7 @@ def markdown(r, unregistered=None):
     for aid in r['uncovered_areas']:
         a = areas[aid]
         notes = []
-        if a.get('audit'):
-            notes.append(f'manual audit `{a["audit"]}`')
+        notes += area_docs(a)
         extra = [e['workflow'] for e in r['elsewhere'] if e['area'] == aid]
         if extra:
             notes.append('a comparison in ' + ', '.join(f'`{w}`' for w in extra))
