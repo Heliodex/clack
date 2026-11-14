@@ -1317,8 +1317,8 @@ func (f *Files) card(gtx C, it *fileItem, first, last bool) D {
 
 func (f *Files) fileMeta(it *fileItem) string {
 	parts := make([]string, 0, 3)
-	if it.User != "" {
-		parts = append(parts, f.userName(it.User))
+	if n := f.userName(it.User); n != "" { // "" until the store can name them, never the id
+		parts = append(parts, n)
 	}
 	if t := unixTime(fileUpdated(it)); !t.IsZero() {
 		switch l := i18n.Locale(); {

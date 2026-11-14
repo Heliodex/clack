@@ -59,6 +59,7 @@ type pal struct {
 	Badge       color.NRGBA
 	Presence    color.NRGBA
 	Skel        color.NRGBA
+	MissingLine color.NRGBA // MissingText's --non-existent outline (1px rgb(--sk_foreground_low_solid))
 	Focus       color.NRGBA // focus ring
 	Chip        color.NRGBA // filter chip background
 	ChipSel     color.NRGBA
@@ -111,6 +112,7 @@ var lightPal = pal{
 	Badge:       rgb(0x83388a),
 	Presence:    rgb(0x2bac76),
 	Skel:        rgb(0xeaeaea),
+	MissingLine: rgb(0xdddddd),
 	Focus:       argb(0x4d1d9bd1),
 	Chip:        argb(0x0f454447),
 	ChipSel:     rgb(0xe3f8ff),
@@ -165,6 +167,7 @@ var darkPal = pal{
 	Badge:       rgb(0xcfa1de), // theme-base-imp (aubergine-70)
 	Presence:    rgb(0x2bac76),
 	Skel:        rgb(0x212428), // base-ter
+	MissingLine: rgb(0x35373b), // foreground_low_solid
 	Focus:       argb(0x4d2ba5ce),
 	Chip:        argb(0x14f8f8f8),
 	ChipSel:     rgb(0x001a2d), // base-hgl-1
@@ -322,6 +325,9 @@ type base struct {
 	addBtns map[string]*widget.Clickable
 	// pv caches Activity's preview documents (activity_rows.go)
 	pv map[string]pvEntry
+	// rec, while a row is described (recording), notes the members it
+	// drew without a name (missing_member.go)
+	rec *[]string
 }
 
 func newBase(h Host) base { return base{h: h, rich: richCache{}} }

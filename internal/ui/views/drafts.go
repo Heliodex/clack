@@ -1800,7 +1800,7 @@ func (d *Drafts) destOf(ch string, users []string, threadTS string, refs map[str
 				dst.avatars = append(dst.avatars, u.Avatar)
 			}
 		}
-		dst.name = strings.Join(names, ", ")
+		dst.name = joinNamed(names) // a member the store can't name yet is left out, never their id
 	default:
 		dst.glyph, dst.name = "hash", nsDrafts.T("Draft")
 	}
@@ -1938,7 +1938,7 @@ func (d *Drafts) draftCard(gtx C, dr *core.Draft, scheduled bool) D {
 	if scheduled {
 		when = draftsSendText(unixTime(dr.DateScheduled))
 	}
-	prev := oneLine(richtext.PlainText(dr.Doc))
+	prev := oneLine(d.plainText(dr.Doc)) // its mentions read as it draws (adapt.go)
 	if prev == "" && dr.Files > 0 {
 		prev = draftFilesLine(dr)
 	}

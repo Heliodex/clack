@@ -134,7 +134,7 @@ func (b *base) viewsPatched() bool {
 }
 
 // preview is the one-line preview of m as plugins present it.
-func (b *base) preview(m *core.Message) string { return preview(b.viewMsg(m)) }
+func (b *base) preview(m *core.Message) string { return previewWith(b.viewMsg(m), b.plainText) }
 
 // ---- thunks (taut.Dispatch; Slack's argument shapes) ----
 

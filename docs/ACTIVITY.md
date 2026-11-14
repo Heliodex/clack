@@ -147,6 +147,18 @@ Connect Invitation" before the invite loads); "Slack" for system alerts;
 (`ReactionSender`): the reactor, "{name} +{n}" when other people reacted
 too; threads (`ThreadSender`): the reply's author, "+{n}" for the root's
 other participants (not you, not Slackbot); "Slackbot"; else the person.
+A sender the store can't name yet (getMemberById's unknown stub while
+users/info runs) or one it didn't return is `BaseMissingMember` with no
+type, so its default "unknown": MissingText's filled 120×8 bar on the
+name's line and "Loading…", never the id. `ReactionSender` draws it while
+the reactor's name is "" (no "+{n}"), `ThreadSender` while any other
+participant's is (getPrefCompliantMemberNameById, else getBotNameById); an
+external invite's inviter without a name is blank next to the team
+(`BaseInviteSenderName`). A group DM's destination is
+getMpimDisplayNameAlphabetical: the members the store can name, sorted
+(QJub), the rest left out. The row is described again on the "names"
+event that lists a member it drew without a name
+(`internal/ui/views/missing_member.go`; `TestActivityUnknownMembersNeverIDs`).
 
 **Body** (w4rX `ActivityRowContentDetails`): the message (2 lines Detailed,
 1 Dense) with "You: " when you wrote it; reactions (QTZf `ReactionContent`): "Reacted {emoji} to:" (Detailed) or

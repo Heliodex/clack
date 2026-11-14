@@ -30,44 +30,76 @@ func (b *base) icon(gtx C, name string, size unit.Dp, col color.NRGBA) D {
 // body draws a document as plain text (for docs without a message key,
 // e.g. drafts) clipped to maxLines (0 = all). Prefer msgBody for messages.
 func (b *base) body(gtx C, doc richtext.Doc, fallback string, maxLines int) D {
-	t := richtext.PlainText(doc)
+	t := b.plainText(doc)
 	if strings.TrimSpace(t) == "" {
 		t = fallback
 	}
 	return b.para(gtx, 15, 22, wReg, b.p.Text, maxLines, t)
 }
 
-// preview returns a one-line plain-text preview of a message.
-func preview(m *core.Message) string {
+// preview returns a one-line plain-text preview of a message (b.preview
+// reads its mentions as it draws).
+func preview(m *core.Message) string { return previewWith(m, richtext.PlainText) }
+
+func previewWith(m *core.Message, plain func(richtext.Doc) string) string {
 	if m == nil {
 		return ""
 	}
-	t := oneLine(richtext.PlainText(m.Doc))
+	t := oneLine(plain(m.Doc))
 	if t == "" {
 		t = oneLine(m.Text)
 	}
 	return t
 }
 
+// plainText is richtext.PlainText with each user mention read from the
+// store as it's drawn, as Slack's MemberSlug reads its member on render
+// (richview's MemberRead): "@name", nothing for a member the store can't
+// name yet (BaseMissingMember's bar adds no text; the lookup asks, and
+// "names" draws it again), never the "@U…" the doc was built with. An id
+// that isn't a member's keeps the parsed text, as MemberSlug draws it.
+func (b *base) plainText(d richtext.Doc) string { return richtext.PlainTextWith(d, b.mentionText) }
+
+func (b *base) mentionText(s richtext.Span) (string, bool) {
+	if s.Kind != richtext.User || !core.LooksLikeMemberID(s.ID) {
+		return "", false
+	}
+	if n := b.userName(s.ID); n != "" {
+		return "@" + strings.TrimPrefix(n, "@"), true
+	}
+	return "", true
+}
+
 // ---- core lookups ----
 
+// user is getMemberById: the member if the store holds it (a miss is
+// asked for; "names" follows the answer). A miss while a row is
+// described is noted (missing_member.go) when users/info hasn't answered
+// for the id yet.
 func (b *base) user(id string) (core.User, bool) {
 	if id == "" {
 		return core.User{}, false
 	}
-	u, ok := b.h.Core().User(id)
+	c := b.h.Core()
+	u, ok := c.User(id)
 	if ok {
 		u = b.viewUser(u)
+	} else if b.rec != nil && core.LooksLikeMemberID(id) && c.MissingMember(id) == core.MemberUnknown {
+		b.noteWait(id)
 	}
 	return u, ok
 }
 
-// userName is the display name Slack shows (display name, else real name).
+// userName is the display name Slack shows (display name, else real
+// name): getPrefCompliantMemberNameById, "" for a member the store can't
+// name (the unknown stub while users/info runs, or a non-existent one),
+// never the id. Where a name goes, the surfaces draw Slack's placeholder
+// for "" (missing_member.go).
 func (b *base) userName(id string) string {
 	if u, ok := b.user(id); ok {
 		return displayName(u)
 	}
-	return id
+	return ""
 }
 
 func displayName(u core.User) string {
@@ -147,7 +179,10 @@ func (b *base) refTitle(r core.ConvRef) string {
 // isDMKind reports whether a conversation kind is a direct message.
 func isDMKind(kind string) bool { return kind == "im" || kind == "mpim" }
 
-// groupNames lists group-DM members other than the viewer.
+// groupNames is getMpimDisplayNameAlphabetical (W+Ke Bp): the names of
+// the group DM's members other than the viewer, sorted as QJub sorts
+// them; a member the store can't name yet is left out (the stub's name
+// is "": its lookup asked for it, and "names" draws the title again).
 func (b *base) groupNames(members []string) string {
 	self := b.selfID()
 	var names []string
@@ -155,8 +190,11 @@ func (b *base) groupNames(members []string) string {
 		if id == self {
 			continue
 		}
-		names = append(names, b.userName(id))
+		if n := b.userName(id); n != "" {
+			names = append(names, n)
+		}
 	}
+	sortNames(names)
 	return strings.Join(names, ", ")
 }
 

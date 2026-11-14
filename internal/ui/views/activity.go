@@ -134,6 +134,9 @@ type actDesc struct {
 	typeIcon  string // Dense: the 20px type icon after the status
 	list      *actListBody
 	nameDense string // the sender in Dense rows ("Ana +2")
+	// nameBlank: an empty name is blank, not BaseMissingMember's bar
+	// (BaseInviteSenderName names an inviter the store can't name "")
+	nameBlank bool
 	team      string // a Slack Connect inviter's organisation, after the name
 	teamIcon  string // its icon (TeamIcon, 16px), in both densities
 	subtext   string // before the message body ("You: ", "Ana Example: ")
@@ -157,6 +160,11 @@ type actDesc struct {
 	invite bool
 	dm     bool
 	hay    string // lower-cased search haystack
+	// waits are the members (and bots) the row named without a name yet
+	// (missing_member.go): the sender's bar, a participant's, a group
+	// DM's member left out of its title. "names" listing one describes
+	// the row again (membersIn).
+	waits []string
 }
 
 type actRow struct {
@@ -197,6 +205,8 @@ type actRow struct {
 	// nameHov is Slack's ProfileHoverTrigger on a reaction row's reactor
 	// (ActivityItemMember in "X reacted to your message").
 	nameHov hovercard.Trigger
+	// missTip is the sender's BaseMissingMember tooltip (missing_member.go)
+	missTip missTip
 
 	// The read row's mark (actMark) and its tooltip; the Detailed
 	// reminder's Mark Complete button; the invite's text actions.
@@ -458,10 +468,17 @@ func (v *Activity) watchItems() {
 				// core looked a conversation up (LookupConv) or named
 				// channels in the background: the rows waiting for a
 				// channel's name read it again, as Slack's entities
-				// render again once the fetch upserts the channel
-				if actConvIDs(ev.Users) {
+				// render again once the fetch upserts the channel; the
+				// member fetcher's (and bots.info's) carry the people a
+				// row drew without a name (membersIn)
+				ids := ev.Users
+				if len(ids) > 0 {
+					conv := actConvIDs(ids)
 					v.notes.mu.Lock()
-					v.notes.fns = append(v.notes.fns, v.namesIn)
+					if conv {
+						v.notes.fns = append(v.notes.fns, v.namesIn)
+					}
+					v.notes.fns = append(v.notes.fns, func() { v.membersIn(ids) })
 					v.notes.mu.Unlock()
 					v.h.Invalidate()
 				}
@@ -516,6 +533,19 @@ func actConvIDs(ids []string) bool {
 func (v *Activity) namesIn() {
 	for _, r := range v.rows {
 		if r.built && r.d.entOn && r.d.ent.Loading() {
+			r.built = false
+			v.dirty = true
+		}
+	}
+}
+
+// membersIn describes again the rows that drew a member (or a bot) "names"
+// lists without a name (actDesc.waits), keeping their widgets: the store
+// has them now, or knows they don't exist, as Slack's rows render again
+// once the fetch upserts the member.
+func (v *Activity) membersIn(ids []string) {
+	for _, r := range v.rows {
+		if r.built && namesAny(r.d.waits, ids) {
 			r.built = false
 			v.dirty = true
 		}
@@ -1054,7 +1084,16 @@ func (v *Activity) isUnread(it *core.ActivityItem, key string) bool {
 	return it.Unread
 }
 
+// describe is the row's text for it, with the members it couldn't name
+// yet (waits): the row is described again when "names" lists one.
 func (v *Activity) describe(it *core.ActivityItem, refs map[string]core.ConvRef) actDesc {
+	var d actDesc
+	waits := v.recording(func() { d = v.describeItem(it, refs) })
+	d.waits = waits
+	return d
+}
+
+func (v *Activity) describeItem(it *core.ActivityItem, refs map[string]core.ConvRef) actDesc {
 	d := actDesc{at: tsTime(it.FeedTS), thread: actThread(it)}
 	d.when, d.whenNarrow = actWhen(time.Now(), d.at, false), actWhen(time.Now(), d.at, true) // activity_time.go
 	kind := ""
@@ -1104,10 +1143,11 @@ func (v *Activity) describe(it *core.ActivityItem, refs map[string]core.ConvRef)
 	if it.Actor != "" {
 		if u, ok := v.user(it.Actor); ok {
 			actor, actorAv = displayName(u), u.Avatar
-		} else if actor == "" {
-			actor = v.userName(it.Actor)
 		}
 	}
+	// the item has a person behind it, named or not yet (an actor the
+	// store can't name is "": the sender's bar)
+	hasActor := actor != "" || it.Actor != ""
 	if name == "" && actor != "" {
 		name, av = actor, actorAv
 	}
@@ -1155,16 +1195,21 @@ func (v *Activity) describe(it *core.ActivityItem, refs map[string]core.ConvRef)
 		}
 	case actExternal(it.Type):
 		// InviteSenderName: "{user} from {team}", else "Slack Connect
-		// Invitation"; ExternalInviteContent for the body.
-		d.name, d.avatar = firstNonEmpty(actor, i18n.T("slack_connect", "Slack Connect Invitation")), actorAv
-		if actor != "" {
+		// Invitation"; ExternalInviteContent for the body. The user is
+		// BaseInviteSenderName's getPrefCompliantMemberNameById, ""
+		// for an inviter the store can't name yet: blank, not the bar.
+		d.name, d.avatar = actor, actorAv
+		if !hasActor {
+			d.name = i18n.T("slack_connect", "Slack Connect Invitation")
+		} else {
+			d.nameBlank = actor == ""
 			d.team = it.Team
 			if it.Invite != nil {
 				d.teamIcon = it.Invite.TeamIcon
 			}
 		}
 		switch {
-		case it.InviteStatus == "revoked" || it.InviteStatus == "expired" || actor == "":
+		case it.InviteStatus == "revoked" || it.InviteStatus == "expired" || !hasActor:
 			body(nsActivity.T("You received an invitation that has been ignored, expired, or is no longer available for another reason."))
 		case it.Type == "external_dm_invite":
 			body(nsActivity.T("invited you to direct message"))
@@ -1176,7 +1221,7 @@ func (v *Activity) describe(it *core.ActivityItem, refs map[string]core.ConvRef)
 		d.tile = d.avatar == ""
 	case it.Type == "internal_channel_invite" || it.Type == "quietly_added_to_channel":
 		// InviteContent: the message text becomes "invited you to <#C>".
-		if it.Type == "quietly_added_to_channel" && actor != "" {
+		if it.Type == "quietly_added_to_channel" && hasActor {
 			d.name, d.avatar = actor, actorAv
 		}
 		// "invited you to <#{channelId}|{channelName}>": the channel
@@ -1191,7 +1236,7 @@ func (v *Activity) describe(it *core.ActivityItem, refs map[string]core.ConvRef)
 	case it.Type == "shared_workspace_invite":
 		body("")
 	case it.Type == "team_joiner_invite":
-		if actor != "" {
+		if hasActor {
 			d.name, d.avatar = actor, actorAv
 		}
 		if it.JoinerReminder {
@@ -1200,7 +1245,7 @@ func (v *Activity) describe(it *core.ActivityItem, refs map[string]core.ConvRef)
 			body(nsActivity.T("Accepted your invitation to join Slack \u2014\u00a0take a second to say hello."))
 		}
 	case it.Type == "prejoin_dm_welcome_party_alert":
-		if actor != "" {
+		if hasActor {
 			d.name, d.avatar = actor, actorAv
 		}
 		body(nsActivity.T("Was invited to join {teamName} \u2014 take a second to say hello.", "teamName", v.teamName()))
@@ -2037,6 +2082,13 @@ func (v *Activity) row(gtx C, it *core.ActivityItem, i int) D {
 			v.actMenuOpen(v.pointerAt(), *it, key, unread)
 		}
 	}
+	if r.built && len(r.d.waits) > 0 && v.waitOver(r.d.waits) {
+		// a member the row drew without a name is in the store now (or
+		// known not to exist) before a "names" said so, e.g. another
+		// view's fetch: describe it again (missing_member.go)
+		r.built = false
+		v.dirty = true
+	}
 	if v.dirty {
 		// A click above changed rows (or the pane) already drawn this
 		// frame: draw again.
@@ -2316,22 +2368,30 @@ func (r *actRow) nameText(gtx C, st slackc.Styled, blur bool) D {
 	if v.dense && r.cur.nameDense != "" {
 		name = r.cur.nameDense
 	}
-	if name == "" { // the sender isn't known yet: Slack's loading shimmer
-		return v.shimmerLine(gtx, 120)
-	}
 	if r.nameMax > 0 {
 		gtx.Constraints.Max.X = min(gtx.Constraints.Max.X, r.nameMax)
 	}
-	var d D
-	switch {
-	case blur:
-		return v.blurPara(gtx, size, 22, r.nameW, col, name)
-	case v.dense:
-		d = v.label(gtx, size, r.nameW, col, name)
-	default:
-		d = v.para(gtx, size, 22, r.nameW, col, 1, name)
+	line := func(gtx C, s string) D {
+		switch {
+		case blur:
+			return v.blurPara(gtx, size, 22, r.nameW, col, s)
+		case v.dense:
+			return v.label(gtx, size, r.nameW, col, s)
+		}
+		return v.para(gtx, size, 22, r.nameW, col, 1, s)
 	}
-	r.nameHov.Layout(gtx, r.reactor(), d.Size)
+	if name == "" {
+		if r.cur.nameBlank {
+			return line(gtx, "")
+		}
+		// no sender, or one the store can't name yet: BaseMissingMember
+		// (missing_member.go), its default type, on the name's line
+		return v.missingBar(gtx, false, &r.missTip, func(gtx C) D { return line(gtx, "") })
+	}
+	d := line(gtx, name)
+	if !blur {
+		r.nameHov.Layout(gtx, r.reactor(), d.Size)
+	}
 	return d
 }
 
