@@ -10,9 +10,11 @@ import io
 import json
 import os
 import re
+import sys
 import tempfile
 import unittest
 
+sys.dont_write_bytecode = True  # no tools/__pycache__ (-I ignores PYTHONDONTWRITEBYTECODE)
 HERE = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location('parity', os.path.join(HERE, 'parity.py'))
 parity = importlib.util.module_from_spec(spec)
