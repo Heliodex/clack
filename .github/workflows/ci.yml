@@ -92,6 +92,32 @@ jobs:
       - name: every test ran in some shard
         run: python3 .github/scripts/test-shard.py check "$RUNNER_TEMP"/shards/test-shard-*
 
+  # release.yml's test job, step for step: every package in one
+  # `go test` on a clean cache. The shards above split internal/ui
+  # across jobs, so none of them carries the whole suite's load, and
+  # timing races that only show under it (TestInspectKonami in α.82,
+  # TestFilesViewSectionsSidebar in α.83) passed ci and failed the
+  # tagged release. This fails the ui/main push instead. ui and main
+  # only (~18 min); a newer push to the same ref cancels the older run.
+  full-test:
+    if: github.ref == 'refs/heads/ui' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ci-full-test-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: false # as release.yml: a clean module/build cache
+      - name: gio deps
+        run: sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" update -qq && sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" install -y -qq $GIO_DEPS
+      - name: test
+        run: go test -timeout 30m ./...
+
   # Report-only (docs/PARITY.md): tools/parity.py runs the Slack-parity
   # tests (tools/parity_checks.json) against Slack's committed output and
   # says per dimension whether Clack is the same as Slack, what no check
