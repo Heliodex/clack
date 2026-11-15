@@ -30,6 +30,9 @@ var sidebarExperiments = map[string]string{
 	"fe_nav_first_apply_post_processing_rules": "treatment", "omni_date_quick_filters": "on",
 	"srp_card_explore": "on", "search_file_channel_messages": "on",
 	"work_objects_message_search_xp_v2": "on",
+	// an app DM's About tab is the About page (core/app_about.go)
+	"agent_about_page": "on", "flexpane_content_parity": "on", "revamp_agent_app_profile": "on",
+	"scope_app_install_reads_to_viewer_team": "on",
 	// work object cards (core/workobjects.go), as the account had them on 2026-11-10
 	"work_objects_rearrangement": "on", "work_objects_refresh_timestamp": "on", "wo_comment_sync_client_xp": "on",
 	"work_objects_embedded_preview": "on", "third_party_integrations_video_previews": "on",

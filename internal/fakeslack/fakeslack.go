@@ -1655,6 +1655,11 @@ func (s *Server) handle(method string, f url.Values, edge map[string]json.RawMes
 			return ok("app_profile", p)
 		}
 		return map[string]any{"ok": false, "error": "app_not_found"}
+	case "apps.about.info":
+		if p, found := s.appAboutInfo(f.Get("app_id")); found {
+			return p
+		}
+		return map[string]any{"ok": false, "error": "app_not_found"}
 	case "emoji.list":
 		return ok("emoji", s.emoji)
 	case "client.getWebSocketURL":

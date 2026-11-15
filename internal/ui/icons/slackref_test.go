@@ -112,6 +112,7 @@ var slackRef = map[string]string{
 	"edit":                        "edit",
 	"edit-filled":                 "edit-filled",
 	"email":                       "email",
+	"workspace":                   "workspace",
 	"email-filled":                "email-filled",
 	"emoji":                       "emoji",
 	"reaction":                    "reaction",
