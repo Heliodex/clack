@@ -404,6 +404,7 @@ type User struct {
 	AgentStatus       string  `json:"agent_status,omitempty"`      // not_an_agent | consistently_an_agent | check_required (bot users)
 	IsWorkflowBot     bool    `json:"is_workflow_bot,omitempty"`   // Workflow Builder's bot user: badged WORKFLOW
 	IsAgentforceBot   bool    `json:"is_agentforce_bot,omitempty"` // a Salesforce Agentforce agent: badged AGENTFORCE
+	IsSidekickBot     bool    `json:"is_sidekick_bot,omitempty"`   // 7jev isSidekickMember (bD9l keeps it out of Slack Connect channels)
 	Updated           int64   `json:"updated,omitempty"`
 	Profile           Profile `json:"profile"`
 	Presence          string  `json:"presence,omitempty"`

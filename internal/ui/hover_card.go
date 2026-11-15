@@ -317,6 +317,18 @@ func (h *profileHover) setPeek(p *slugPeek) {
 func (a *App) installAppCardHooks() {
 	popups.OpenAppAbout = func(uid string) { a.openAppTab(uid, "about") }
 	popups.OpenAppTab = a.openAppTab
+	// App details' primary action facts read the primary view (3QxE
+	// getPrimaryView): its conversation and an app DM's open tab
+	popups.CurrentView = func() (string, string) {
+		ch := a.router.Current().Channel()
+		if ch == "" {
+			return "", ""
+		}
+		if dm := blockkit.AppDMFor(a, ch); dm != nil {
+			return ch, dm.Tab()
+		}
+		return ch, ""
+	}
 	// ChannelHoverCardHuddleBadge is the sidebar suffix's badge (huddleui
 	// Badge), and a channel-tab slug opens the channel card where Slack's
 	// does (core.ChannelTabSlugCard)
