@@ -342,6 +342,9 @@ type Activity struct {
 	hideRead map[string]bool
 	notes    actNotes
 	patchOn  bool
+	// shown: whether the page or its peek drew in the latest frame; its
+	// realtime watcher redraws only then (watchItems)
+	shown    shownTracker
 	wmu      sync.Mutex      // serializes core activity writes
 	listsReq map[string]bool // lists asked for so list rows can name their item
 	// densityReq: the saved layout was asked for (activity.views);
@@ -449,19 +452,34 @@ func (v *Activity) watchItems() {
 	go func() {
 		for ev := range ch {
 			if ev.Type == "typing" || ev.Type == "message" {
-				// the status column's typing indicator (rZx3 z8)
-				if v.typing.apply(ev, v.h.Core().Self().ID) {
+				// the status column's typing indicator (rZx3 z8), for the
+				// rows on screen
+				if v.typing.apply(ev, v.h.Core().Self().ID) && v.shown.shown(v.h) {
 					v.h.Invalidate()
 				}
 				continue
 			}
+			// Off screen the page takes realtime changes for its next
+			// draw without drawing now, one pending pass of each kind
+			// however many come (a busy workspace's socket)
+			shown := v.shown.shown(v.h)
 			if ev.Type == "conv" {
 				// channel_updated: an agent session's status (the rows'
 				// agent status) may have changed
 				v.notes.mu.Lock()
-				v.notes.fns = append(v.notes.fns, func() { v.dirty = true })
+				if !v.notes.dirtyQueued {
+					v.notes.dirtyQueued = true
+					v.notes.fns = append(v.notes.fns, func() {
+						v.notes.mu.Lock()
+						v.notes.dirtyQueued = false
+						v.notes.mu.Unlock()
+						v.dirty = true
+					})
+				}
 				v.notes.mu.Unlock()
-				v.h.Invalidate()
+				if shown {
+					v.h.Invalidate()
+				}
 				continue
 			}
 			if ev.Type == "names" {
@@ -475,12 +493,37 @@ func (v *Activity) watchItems() {
 				if len(ids) > 0 {
 					conv := actConvIDs(ids)
 					v.notes.mu.Lock()
-					if conv {
-						v.notes.fns = append(v.notes.fns, v.namesIn)
+					if conv && !v.notes.namesQueued {
+						v.notes.namesQueued = true
+						v.notes.fns = append(v.notes.fns, func() {
+							v.notes.mu.Lock()
+							v.notes.namesQueued = false
+							v.notes.mu.Unlock()
+							v.namesIn()
+						})
 					}
-					v.notes.fns = append(v.notes.fns, func() { v.membersIn(ids) })
+					if v.notes.members == nil {
+						v.notes.members = map[string]bool{}
+					}
+					if len(v.notes.members) == 0 {
+						v.notes.fns = append(v.notes.fns, func() {
+							v.notes.mu.Lock()
+							ids := make([]string, 0, len(v.notes.members))
+							for id := range v.notes.members {
+								ids = append(ids, id)
+							}
+							clear(v.notes.members)
+							v.notes.mu.Unlock()
+							v.membersIn(ids)
+						})
+					}
+					for _, id := range ids {
+						v.notes.members[id] = true
+					}
 					v.notes.mu.Unlock()
-					v.h.Invalidate()
+					if shown {
+						v.h.Invalidate()
+					}
 				}
 				continue
 			}
@@ -585,6 +628,7 @@ func (v *Activity) applyPatches() {
 
 // Layout draws the view.
 func (v *Activity) Layout(gtx C) D {
+	v.shown.mark(v.h)
 	v.frame()
 	v.watchItems()
 	v.loadDensity()
@@ -2634,6 +2678,10 @@ type actNotes struct {
 	fns   []func()            // reverts of failed writes (Activity)
 	items []core.ActivityItem // realtime activity items (Activity)
 	gone  []string            // keys of realtime activity_deleted items
+	// the realtime watcher's pending passes (Activity): one each in fns
+	// however many events come before a draw
+	dirtyQueued, namesQueued bool
+	members                  map[string]bool // the people "names" named since the last draw
 }
 
 func (n *actNotes) add(h Host, s string) {

@@ -128,6 +128,11 @@ type Unreads struct {
 	evq     []core.Event
 	fetched []unrFetched
 	sub     bool
+	// shown: whether the view drew in the latest frame (the events'
+	// goroutine redraws only then); stale: the queue overflowed while it
+	// didn't, so the next Layout builds again instead of replaying it
+	shown shownTracker
+	stale bool
 
 	focused bool
 	active  int       // the keyboard's row (index into rows), -1: none
@@ -324,10 +329,17 @@ func (v *Unreads) subscribe() {
 		for ev := range ch {
 			switch ev.Type {
 			case "message", "update", "delete", "prefs", "marked":
+				shown := v.shown.shown(v.h)
 				v.mu.Lock()
-				v.evq = append(v.evq, ev)
+				if shown || len(v.evq) < unrQueueMax {
+					v.evq = append(v.evq, ev)
+				} else {
+					v.evq, v.stale = nil, true // let it go: the next Layout builds again
+				}
 				v.mu.Unlock()
-				v.h.Invalidate()
+				if shown {
+					v.h.Invalidate()
+				}
 			}
 		}
 	}()
@@ -623,10 +635,23 @@ func (v *Unreads) lastRead(ch string) string { return v.h.Core().Count(ch).LastR
 // ---- Layout ----
 
 // Layout draws the view.
+// unrQueueMax bounds the events queued while the view isn't on screen
+// (a busy workspace's messages, edits and marks): past it the queue goes
+// and the next Layout builds the view again.
+const unrQueueMax = 1024
+
 func (v *Unreads) Layout(gtx C) D {
+	v.shown.mark(v.h)
 	v.frame()
 	v.notes.drain(v.h)
 	v.subscribe()
+	v.mu.Lock()
+	stale := v.stale
+	v.stale = false
+	v.mu.Unlock()
+	if stale && v.built {
+		v.build()
+	}
 	if !v.built && v.known() {
 		v.build()
 	}

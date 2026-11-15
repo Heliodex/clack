@@ -61,11 +61,22 @@ import (
 	"sync"
 	"time"
 
+	"gioui.org/app"
+	"gioui.org/io/event"
+
+	"github.com/some-du6e/clack/internal/ui/idleprobe"
 	"github.com/some-du6e/clack/internal/ui/messages"
 	"github.com/some-du6e/clack/internal/ui/popups"
 )
 
 var perfDriveOnce sync.Once
+
+// perfRec records the idle stage's frames and who asked for them
+// (perfIdle); it walks no stacks outside a recording.
+var (
+	perfRec    *idleprobe.Recorder
+	perfRecApp *App
+)
 
 func init() {
 	prev := installHooks
@@ -77,7 +88,34 @@ func init() {
 		if dir == "" || a.win == nil { // the real window's Run only
 			return
 		}
-		perfDriveOnce.Do(func() { go perfDrive(a, dir) })
+		perfDriveOnce.Do(func() {
+			perfRec, perfRecApp = idleprobe.NewRecorder(), a
+			ev := a.opts.OnWindowEvent
+			a.opts.OnWindowEvent = func(e event.Event) {
+				if ev != nil {
+					ev(e)
+				}
+				if _, ok := e.(app.FrameEvent); ok {
+					perfRec.Frame()
+				}
+			}
+			prevInv := invalidateHook
+			invalidateHook = func(b *App) {
+				if prevInv != nil {
+					prevInv(b)
+				}
+				perfInvalidateHook(b)
+			}
+			go perfDrive(a, dir)
+		})
+	}
+}
+
+// perfInvalidateHook passes the driven window's Invalidates to perfRec
+// (idleprobe names the caller past this frame).
+func perfInvalidateHook(b *App) {
+	if b == perfRecApp {
+		perfRec.Invalidated()
 	}
 }
 
@@ -157,7 +195,7 @@ func perfDrive(a *App, dir string) {
 			perfChannels(a, logf)
 		case "idle":
 			perfOnUI(a, func() { a.Navigate("c/" + perfFirstChannel(a)) })
-			time.Sleep(perfDur("CLACK_PERF_IDLE", 10*time.Minute))
+			perfIdle(dir, perfDur("CLACK_PERF_IDLE", 10*time.Minute), logf)
 		case "gifs":
 			perfGIFs(a, logf)
 		case "gifs-left":
@@ -184,6 +222,41 @@ func perfDrive(a *App, dir string) {
 	}
 	_ = os.WriteFile(filepath.Join(dir, "done"), []byte("done\n"), 0o600)
 	logf("done")
+}
+
+// perfIdle leaves the client alone for d. Once the session's background
+// work has had a minute (a quarter of d at most), it records
+// CLACK_PERF_IDLE_REC (60 s) of the idle: the frames drawn and who asked
+// for each, every Invalidate and InvalidateCmd by caller, the process's
+// CPU and Go heap (idleprobe.Recorder) to <dir>/idle.frames.txt, and a
+// CPU profile of the same seconds to <dir>/idle.cpu.pprof.
+func perfIdle(dir string, d time.Duration, logf func(string, ...any)) {
+	t0 := time.Now()
+	wait := min(time.Minute, d/4)
+	rec := min(perfDur("CLACK_PERF_IDLE_REC", time.Minute), d-wait)
+	time.Sleep(wait)
+	if rec > 0 && perfRec != nil {
+		var prof *os.File
+		if f, err := os.Create(filepath.Join(dir, "idle.cpu.pprof")); err == nil {
+			if pprof.StartCPUProfile(f) == nil {
+				prof = f
+			} else {
+				f.Close()
+			}
+		}
+		perfRec.Start("idle")
+		time.Sleep(rec)
+		rep := perfRec.Stop()
+		if prof != nil {
+			pprof.StopCPUProfile()
+			prof.Close()
+		}
+		_ = os.WriteFile(filepath.Join(dir, "idle.frames.txt"), []byte(rep.String()), 0o600)
+		logf("%s", rep.Summary())
+	}
+	if rest := d - time.Since(t0); rest > 0 {
+		time.Sleep(rest)
+	}
 }
 
 // perfFirstChannel is the sidebar's first channel (fakeslack's

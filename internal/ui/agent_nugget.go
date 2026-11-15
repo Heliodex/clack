@@ -179,7 +179,7 @@ func (a *App) layoutAppThreadNugget(gtx layout.Context, ch, ts string) layout.Di
 		a.shimmerLine(gtx, ln, image.Pt(tx, gtx.Dp(8)+i*lh), lh, tw)
 	}
 	off.Pop()
-	gtx.Execute(op.InvalidateCmd{At: gtx.Now.Add(33 * time.Millisecond)})
+	indicatorFrame(gtx, 33*time.Millisecond)
 	return layout.Dimensions{Size: image.Pt(w, rowH)}
 }
 
@@ -302,5 +302,5 @@ func nuggetSpinner(gtx layout.Context, d int, arcCol, trackCol color.NRGBA) {
 	base := float32(-90.0/219.9*2*math.Pi) - float32(math.Pi/4)
 	arc(base+float32(2*math.Pi*ccBezier(.25, .29, .54, .86, t)), dash, arcCol)
 	arc(base+float32(2*math.Pi*ccBezier(.41, .24, .64, .69, t)), dash, arcCol)
-	gtx.Execute(op.InvalidateCmd{At: gtx.Now.Add(33 * time.Millisecond)})
+	indicatorFrame(gtx, 33*time.Millisecond)
 }

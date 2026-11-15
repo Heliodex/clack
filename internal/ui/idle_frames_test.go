@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"image"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"gioui.org/f32"
 	"gioui.org/io/key"
 	"gioui.org/io/pointer"
 	"gioui.org/widget"
@@ -102,15 +104,189 @@ func TestIdleFrames(t *testing.T) {
 			e.until("history", 20*time.Second, func() bool { return e.loadedMessages(ch) > 0 })
 			e.focusComposer(ch, "")
 			e.idle(t, p, "sidebar with unreads", true)
+			e.shutdown()
+
+			// the rail's and the sidebar's views, with their fixtures
+			sz = fakeslack.Small
+			sz.Views = true
+			sz.DMsTab = true
+			sz.Unreads = true
+			sz.ThreadHeader = true
+			e = newIdleEnv(t, sz, motion.override)
+			measured.Store(e.a)
+			ch = fakeslack.ThreadPublicID
+			e.openChannel(ch)
+			e.until("history", 20*time.Second, func() bool { return e.loadedMessages(ch) > 0 })
+			for _, page := range []string{"threads", "later", "dms", "files", "huddles", "unreads", "drafts", "saved"} {
+				e.a.Navigate(page)
+				e.frame()
+				e.idle(t, p, page, false)
+			}
+			e.a.Navigate("directories")
+			e.frame()
+			e.idle(t, p, "directories", true) // Slack focuses its search field
+			if motion.override >= 0 {
+				return // the rest with full motion only
+			}
+			e.shutdown()
+
+			// a pointer resting over the window: hover states (a row's
+			// background and actions, the sidebar's row, tooltips after
+			// their delays) settle, and nothing keeps animating
+			sz = fakeslack.Small
+			sz.Unread = 0
+			sz.ThreadHeader = true
+			e = newIdleEnv(t, sz, motion.override)
+			measured.Store(e.a)
+			ch = fakeslack.ThreadPublicID
+			e.openChannel(ch)
+			e.until("history", 20*time.Second, func() bool { return e.loadedMessages(ch) > 0 })
+			for _, at := range []struct {
+				name string
+				x, y float32
+			}{
+				{"pointer on the newest message", 900, 720},
+				{"pointer on the message list", 900, 400},
+				{"pointer on a sidebar row", 160, 260},
+				{"pointer on the channel header", 800, 64},
+				{"pointer on the top nav", 700, 18},
+				{"pointer on the rail", 34, 180},
+			} {
+				e.r.Queue(pointer.Event{Kind: pointer.Move, Source: pointer.Mouse, Position: f32.Pt(at.x, at.y)})
+				e.frame()
+				e.idle(t, p, at.name, true) // opening the channel focused its composer
+			}
+			e.r.Queue(pointer.Event{Kind: pointer.Leave, Source: pointer.Mouse, Position: f32.Pt(-1, -1)})
+			e.frame()
+
+			// a busy workspace's socket about nothing on screen: people
+			// Clack never drew changing their profiles and presence, new
+			// custom emoji, typing in another channel (Hack Club's stream
+			// while the client sits in one channel); ten events a second
+			other := ""
+			for _, id := range e.fs.ChannelIDs() {
+				if id != ch {
+					other = id
+					break
+				}
+			}
+			stop := make(chan struct{})
+			go func() {
+				select { // idle's settle
+				case <-time.After(2500 * time.Millisecond):
+				case <-stop:
+					return
+				}
+				tick := time.NewTicker(100 * time.Millisecond)
+				defer tick.Stop()
+				for i := 0; ; i++ {
+					select {
+					case <-stop:
+						return
+					case <-tick.C:
+					}
+					u := fmt.Sprintf("U0IDLETR%03d", i%40)
+					switch i % 4 {
+					case 0:
+						e.fs.Push(map[string]any{"type": "user_change", "user": map[string]any{"id": u, "name": "idle" + u, "real_name": "Idle " + u,
+							"profile": map[string]any{"display_name": "idle" + u, "status_emoji": ":wave:", "status_text": fmt.Sprintf("away %d", i)}}})
+					case 1:
+						pr := "active"
+						if i%8 == 1 {
+							pr = "away"
+						}
+						e.fs.Push(map[string]any{"type": "presence_change", "user": u, "presence": pr})
+					case 2:
+						e.fs.Push(map[string]any{"type": "emoji_changed", "subtype": "add", "name": fmt.Sprintf("idle-emoji-%d", i),
+							"value": "https://emoji.slack-edge.com/T0/idle/1.png", "event_ts": fmt.Sprintf("%d.000100", time.Now().Unix())})
+					case 3:
+						e.fs.Push(map[string]any{"type": "user_typing", "channel": other, "user": u})
+					}
+				}
+			}()
+			e.idle(t, p, "realtime events about nothing on screen", true)
+			close(stop)
+
+			// a huddle on in the open channel and in another (the header's
+			// button, the sidebar's Huddles link and rows)
+			if users := e.fs.GroupDMUsers(); len(users) >= 4 {
+				now := time.Now().Unix()
+				e.fs.PushHuddleRoom("sh_room_join", ch, "R0IDLE0001", []string{users[0].ID, users[1].ID, users[2].ID}, now-120, nil)
+				e.fs.PushHuddleRoom("sh_room_join", other, "R0IDLE0002", []string{users[3].ID}, now-60, nil)
+				hud := e.a.huddles()
+				e.untilSoft(10*time.Second, func() bool { _, on := hud.Live(ch); return on })
+				e.idle(t, p, "huddles on in the channel and another", true)
+			}
+			e.shutdown()
+
+			// every fixture gallery's messages laid out at once (a window
+			// tall enough for most of them): Block Kit, link previews,
+			// files, an agent's thread, work objects, workflows, pins, bot
+			// and app senders
+			sz = fakeslack.Small
+			sz.Unread = 0
+			sz.Gallery, sz.Embeds, sz.Files, sz.AgentThread = true, true, true, true
+			sz.WorkObjects, sz.Workflows, sz.PinsFolders, sz.Identity = true, true, true, true
+			e = newIdleEnv(t, sz, motion.override)
+			measured.Store(e.a)
+			e.size = image.Pt(1440, 4000)
+			for _, g := range []struct{ name, ch string }{
+				{"#blockkit-gallery", fakeslack.GalleryChannelID},
+				{"#embeds-gallery", fakeslack.EmbedsChannelID},
+				{"#files-gallery", fakeslack.FilesChannelID},
+				{"the agent's DM", fakeslack.AgentDMID},
+				{"#work-objects", fakeslack.WorkObjectsChannelID},
+				{"#workflows-gallery", fakeslack.WorkflowsChannelID},
+				{"#pins-gallery", fakeslack.PinsChannelID},
+				{"#identity-fixtures", fakeslack.IdentityChannelID},
+			} {
+				e.openChannel(g.ch)
+				if !e.untilSoft(20*time.Second, func() bool { return e.loadedMessages(g.ch) > 0 }) {
+					t.Logf("%s: no history loaded", g.name)
+				}
+				e.idle(t, p, g.name, true)
+			}
+			e.shutdown()
+
+			// a code channel whose agent works: the sidebar's dot is
+			// Slack's slow spinner, pulsing, which turns while the window
+			// is active and holds still in the background (indicatorFrame;
+			// it drew 30 frames a second there)
+			sz = fakeslack.Small
+			sz.Unread = 0
+			sz.CodeChannels = true
+			e = newIdleEnv(t, sz, motion.override)
+			measured.Store(e.a)
+			ch = e.fs.ChannelIDs()[0]
+			e.openChannel(ch)
+			e.untilSoft(20*time.Second, func() bool { return e.loadedMessages(ch) > 0 })
+			e.idle(t, p, "a working code channel in the sidebar", true, "ui.codeSpinner")
+			e.blur()
+			e.idle(t, p, "a working code channel in the sidebar, window in the background", false)
+			e.unblur()
 		})
 	}
 }
 
+// untilSoft runs frames until cond holds or d passes, and reports which.
+func (e *perfEnv) untilSoft(d time.Duration, cond func() bool) bool {
+	for dl := time.Now().Add(d); time.Now().Before(dl); time.Sleep(time.Millisecond) {
+		if cond() {
+			e.frame()
+			return true
+		}
+		e.frame()
+	}
+	return false
+}
+
 // idleOtherFrames is what a surface may draw in idleFor besides caret
-// blinks: a minute tick, with room for two more.
+// blinks: a minute tick, with room for two more. indicatorEvery is an
+// indicator's frame interval while the window is active (indicatorFrame).
 const (
 	idleFor         = 10 * time.Second
 	idleOtherFrames = 3
+	indicatorEvery  = 33 * time.Millisecond
 )
 
 // newIdleEnv is startEnv with live updates on and motion set (-1 full
@@ -203,8 +379,11 @@ func (e *perfEnv) idleFrame(now time.Time) {
 // idle settles the surface (loads, opening animations), then counts 10 s
 // of frames with no input and checks them against the budget. caret is
 // whether a text field has the focus (Slack focuses the composer when a
-// conversation opens).
-func (e *perfEnv) idle(t *testing.T, p *idleprobe.Probe, name string, caret bool) {
+// conversation opens). indicators name the callers of an indicator that
+// turns as long as its state holds (a working agent's spinner): their
+// frames count apart, at most one per indicatorEvery, and only in an
+// active window.
+func (e *perfEnv) idle(t *testing.T, p *idleprobe.Probe, name string, caret bool, indicators ...string) {
 	t.Helper()
 	e.settle(2 * time.Second)
 	// core's deferred boot loads (usergroups, client extras: a.later 5 s
@@ -215,7 +394,18 @@ func (e *perfEnv) idle(t *testing.T, p *idleprobe.Probe, name string, caret bool
 	res := p.Run(name, idleFor, &e.r, e.idleFrame)
 	res.Log(t)
 	blinks := res.CountMatching("Editor).Layout")
-	other := res.Count() - blinks
+	anim := 0
+	if len(indicators) > 0 {
+		anim = res.CountMatching(append([]string{"Editor).Layout"}, indicators...)...) - blinks
+	}
+	other := res.Count() - blinks - anim
+	maxAnim := 0
+	if e.a.focused && len(indicators) > 0 {
+		maxAnim = int(idleFor/indicatorEvery) + 2
+	}
+	if anim > maxAnim {
+		t.Errorf("%s: %d indicator frames in %v idle, want at most %d (focused window: %v)", name, anim, idleFor, maxAnim, e.a.focused)
+	}
 	maxBlinks := 0
 	if blink := widget.CaretBlinkInterval(); caret && e.a.focused && blink > 0 {
 		// 500 ms, or Windows' GetCaretBlinkTime once a window opened

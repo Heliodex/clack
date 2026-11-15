@@ -66,6 +66,10 @@ on:
         description: "scale jobs: both, linux or windows"
         required: false
         default: "both"
+      scale_script:
+        description: "scale jobs: the warm session's stages (CLACK_PERF_WARM_SCRIPT); empty = startup,picker,picker-all,scroll,channels,idle,gifs,gifs-left"
+        required: false
+        default: ""
 
 permissions:
   contents: write # perf-history branch
@@ -239,6 +243,7 @@ jobs:
         side: ${{ fromJSON(inputs.scale_base != '' && '["head","base"]' || '["head"]') }}
     env:
       CLACK_PERF_IDLE: ${{ inputs.scale_idle || '10m' }}
+      CLACK_PERF_WARM_SCRIPT: ${{ inputs.scale_script }}
       # llvmpipe draws a 1440x900 frame in about a second: the picker and
       # the long channels move twice as far a frame here as on Windows
       CLACK_PERF_PICKER_STEP: "16"
@@ -296,6 +301,10 @@ jobs:
           done
           cat scale-out/scale.md >> "$GITHUB_STEP_SUMMARY"
           cat scale-out/scale.md
+          # the idle stage's recorded minute (perfIdle): frames, who asked, CPU
+          w=scale-out/$SIDE/scale/warm
+          [ -f $w/idle.frames.txt ] && cat $w/idle.frames.txt
+          [ -f $w/idle.cpu.pprof ] && go tool pprof -top -nodecount=45 "scale-out/$SIDE/clack-perf" $w/idle.cpu.pprof 2>&1 | tee $w/idle.cpu.top.txt || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ !cancelled() }}
         with:
@@ -316,6 +325,7 @@ jobs:
         side: ${{ fromJSON(inputs.scale_base != '' && '["head","base"]' || '["head"]') }}
     env:
       CLACK_PERF_IDLE: ${{ inputs.scale_idle || '10m' }}
+      CLACK_PERF_WARM_SCRIPT: ${{ inputs.scale_script }}
       SIDE: ${{ matrix.side }}
       SCALE_BASE: ${{ inputs.scale_base }}
     steps:
@@ -388,6 +398,10 @@ jobs:
           done
           cat scale-out/scale.md >> "$GITHUB_STEP_SUMMARY"
           cat scale-out/scale.md
+          # the idle stage's recorded minute (perfIdle): frames, who asked, CPU
+          w=scale-out/$SIDE/scale/warm
+          [ -f $w/idle.frames.txt ] && cat $w/idle.frames.txt
+          [ -f $w/idle.cpu.pprof ] && go tool pprof -top -nodecount=45 "scale-out/$SIDE/clack-perf.exe" $w/idle.cpu.pprof 2>&1 | tee $w/idle.cpu.top.txt || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ !cancelled() }}
         with:

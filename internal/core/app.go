@@ -339,6 +339,22 @@ func (a *App) pollOnce(ctx context.Context) {
 	a.emit(Event{Type: "poll"})
 }
 
+// watching reports whether ch (or its thread threadTS) is what the UI
+// opened last (watch): the conversation on screen.
+func (a *App) watching(ch, threadTS string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if threadTS == "" {
+		return ch != "" && ch == a.watchCh
+	}
+	for _, t := range a.watchTh {
+		if t.ch == ch && t.ts == threadTS {
+			return true
+		}
+	}
+	return false
+}
+
 // watch remembers what the UI opened, for pollOnce.
 func (a *App) watch(ch, threadTS string) {
 	a.mu.Lock()

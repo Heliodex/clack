@@ -1361,3 +1361,32 @@ or straight to the view). Tests: `app/clack_keys_darwin_test.go`
 once each; the log says which came through `doCommandBySelector:`, run
 43663715941 the list above) and `internal/ui` `TestMacInspectKeys`. Not
 in `UPSTREAM.patch`.
+## 30. app: no frame for a display link tick after the animation stopped (macOS)
+
+`app/os_macos.go` (`newOSWindow`'s display link callback). A fix.
+
+The display link's callback runs on CoreVideo's thread: it puts a token
+in `redraw` and asks the main thread for `setNeedsDisplay`. `draw` takes
+the token and then waits, on the main thread, for the client's frame;
+the frame's `updateAnimation` stops the animation when nothing is due
+now (a caret blink's next wake-up is 500 ms away), but the display link
+only stops 500 ms later, and `running` is still set until then. So a tick
+that came during a frame slower than a vsync (16.7 ms at 60 Hz, 8.3 ms at
+120 Hz) found the token free, and its `setNeedsDisplay` ran on the main
+queue after the frame returned: AppKit drew once more, a `FrameEvent`
+nobody asked for, after every such frame. Clack idle with its composer
+focused draws a frame per caret blink; on Karim's Mac (2026-11-14, 8 GB,
+swapping) every frame was slower than a vsync, so every blink drew twice.
+On the runner it showed as frames whose causes `idleprobe.Recorder`
+couldn't name, about 20 ms after three blinks out of four.
+
+The main thread's block now draws only while the window still animates
+(`w.anim`, which only the main thread writes); otherwise it gives the
+token back and draws nothing. An animation that goes on keeps
+`w.anim` set, so its next frame comes as before, and a later
+`Invalidate` starts the animation again before its tick.
+
+Test: `internal/ui` `TestMacIdleCPU` on ci's macos job
+(`CLACK_MACOS_WINDOW_TESTS`): its "frames slower than a vsync" period
+makes every frame take 30 ms (`OnWindowEvent`) and allows the caret's
+blinks and `idleOtherFrames` more. Not in `UPSTREAM.patch`.
