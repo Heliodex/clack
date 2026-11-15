@@ -71,6 +71,9 @@ type colors struct {
 	// .c-missing_text--unknown's --dt_color-base-ter and --non-existent's
 	// rgb(--sk_foreground_low_solid) border
 	Missing, MissingLine color.NRGBA
+	// .c-avatar--no_image: rgba(var(--sk_foreground_low_solid), 1), the
+	// avatar of a member with no picture to draw yet (paintAvatar)
+	NoImage color.NRGBA
 }
 
 var lightColors = colors{
@@ -100,7 +103,7 @@ var lightColors = colors{
 
 	FindMuted: rgb(0x5e5d60), FindBorder: rgba(0x5e5d60, 0x21/255.0),
 
-	Missing: rgb(0xeaeaea), MissingLine: rgb(0xdddddd),
+	Missing: rgb(0xeaeaea), MissingLine: rgb(0xdddddd), NoImage: rgb(0xdddddd),
 }
 
 var darkColors = colors{
@@ -130,7 +133,7 @@ var darkColors = colors{
 
 	FindMuted: rgb(0x9a9b9e), FindBorder: rgba(0x797c81, 0x4d/255.0),
 
-	Missing: rgb(0x212428), MissingLine: rgb(0x35373b),
+	Missing: rgb(0x212428), MissingLine: rgb(0x35373b), NoImage: rgb(0x35373b),
 }
 
 func colorsFor(th *theme.Theme) *colors {
@@ -337,6 +340,14 @@ func drawAvatar(gtx layout.Context, h Host, url string, r image.Rectangle, c *co
 	paintAvatar(gtx, h.Images(), url, r, c)
 }
 
+// paintAvatar is BaseAvatar (client-boot xc3R) in r: the picture, or
+// .c-base_icon's --dt_color-base-ter behind it while it loads. Without
+// one (url ""), ConnectedBaseAvatar (ztjr) had no imageUrl to give: a
+// member getMemberById hands back as the unknown stub (isUnknown: a
+// sender only a plugin named, users/info not answered yet) or as
+// non-existent (no avatar_hash). BaseAvatar draws that as
+// .c-avatar--no_image, rgba(var(--sk_foreground_low_solid)) in the
+// avatar's rounded square, until "names" resolves the row again.
 func paintAvatar(gtx layout.Context, imgs *imgcache.Cache, url string, r image.Rectangle, c *colors) {
 	radius := avatarRadius(r.Dx())
 	if isDefaultBotAvatar(url) {
@@ -351,7 +362,16 @@ func paintAvatar(gtx layout.Context, imgs *imgcache.Cache, url string, r image.R
 			return
 		}
 	}
-	rrect(gtx.Ops, r, radius, c.Skeleton)
+	rrect(gtx.Ops, r, radius, avatarFill(url, c))
+}
+
+// avatarFill is what an avatar without its picture shows: the no-image
+// square when there is no picture to load, the loading tile otherwise.
+func avatarFill(url string, c *colors) color.NRGBA {
+	if url == "" {
+		return c.NoImage
+	}
+	return c.Skeleton
 }
 
 // drawEmoji paints an emoji image contained in r.

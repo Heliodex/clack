@@ -44,7 +44,7 @@ Legend: ✅ does what it does in Slack · ⚠️ partly (what's missing is liste
 | RealMarkdown | ✅ | Standard Markdown as you type (`RealMarkdown.ts:17`) | Same | `composer-taut` TestTautRealMarkdown. |
 | RestrictedChannelWarning | ✅ | Admins see the "Only certain people can post" box, with Post anyway (`RestrictedChannelWarning.tsx:51-88`) | Same | Bench pass. |
 | ShinigamiEyes | n/a | Disabled upstream (`.disabled.tsx`): broken since the Hackatime API changed | Loads and does nothing without an API token, as in Taut | |
-| ShowRealUser | ✅ | Messages a relay bot posted for someone show that person (`ShowRealUser.tsx:175-212`) | Same, from the message's metadata | Bench: "a relay bot's message credits the person". |
+| ShowRealUser | ✅ | Messages a relay bot posted for someone show that person (`ShowRealUser.tsx:175-212`) | Same, from the message's metadata, with the person's picture (Slack's no-image square until users/info answers for them). Slack Extra's own-token posts (its pinned anchor) already credit the person, so the plugin leaves them alone, and they group under that person's message as in Slack | Bench: "a relay bot's message credits the person"; `messages-taut` TestPluginShowRealUser; TestAppAsUserAnchorGroupsLikeSlack. |
 | ShowSendingBot | ✅ | The bot that sent a person's message, as a badge on their avatar (`ShowSendingBot.tsx:256-444`) | Same, on rows and grouped rows | `messages-taut` TestPluginShowSendingBot, bench. |
 | ShutUpSlackbot | ✅ | Marks Slackbot's "an app took over your slash command" DMs read and silences them (`ShutUpSlackbot.ts:32-78`) | Same | `messages-taut`, `taut`, bench. |
 | SilentTyping | ✅ | A composer button that stops your typing indicator (`SilentTyping.tsx:41`, `:50`) | Same | `composer-taut`, `taut`, bench. |
