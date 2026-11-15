@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"image"
 	"os"
 	"path/filepath"
@@ -158,16 +159,57 @@ func TestIdleFrames(t *testing.T) {
 			e.r.Queue(pointer.Event{Kind: pointer.Leave, Source: pointer.Mouse, Position: f32.Pt(-1, -1)})
 			e.frame()
 
+			// a busy workspace's socket about nothing on screen: people
+			// Clack never drew changing their profiles and presence, new
+			// custom emoji, typing in another channel (Hack Club's stream
+			// while the client sits in one channel); ten events a second
+			other := ""
+			for _, id := range e.fs.ChannelIDs() {
+				if id != ch {
+					other = id
+					break
+				}
+			}
+			stop := make(chan struct{})
+			go func() {
+				select { // idle's settle
+				case <-time.After(2500 * time.Millisecond):
+				case <-stop:
+					return
+				}
+				tick := time.NewTicker(100 * time.Millisecond)
+				defer tick.Stop()
+				for i := 0; ; i++ {
+					select {
+					case <-stop:
+						return
+					case <-tick.C:
+					}
+					u := fmt.Sprintf("U0IDLETR%03d", i%40)
+					switch i % 4 {
+					case 0:
+						e.fs.Push(map[string]any{"type": "user_change", "user": map[string]any{"id": u, "name": "idle" + u, "real_name": "Idle " + u,
+							"profile": map[string]any{"display_name": "idle" + u, "status_emoji": ":wave:", "status_text": fmt.Sprintf("away %d", i)}}})
+					case 1:
+						pr := "active"
+						if i%8 == 1 {
+							pr = "away"
+						}
+						e.fs.Push(map[string]any{"type": "presence_change", "user": u, "presence": pr})
+					case 2:
+						e.fs.Push(map[string]any{"type": "emoji_changed", "subtype": "add", "name": fmt.Sprintf("idle-emoji-%d", i),
+							"value": "https://emoji.slack-edge.com/T0/idle/1.png", "event_ts": fmt.Sprintf("%d.000100", time.Now().Unix())})
+					case 3:
+						e.fs.Push(map[string]any{"type": "user_typing", "channel": other, "user": u})
+					}
+				}
+			}()
+			e.idle(t, p, "realtime events about nothing on screen", false)
+			close(stop)
+
 			// a huddle on in the open channel and in another (the header's
 			// button, the sidebar's Huddles link and rows)
 			if users := e.fs.GroupDMUsers(); len(users) >= 4 {
-				other := ""
-				for _, id := range e.fs.ChannelIDs() {
-					if id != ch {
-						other = id
-						break
-					}
-				}
 				now := time.Now().Unix()
 				e.fs.PushHuddleRoom("sh_room_join", ch, "R0IDLE0001", []string{users[0].ID, users[1].ID, users[2].ID}, now-120, nil)
 				e.fs.PushHuddleRoom("sh_room_join", other, "R0IDLE0002", []string{users[3].ID}, now-60, nil)
