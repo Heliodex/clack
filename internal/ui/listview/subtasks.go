@@ -234,11 +234,16 @@ func (c *ctl) threadUnread(d *core.ListDoc, rec *lists.Record) bool {
 	if a == nil || rec.ThreadTS == "" {
 		return false
 	}
-	m, ok := a.S.Find(core.ListCommentsChannel(d.Info.ID), rec.ThreadTS)
-	if !ok || !m.Subscribed {
+	lc := core.ListCommentsChannel(d.Info.ID)
+	m, ok := a.S.Find(lc, rec.ThreadTS)
+	if !ok {
 		return false
 	}
-	last := m.LastRead
+	sub := a.S.ThreadSubOf(lc, &m) // the thread's subscription (store/thread_subs.go)
+	if !sub.Subscribed {
+		return false
+	}
+	last := sub.LastRead
 	if last == "" {
 		last = "0"
 	}

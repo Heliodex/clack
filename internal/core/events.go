@@ -503,7 +503,16 @@ func (a *App) onMessage(ctx context.Context, ch string, ev slack.Event) {
 			if m.ThreadTS == "" && old.ThreadTS != "" && old.ThreadTS != old.TS {
 				m.ThreadTS, m.ParentUser = old.ThreadTS, firstNonEmpty(m.ParentUser, old.ParentUser)
 			}
+			// a root's thread subscription isn't the message's: Slack's
+			// replaceMessages swaps the message, and only a copy with a
+			// "subscribed" field of its own changes the subscription
+			// (store/thread_subs.go), so the cached copies keep theirs
+			if !m.SubscribedSet {
+				sub := a.S.ThreadSubOf(ch, &old)
+				m.Subscribed, m.LastRead = sub.Subscribed, sub.LastRead
+			}
 		}
+		a.S.SlurpSub(ch, &m)
 		a.S.NoteLive(ch, m.TS, &m) // a replies answer older than this keeps it (store/live.go)
 		if _, found := a.S.Mutate(ch, m.TS, func(x *slack.Message) { *x = m }); !found {
 			a.putLocal(ch, m) // a reply goes to its (cached) thread, never the channel
@@ -543,8 +552,10 @@ func (a *App) onMessage(ctx context.Context, ch string, ev slack.Event) {
 		return
 	}
 	// appendMessages merges a socket message into the stored one: a pin
-	// that came first stays (store/pins.go)
+	// that came first stays (store/pins.go), and a thread's subscription
+	// changes only with a "subscribed" of the copy's own (thread_subs.go)
 	a.S.KeepPin(ch, &m)
+	a.S.SlurpSub(ch, &m)
 	a.streams.seen(ch, m.TS, m.StreamingState == "in_progress")
 	// the "message" event names its sender for the notification (and the
 	// mentions in its text), so the people are fetched before it goes out;

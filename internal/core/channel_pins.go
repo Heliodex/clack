@@ -301,6 +301,53 @@ func (a *App) pinsTabEvent(ch string, added bool, raw pinsListItem) {
 	a.emit(Event{Type: "pins_tab", Channel: ch})
 }
 
+// pinsTabPrepend is prependPinnedItem for the viewer's own pin: the item
+// goes first unless it's there, while ch's pins are loaded or loading
+// (Slack's list exists from the first read; Clack's first read fetches).
+func (a *App) pinsTabPrepend(ch string, it PinsTabItem) {
+	st := a.pinsTab()
+	st.mu.Lock()
+	c := st.chs[ch]
+	if c == nil || c.state == pinsNotLoaded || slices.ContainsFunc(c.items, it.same) {
+		st.mu.Unlock()
+		return
+	}
+	c.items = append([]PinsTabItem{it}, c.items...)
+	st.mu.Unlock()
+	a.emit(Event{Type: "pins_tab", Channel: ch})
+}
+
+// pinsTabRemove is removePinnedItem: it leaves ch's rows.
+func (a *App) pinsTabRemove(ch string, it PinsTabItem) {
+	st := a.pinsTab()
+	st.mu.Lock()
+	c := st.chs[ch]
+	i := -1
+	if c != nil {
+		i = slices.IndexFunc(c.items, it.same)
+	}
+	if i < 0 {
+		st.mu.Unlock()
+		return
+	}
+	c.items = slices.Delete(slices.Clone(c.items), i, i+1)
+	st.mu.Unlock()
+	a.emit(Event{Type: "pins_tab", Channel: ch})
+}
+
+// pinsTabRow is ch's row for it, when its pins hold one.
+func (a *App) pinsTabRow(ch string, it PinsTabItem) (PinsTabItem, bool) {
+	st := a.pinsTab()
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if c := st.chs[ch]; c != nil {
+		if i := slices.IndexFunc(c.items, it.same); i >= 0 {
+			return c.items[i], true
+		}
+	}
+	return PinsTabItem{}, false
+}
+
 // pinsTabSee keeps the rows' message copies current from the events
 // that carry one (update), and drops a deleted message's row: Slack's
 // rows read the messages store, where an edit, a reaction or a delete

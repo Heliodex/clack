@@ -55,6 +55,9 @@ type Store struct {
 	live        map[string]liveRec         // key channel/ts: realtime message changes (live.go)
 	liveQ       []string                   // live's keys, oldest first
 	liveSeq     uint64                     // realtime message changes seen
+	subs        map[string]subRec          // key channel/thread_ts: thread subscriptions (thread_subs.go)
+	subQ        []string                   // subs' keys, oldest first
+	subSeq      uint64                     // subscription events seen
 	CustomEmoji emoji.Custom
 	EmojiStyle  string
 	cacheDir    string
