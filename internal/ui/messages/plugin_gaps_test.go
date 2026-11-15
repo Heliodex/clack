@@ -2,10 +2,15 @@ package messages
 
 import (
 	"encoding/json"
+	"image"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"gioui.org/layout"
+	"gioui.org/op"
+	"gioui.org/unit"
 
 	"github.com/some-du6e/clack/internal/richtext"
 	"github.com/some-du6e/clack/internal/slack"
@@ -42,16 +47,24 @@ return ThreadPronouns
 })()`
 
 // The thread pane's sender line is ThreadSenderAndTimestampGeneric: a
-// plugin's siblings of it (UserPronouns) render there, in the pane.
+// plugin's siblings of it (UserPronouns) render there, in the pane, on
+// the sender's line. Slack's component ends the line with a <br> only
+// without omitLinebreak; the native took the whole line regardless, so
+// the pronouns wrapped onto a line of their own under "alice  3:04 PM"
+// and the root row grew by a line.
 func TestPluginThreadSenderSiblings(t *testing.T) {
 	_, _, tt, u, h := pluginEnv(t)
+	tv := NewThreadView(h, tGen, tsFair)
+	ft := frameFn(tv)
+	until(t, 8*time.Second, "the thread loaded", ft, func() bool {
+		return len(tv.s.snap.msgs) > 0 && tv.s.rows[tsFair] != nil && itemHeight(tv.s, tsFair) > 0
+	})
+	ft()
+	before := itemHeight(tv.s, tsFair)
 	install(t, tt, []byte(threadPronounsPlugin))
 	until(t, 5*time.Second, "ThreadSenderAndTimestampGeneric patched", func() {}, func() bool {
 		return slackc.Patched("ThreadSenderAndTimestampGeneric")
 	})
-	tv := NewThreadView(h, tGen, tsFair)
-	ft := frameFn(tv)
-	until(t, 8*time.Second, "the thread loaded", ft, func() bool { return len(tv.s.snap.msgs) > 0 })
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) && !u.anyTree("x-thread-pronouns") {
 		ft()
@@ -64,6 +77,36 @@ func TestPluginThreadSenderSiblings(t *testing.T) {
 		}
 		u.mu.Unlock()
 		t.Fatal("no tree with the root sender's pronouns in the thread pane")
+	}
+	for i := 0; i < 5; i++ {
+		ft()
+		time.Sleep(15 * time.Millisecond)
+	}
+	// the pronouns follow the time on the sender's line: no new line
+	after := itemHeight(tv.s, tsFair)
+	if line := int(mt.nameLine); after-before >= line/2 {
+		t.Errorf("thread root row %dpx with the pronouns, %dpx without: they wrapped onto their own line (a line is %dpx)", after, before, line)
+	}
+	// the native: the whole line with its <br>, as wide as what it drew
+	// under omitLinebreak (the patch's Original)
+	r := tv.s.rows[tsFair]
+	gtx := layout.Context{Ops: new(op.Ops), Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1}, Constraints: layout.Constraints{Max: image.Pt(600, 40)}, Now: time.Now()}
+	full := r.layoutThreadSender(gtx, slackc.Props{"omitLinebreak": false})
+	fit := r.layoutThreadSender(gtx, slackc.Props{"omitLinebreak": true})
+	ts := r.layoutTimestamp(gtx, nil)
+	if full.Size.X != 600 {
+		t.Errorf("sender line without omitLinebreak %dpx wide, want the whole line (600)", full.Size.X)
+	}
+	if fit.Size.X <= ts.Size.X+int(mt.tsGap) || fit.Size.X >= 600 {
+		t.Errorf("sender line under omitLinebreak %dpx wide, want the name + gap + time (time %dpx)", fit.Size.X, ts.Size.X)
+	}
+	if fit.Size.Y != full.Size.Y || fit.Baseline != full.Baseline {
+		t.Errorf("omitLinebreak changed the line box: %v/%d, without %v/%d", fit.Size, fit.Baseline, full.Size, full.Baseline)
+	}
+	// omitTimestamp: the name and Slack's two no-break spaces
+	name := r.layoutThreadSender(gtx, slackc.Props{"omitLinebreak": true, "omitTimestamp": true})
+	if want := fit.Size.X - ts.Size.X; name.Size.X != want {
+		t.Errorf("sender line under omitLinebreak+omitTimestamp %dpx wide, want %d (no time)", name.Size.X, want)
 	}
 }
 
