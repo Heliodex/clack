@@ -11,6 +11,8 @@ import (
 	"context"
 	"encoding/json"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/some-du6e/clack/internal/slack"
@@ -23,11 +25,36 @@ func (a *App) CodeChannelViewsOn() bool {
 	return a.sessionChannelsOn() && a.experiment("session_channels_code_tab_pr") != "on"
 }
 
-// CodeChannelPRViewsOn is prViewsEnabled (biaa.jt: session_channels and
-// session_channels_gh_wo): pull_request views survive getCodeChannelViews.
+// CodeChannelPRViewsOn is readablePrViewsEnabled: pull_request views
+// survive getCodeChannelViews. Both callers (the details pane ECTe and the
+// artifact tabs 96Xs) pass isCodeChannelCodeTabPrEnabled (biaa.OA:
+// session_channels and session_channels_code_tab_pr), build c07ab895506f.
+// Older builds used prViewsEnabled (biaa.jt, session_channels_gh_wo); no
+// chunk in c07ab895506f reads that experiment any more.
 func (a *App) CodeChannelPRViewsOn() bool {
-	return a.sessionChannelsOn() && a.experiment("session_channels_gh_wo") == "on"
+	return a.sessionChannelsOn() && a.experiment("session_channels_code_tab_pr") == "on"
 }
+
+// linkablePRURL is isLinkablePrUrl (M1U4.qo): parsePrUrl (k0lG.tD,
+// https://<host>/<owner>/<repo>/pull/<n>) with n > 0 on an allowed GitHub
+// host (jIyG.y5: github.com, or slack-github.com on the production
+// backend). getCodeChannelViews keeps a pull_request view only when its
+// pr_url passes.
+func linkablePRURL(u string) bool {
+	m := prURLRe.FindStringSubmatch(u)
+	if m == nil {
+		return false
+	}
+	n, err := strconv.ParseFloat(m[3], 64)
+	if err != nil || n <= 0 {
+		return false
+	}
+	host := strings.ToLower(m[1])
+	return host == "github.com" || host == "slack-github.com"
+}
+
+// prURLRe is k0lG's parsePrUrl pattern.
+var prURLRe = regexp.MustCompile(`^https://([^/]+)/([^/]+/[^/]+)/pull/(\d+)(?:[/?#]|$)`)
 
 // CodeChannelInlineDiffOn is biaa._5 (session_channels and
 // session_channels_inline_diff): agent_view_added messages carry inline
@@ -45,7 +72,7 @@ func (a *App) CodeChannelViews(cc *CodeChannel) []CodeChannelView {
 	pr := a.CodeChannelPRViewsOn()
 	var out []CodeChannelView
 	for _, v := range cc.allViews {
-		if v.Type == ViewPullRequest && (!pr || v.PRURL == "") {
+		if v.Type == ViewPullRequest && (!pr || !linkablePRURL(v.PRURL)) {
 			continue
 		}
 		out = append(out, v)

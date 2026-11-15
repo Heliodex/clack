@@ -122,7 +122,10 @@ func TestCodeChannelViewsAndTabs(t *testing.T) {
 	a, _ := testApp(t)
 	props := `{"record_channel":{"record_id":"AC:1:2:CCODE1","record_type":"agent_channel"},"agent_session":{"status":"active"},
 	"code_channel":{"repo":"acme/api","diff_file_id":"F1","diff_file_version":3,
-	 "agent_session_views":[{"view_id":"V1","type":"block_kit","name":"Summary"},{"view_id":"V2","type":"pull_request","pr_url":"https://github.com/acme/api/pull/1"}],
+	 "agent_session_views":[{"view_id":"V1","type":"block_kit","name":"Summary"},{"view_id":"V2","type":"pull_request","pr_url":"https://github.com/acme/api/pull/1"},
+	  {"view_id":"VL","type":"list"},{"view_id":"VGL","type":"pull_request","pr_url":"https://gitlab.com/acme/api/pull/2"},
+	  {"view_id":"V0","type":"pull_request","pr_url":"https://github.com/acme/api/pull/0"},{"view_id":"VX","type":"pull_request","pr_url":"https://github.com/acme/api/issues/3"},
+	  {"view_id":"VS","type":"pull_request","pr_url":"https://Slack-GitHub.com/acme/api/pull/4?tab=files"}],
 	 "agent_views":[{"view_id":"VH","file_id":"FH"}],"plan_canvases":[{"canvas_id":"FCAN"}]},
 	"tabz":[{"id":"code","type":"code"},{"id":"VH","type":"agent_view"},{"id":"Ct1","type":"canvas","data":{"file_id":"FCAN"}},{"id":"Ct2","type":"canvas","data":{"file_id":"FOTHER"}},{"id":"files","type":"files"}]}`
 	a.S.PutConv(slack.Conversation{ID: "CCODE1", Name: "fix", IsChannel: true, IsMember: true, Properties: json.RawMessage(props)})
@@ -133,20 +136,34 @@ func TestCodeChannelViewsAndTabs(t *testing.T) {
 		}
 		return
 	}
+	// the test account: session_channels on, session_channels_code_tab_pr
+	// not assigned, so no PR views (and never a list view)
 	if got := ids(a.CodeChannelViews(cc)); !reflect.DeepEqual(got, []string{"code", "V1", "VH", "Ct1"}) { // the plan canvas takes its tab's id
 		t.Errorf("views %v (PR views are off by default)", got)
-	}
-	a.SetExperimentGroup("session_channels_gh_wo", "on")
-	if got := ids(a.CodeChannelViews(cc)); !reflect.DeepEqual(got, []string{"code", "V1", "V2", "VH", "Ct1"}) {
-		t.Errorf("views with session_channels_gh_wo %v", got)
 	}
 	if !a.CodeChannelViewsOn() {
 		t.Error("the pane is on with session_channels")
 	}
+	// session_channels_gh_wo is gone from Slack's client (c07ab895506f): it
+	// no longer turns PR views on
+	a.SetExperimentGroup("session_channels_gh_wo", "on")
+	if got := ids(a.CodeChannelViews(cc)); !reflect.DeepEqual(got, []string{"code", "V1", "VH", "Ct1"}) {
+		t.Errorf("views with session_channels_gh_wo %v, want no PR views", got)
+	}
+	// readablePrViewsEnabled (biaa.OA): PR views whose pr_url is a linkable
+	// GitHub PR (isLinkablePrUrl), not gitlab, PR 0 or an issue
 	a.SetExperimentGroup("session_channels_code_tab_pr", "on")
+	if got := ids(a.CodeChannelViews(cc)); !reflect.DeepEqual(got, []string{"code", "V1", "V2", "VS", "VH", "Ct1"}) {
+		t.Errorf("views with session_channels_code_tab_pr %v", got)
+	}
 	if a.CodeChannelViewsOn() {
 		t.Error("artifact tabs replace the pane")
 	}
+	a.SetExperimentGroup("session_channels", "off")
+	if a.CodeChannelPRViewsOn() {
+		t.Error("PR views need session_channels too")
+	}
+	a.SetExperimentGroup("session_channels", "on")
 	for tab, want := range map[string]string{"code": "code", "VH": "VH", "Ct1": "Ct1", "Ct2": "", "missing": "", "files": ""} {
 		if got := a.CodeViewForTab("CCODE1", tab); got != want {
 			t.Errorf("CodeViewForTab(%q) = %q, want %q", tab, got, want)

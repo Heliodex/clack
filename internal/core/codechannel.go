@@ -84,6 +84,7 @@ const (
 	ViewCanvas      = "canvas"
 	ViewBlockKit    = "block_kit"
 	ViewPullRequest = "pull_request"
+	ViewList        = "list" // never a view: getCodeChannelViews drops it
 )
 
 // CodeChannelView is an artifact the agent published: one of
@@ -198,7 +199,8 @@ func ParseCodeChannel(props json.RawMessage) *CodeChannel {
 }
 
 // codeChannelViews is getCodeChannelViews (PntH.B) with session channels
-// on: agent_session_views (pull requests only with prViews and a pr_url),
+// on: agent_session_views (never a list; pull requests only with prViews
+// and a linkable pr_url),
 // agent_views as html, diff_file_id as the Code diff, plan_canvases as
 // canvases; the Code diff first. CodeChannelViews applies the viewer's
 // experiments to the prViews list.
@@ -215,7 +217,7 @@ func codeChannelViews(c map[string]json.RawMessage, prViews bool, canvasTabs map
 	var views []CodeChannelView
 	_ = json.Unmarshal(c["agent_session_views"], &views)
 	for _, v := range views {
-		if v.Type == ViewPullRequest && (!prViews || v.PRURL == "") {
+		if v.Type == ViewList || v.Type == ViewPullRequest && (!prViews || !linkablePRURL(v.PRURL)) {
 			continue
 		}
 		seen[v.ViewID] = true

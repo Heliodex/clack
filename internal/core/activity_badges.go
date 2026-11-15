@@ -82,6 +82,11 @@ func (a *App) ActivityBadgeCount() int {
 // activityBadgeTypes is 3x6A H's set: the entry types the All tab's count
 // sums (message_reaction is in the set but never summed), with the ones
 // behind a setting or an experiment as Clack has them.
+//
+// team_joiner_invite is never summed. Build c07ab895506f (2026-11-15) lists
+// TeamJoinerInvite with mpdm, bot_dm and thread_reply as types the selector
+// skips, and no chunk in that build reads inviter_joiner_first_dm_v2. Before
+// that, Clack counted it under that experiment's treatment group.
 func (a *App) activityBadgeTypes() map[string]bool {
 	t := map[string]bool{}
 	for _, k := range []string{"thread_v2", "channel", "internal_channel_invite", "list_record_edited", "bot_dm_bundle",
@@ -98,9 +103,6 @@ func (a *App) activityBadgeTypes() map[string]bool {
 	}
 	if a.experiment("code_review_requested_in_activity") == "on" {
 		t["code_review_requested"] = true // ysZt f
-	}
-	if a.experiment("inviter_joiner_first_dm_v2") == "treatment" {
-		t["team_joiner_invite"] = true // vydz wy inviterJoinerFirstDmIsTreatment
 	}
 	return t
 }

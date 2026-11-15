@@ -701,9 +701,12 @@ func (a *App) onSavedEvent(ctx context.Context, typ string, raw json.RawMessage)
 	a.emit(Event{Type: "saved", Name: name, Channel: it.Channel, TS: it.TS, Saved: &it, Raw: raw})
 }
 
-// activityLiveTypes is activityUpdatedV2's J (boot-shared, build
-// fa938a086569): the entry types a realtime activity_updated may add to
-// the inbox. The server also pushes entries Slack's client never shows,
+// activityLiveTypes is activityUpdatedV2's allow-list (boot-shared `ee`
+// in sD/F, build c07ab895506f): the entry types a realtime
+// activity_updated may add to the inbox. That build dropped
+// team_joiner_invite from the list (build fa938a086569's J still had it),
+// so a pushed joiner entry never reaches the inbox; the feed still returns
+// one under the Invitations filter (RmAw). The server also pushes entries Slack's client never shows,
 // such as thread_reply (one per reply in a followed thread, next to the
 // thread's thread_v2 bundle); getActivityIconType draws an unknown type
 // with the @ glyph, so letting one through gave every reply a second,
@@ -712,8 +715,8 @@ var activityLiveTypes = []string{"thread_v2", "at_user", "at_user_group", "at_ch
 	"message_reaction", "internal_channel_invite", "quietly_added_to_channel", "external_channel_invite",
 	"external_dm_invite", "unjoined_channel_mention", "code_review_requested", "list_record_assigned",
 	"list_record_edited", "list_user_mentioned", "list_todo_notification", "list_approval_request",
-	"list_approval_reviewed", "bot_dm_bundle", "saved_reminder", "dm", "channel", "mpdm", "team_joiner_invite",
-	"generic_system_alert", "prejoin_dm_welcome_party_alert"}
+	"list_approval_reviewed", "bot_dm_bundle", "saved_reminder", "dm", "channel", "mpdm", "generic_system_alert",
+	"prejoin_dm_welcome_party_alert"}
 
 func activityLiveType(t string) bool { return slices.Contains(activityLiveTypes, t) }
 
