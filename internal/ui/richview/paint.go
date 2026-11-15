@@ -59,6 +59,7 @@ func strokeRadii(ops *op.Ops, r image.Rectangle, rad [4]float32, bw int, col col
 	if bw <= 0 || col.A == 0 || r.Empty() {
 		return
 	}
+	rad, _ = cssRadii(r, rad)
 	h := float32(bw) / 2
 	rr := fr(r)
 	rr.x0 += h
@@ -72,8 +73,44 @@ func strokeRadii(ops *op.Ops, r image.Rectangle, rad [4]float32, bw int, col col
 	paint.FillShape(ops, col, clip.Stroke{Path: path, Width: float32(bw)}.Op())
 }
 
+// cssRadii scales corner radii (NW, NE, SE, SW) the way a browser does
+// when adjacent corners don't fit along a side (CSS Backgrounds 3,
+// "Corner Curve Overlap"): every radius is multiplied by the smallest
+// side length / sum of that side's two radii, when that is below 1.
+// Slack's attachment bar (.c-message_attachment__border, width 4px,
+// border-radius 8px) is a 4px stadium with 2px round ends that way;
+// clip.RRect doesn't clamp, so radius 8 on a 4px box drew a path that
+// ran back past its own start and crossed itself (horns at both ends).
+func cssRadii(r image.Rectangle, rad [4]float32) ([4]float32, bool) {
+	f := float32(1)
+	side := func(l int, a, b float32) {
+		if s := a + b; s > 0 && float32(l)/s < f {
+			f = float32(l) / s
+		}
+	}
+	w, h := r.Dx(), r.Dy()
+	side(w, rad[0], rad[1]) // top
+	side(w, rad[3], rad[2]) // bottom
+	side(h, rad[0], rad[3]) // left
+	side(h, rad[1], rad[2]) // right
+	if f >= 1 {
+		return rad, false
+	}
+	for i := range rad {
+		rad[i] *= f
+	}
+	return rad, true
+}
+
 func fillRadii(ops *op.Ops, r image.Rectangle, radii [4]int, col color.NRGBA) {
 	if col.A == 0 || r.Empty() {
+		return
+	}
+	rad := [4]float32{float32(radii[0]), float32(radii[1]), float32(radii[2]), float32(radii[3])}
+	if rad, scaled := cssRadii(r, rad); scaled {
+		// fractional after scaling (a 5px bar's 2.5px ends), so the
+		// float path rather than clip.RRect's int radii
+		paint.FillShape(ops, col, clip.Outline{Path: roundRect(ops, fr(r), rad)}.Op())
 		return
 	}
 	paint.FillShape(ops, col, clip.RRect{Rect: r, NW: radii[0], NE: radii[1], SE: radii[2], SW: radii[3]}.Op(ops))
