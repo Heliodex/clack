@@ -145,6 +145,21 @@ name: flake-check
 #                                            lines on Windows' disk (94 were
 #                                            in), and the Fatal skipped Close:
 #                                            TempDir couldn't remove the file
+# and flake-fix-2's (2026-11-15: α.85's release; the race forced every run):
+#   TestDetailsSendEmailsLikeSlack           the details' conversations.info
+#     (ui/views)                             stored fakeslack's channel name
+#                                            over the test's after the email
+#                                            modal had kept the old one, so
+#                                            the copied address and Slackbot's
+#                                            prompt named another channel
+#                                            than w.name(); newW13Env now
+#                                            waits for that read. The test
+#                                            holds it back 1 s and the
+#                                            address's create until the
+#                                            client stored it (the old order
+#                                            fails every run)
+#   TestDetailsCallButtonLikeSlack,          the same read against the call
+#   TestDetailsCallMenuStartsCall (ui/views) tooltip's name
 # Synthetic data only (internal/fakeslack, the fake Chime).
 on:
   workflow_dispatch:
@@ -200,6 +215,7 @@ on:
       - "internal/huddle/videosend_test.go"
       - "internal/huddle/share_test.go"
       - "internal/ui/views/details_w14_test.go"
+      - "internal/ui/views/details_w13_test.go"
       - "internal/ui/views/views_keys_test.go"
       - "internal/ui/channel_preview_test.go"
       - "internal/ui/backend.go"
@@ -797,6 +813,59 @@ jobs:
           TEST: ${{ matrix.test }}
           PKG: ${{ matrix.pkg }}
         run: sh "$GITHUB_WORKSPACE/.github/flake-count.sh" ${{ matrix.flags }}
+
+  flake-fix-2-views:
+    if: ${{ !inputs.only || startsWith('flake-fix-2-views', inputs.only) }}
+    name: "flake-fix-2 ${{ matrix.test }} (${{ matrix.flags }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { test: TestDetailsSendEmailsLikeSlack, pkg: ./internal/ui/views, flags: "-race" }
+          - { test: TestDetailsSendEmailsLikeSlack, pkg: ./internal/ui/views, flags: "-cpu=1" }
+          - { test: TestDetailsCallButtonLikeSlack, pkg: ./internal/ui/views, flags: "-race" }
+          - { test: TestDetailsCallMenuStartsCall, pkg: ./internal/ui/views, flags: "-race" }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gio deps
+        run: sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" update -qq && sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" install -y -qq $GIO_DEPS
+      - name: "${{ matrix.test }} ${{ matrix.flags }}, every run counted"
+        env:
+          TEST: ${{ matrix.test }}
+          PKG: ${{ matrix.pkg }}
+        run: sh "$GITHUB_WORKSPACE/.github/flake-count.sh" ${{ matrix.flags }}
+
+  # the release's test job (release.yml) as it is: the whole suite in one
+  # job on a clean cache, on three fresh runners at once. Timing races
+  # that only show under the whole suite's load failed α.82, α.83 and α.85
+  # there and nowhere else.
+  release-suite:
+    if: ${{ !inputs.only || startsWith('release-suite', inputs.only) }}
+    name: "release-suite (runner ${{ matrix.runner }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: false # as release.yml: a clean module/build cache
+      - name: gio deps
+        run: sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" update -qq && sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" install -y -qq $GIO_DEPS
+      - name: go test ./...
+        run: go test -timeout 30m ./...
 
   # flake-fix: the title bar tests after the gioui.org/app steps ci's
   # windows-applog runs before them (the OLE drops move the cursor and run
