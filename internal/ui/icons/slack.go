@@ -63,7 +63,6 @@ var slackIconNames = map[string]string{
 	"question-circle":            "help",
 	"help-circle":                "help",
 	"emoji-add":                  "add-reaction",
-	"reaction":                   "add-reaction",
 	"add-emoji":                  "add-reaction",
 	"smile":                      "emoji",
 	"emoji-smile":                "emoji",

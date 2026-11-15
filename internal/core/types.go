@@ -28,10 +28,16 @@ type Message struct {
 	EditedTS                 string
 	EditedBy                 string // edited.user: who made the last edit (EditedLabel names them on a workflow message)
 	Permalink                string // set on search results
-	ClientMsgID              string
-	PinnedBy                 string // who pinned it (when Pinned)
-	IsBot, Edited, Pinned    bool
-	Broadcast, System        bool // System: join/leave/topic… drawn compactly
+	// Search results only (search.go): requestor_replied (the viewer
+	// replied in the thread) and the index of the first block that held a
+	// highlight marker (0 when none), compactCardBlocks' start
+	// (exp_wave7.go).
+	RequestorReplied      bool
+	SearchHitBlock        int
+	ClientMsgID           string
+	PinnedBy              string // who pinned it (when Pinned)
+	IsBot, Edited, Pinned bool
+	Broadcast, System     bool // System: join/leave/topic… drawn compactly
 	// A system message's own fields: who added the joiner (inviter), the
 	// topic or purpose it set, a rename's old and new names.
 	Inviter, Topic, Purpose, OldName, NewName string

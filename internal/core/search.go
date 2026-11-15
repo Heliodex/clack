@@ -308,6 +308,9 @@ func (a *App) SearchMessages(ctx context.Context, o SearchOpts) (SearchResult, e
 		UnfilteredFilter   map[string]json.RawMessage `json:"unfiltered_result_filter"`
 		SortForcedToRecent json.RawMessage            `json:"sort_forced_to_recent"`
 	}
+	// the markers, before they go: compactCardBlocks' first highlighted
+	// block (exp_wave7.go)
+	marked := searchHitBlocks(raw)
 	if err := json.Unmarshal(stripHighlightJSON(raw), &res); err != nil {
 		return SearchResult{}, err
 	}
@@ -326,13 +329,15 @@ func (a *App) SearchMessages(ctx context.Context, o SearchOpts) (SearchResult, e
 	}
 	var msgs []slack.Message
 	type hit struct {
-		ch   string
-		m    slack.Message
-		link string
+		ch      string
+		m       slack.Message
+		link    string
+		replied bool
+		hitAt   int
 	}
 	var hits []hit
 	chans := map[string]bool{}
-	for _, it := range res.Items {
+	for i, it := range res.Items {
 		ch := it.Channel.ID
 		if ch == "" {
 			continue
@@ -341,23 +346,25 @@ func (a *App) SearchMessages(ctx context.Context, o SearchOpts) (SearchResult, e
 		if it.Channel.Name != "" && !it.Channel.IsIM && !it.Channel.IsMPIM {
 			a.S.PutName(ch, it.Channel.Name) // names of channels we are not in (metadata)
 		}
-		for _, mr := range it.Messages {
+		for j, mr := range it.Messages {
 			var m slack.Message
 			if json.Unmarshal(mr, &m) != nil || m.TS == "" {
 				continue
 			}
 			var aux struct {
-				Permalink string `json:"permalink"`
+				Permalink        string `json:"permalink"`
+				RequestorReplied bool   `json:"requestor_replied"`
 			}
 			_ = json.Unmarshal(mr, &aux)
 			msgs = append(msgs, m)
-			hits = append(hits, hit{ch, m, aux.Permalink})
+			hits = append(hits, hit{ch, m, aux.Permalink, aux.RequestorReplied, marked[[2]int{i, j}]})
 		}
 	}
 	// the results' people are asked for as their rows draw (lazy_users.go)
 	for i := range hits {
 		v := a.message(hits[i].ch, &hits[i].m)
 		v.Permalink = hits[i].link
+		v.RequestorReplied, v.SearchHitBlock = hits[i].replied, hits[i].hitAt
 		out.Messages = append(out.Messages, v)
 	}
 	out.Convs = a.convRefs(chans)
