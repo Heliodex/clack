@@ -21,6 +21,9 @@ on:
       - "internal/ui/views/details.go"
       - "internal/ui/views/details_agents.go"
       - "internal/ui/agents_channels_test.go"
+      - "internal/ui/agents_row_menu_test.go"
+      - "internal/ui/views/details_agents_menu.go"
+      - "internal/ui/popups/remove_member.go"
       - "internal/fakeslack/channel_agents.go"
       - "internal/ui/views/directories.go"
       - "internal/ui/views/spanline.go"
@@ -62,7 +65,7 @@ jobs:
           LIBGL_ALWAYS_SOFTWARE: "1"
         run: |
           mkdir -p "$PREVIEW_SHOTS_DIR"
-          xvfb-run -a go test -count=1 -v -run 'TestChannelHeaderMoveTo$|TestChannelPreviewHeaderAndMenu$|TestChannelPreviewJoin$|TestChannelDetailsMembersAndApps$|TestChannelBrowserShot$|TestChannelBellMenu$|TestChannelTopicEditModal$|TestChannelLeaveRejoin$|TestChannelDetailsTabsShot$|TestSidebarTextFilter$|TestSidebarTextFilterFollowsExperiment$|TestTempMuteFollowsExperiment$|TestSidebarOrganizeMode$|TestSidebarKeyboard$|TestSectionMoveErrorToasts$|TestTempMuteNewBadge$|TestSidebarDraftMenuOpensPickedDraft$|TestSidebarDraftPencilMenu$|TestChannelDetailsAgentsImprovements$|TestChannelDetailsAgentsEmpty$|TestChannelDetailsAgentsOff$' ./internal/ui/
+          xvfb-run -a go test -count=1 -v -run 'TestChannelHeaderMoveTo$|TestChannelPreviewHeaderAndMenu$|TestChannelPreviewJoin$|TestChannelDetailsMembersAndApps$|TestChannelBrowserShot$|TestChannelBellMenu$|TestChannelTopicEditModal$|TestChannelLeaveRejoin$|TestChannelDetailsTabsShot$|TestSidebarTextFilter$|TestSidebarTextFilterFollowsExperiment$|TestTempMuteFollowsExperiment$|TestSidebarOrganizeMode$|TestSidebarKeyboard$|TestSectionMoveErrorToasts$|TestTempMuteNewBadge$|TestSidebarDraftMenuOpensPickedDraft$|TestSidebarDraftPencilMenu$|TestChannelDetailsAgentsImprovements$|TestChannelDetailsAgentsEmpty$|TestChannelDetailsAgentsOff$|TestAgentsRowMenuRemove$|TestAgentsRowMenuRemoveFails$' ./internal/ui/
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ !cancelled() }}
         with:
