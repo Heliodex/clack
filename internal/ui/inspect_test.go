@@ -399,6 +399,12 @@ func TestInspectKonami(t *testing.T) {
 	if !ok {
 		t.Fatalf("the composer is a %T", e.a.convos[ch+"/"].comp)
 	}
+	// clear any draft fakeslack seeded on this channel so the typed text
+	// starts clean (the first Small channel has one; without this the
+	// composer reads "synthetic drafthello").
+	e.key("A", key.ModShortcut)
+	e.key(key.NameDeleteBackward, 0)
+	e.frame()
 	e.typeAt("hello")
 	e.key(key.NameLeftArrow, 0)
 	e.frame()
