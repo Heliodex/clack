@@ -12,6 +12,7 @@ import (
 
 	"github.com/some-du6e/clack/internal/richtext"
 	"github.com/some-du6e/clack/internal/slack"
+	"github.com/some-du6e/clack/internal/store"
 )
 
 var mentionRe = regexp.MustCompile(`<@([UW][A-Z0-9]+)`)
@@ -75,8 +76,20 @@ func (a *App) handle(ev slack.Event) {
 		if e.User == a.S.SelfID() {
 			return
 		}
-		a.EnsureUsers(ctx, []string{e.User})
-		a.emit(Event{Type: "typing", Channel: ch, UserID: e.User, Name: a.S.UserName(e.User), ThreadTS: e.ThreadTS})
+		// Slack's typing line maps its typers through getMemberById as it
+		// renders (MessagePaneInput, cRQG), so only the conversation on
+		// screen asks for a typer it doesn't hold. Elsewhere the record
+		// waits with what the store has: a busy workspace types in
+		// hundreds of channels, and each fetch's "names" redrew the window
+		// for nothing on it.
+		name := ""
+		if a.watching(ch, e.ThreadTS) {
+			a.EnsureUsers(ctx, []string{e.User})
+			name = a.S.UserName(e.User)
+		} else if u, ok := a.S.RawUser(e.User); ok {
+			name = store.DisplayName(u)
+		}
+		a.emit(Event{Type: "typing", Channel: ch, UserID: e.User, Name: name, ThreadTS: e.ThreadTS})
 	case "channel_marked", "im_marked", "group_marked", "mpim_marked":
 		var e struct {
 			TS           string `json:"ts"`
@@ -120,9 +133,18 @@ func (a *App) handle(ev slack.Event) {
 		}
 		_ = json.Unmarshal(ev.Raw, &e)
 		if e.User.ID != "" {
+			// Seen: when a view last read the member (store.MemberAccessed:
+			// a row its sender, a mention its member, as they draw), so the
+			// views know whether one draws them now. One the store didn't
+			// hold, or no view read, draws nowhere (a row that wants it
+			// draws the unknown stub, and its fetch's "names" follows), as
+			// most of a large workspace's profile changes are. The event is
+			// read without a lookup, which would count as a view's.
+			seen := a.S.MemberAccessed(e.User.ID)
 			a.S.PutUsers([]slack.User{e.User})
-			if u, ok := a.User(e.User.ID); ok {
-				a.emit(Event{Type: "user", UserID: u.ID, User: &u})
+			if su, ok := a.S.RawUser(e.User.ID); ok {
+				u := a.userOf(su)
+				a.emit(Event{Type: "user", UserID: u.ID, User: &u, Seen: seen})
 			}
 		}
 	case "team_icon_change":

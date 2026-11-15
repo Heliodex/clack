@@ -154,7 +154,7 @@ func TestIdleFrames(t *testing.T) {
 			} {
 				e.r.Queue(pointer.Event{Kind: pointer.Move, Source: pointer.Mouse, Position: f32.Pt(at.x, at.y)})
 				e.frame()
-				e.idle(t, p, at.name, false)
+				e.idle(t, p, at.name, true) // opening the channel focused its composer
 			}
 			e.r.Queue(pointer.Event{Kind: pointer.Leave, Source: pointer.Mouse, Position: f32.Pt(-1, -1)})
 			e.frame()
@@ -204,7 +204,7 @@ func TestIdleFrames(t *testing.T) {
 					}
 				}
 			}()
-			e.idle(t, p, "realtime events about nothing on screen", false)
+			e.idle(t, p, "realtime events about nothing on screen", true)
 			close(stop)
 
 			// a huddle on in the open channel and in another (the header's
@@ -215,17 +215,17 @@ func TestIdleFrames(t *testing.T) {
 				e.fs.PushHuddleRoom("sh_room_join", other, "R0IDLE0002", []string{users[3].ID}, now-60, nil)
 				hud := e.a.huddles()
 				e.untilSoft(10*time.Second, func() bool { _, on := hud.Live(ch); return on })
-				e.idle(t, p, "huddles on in the channel and another", false)
+				e.idle(t, p, "huddles on in the channel and another", true)
 			}
 			e.shutdown()
 
 			// every fixture gallery's messages laid out at once (a window
 			// tall enough for most of them): Block Kit, link previews,
-			// files, an agent's thread, code channels, work objects,
-			// workflows, pins, bot and app senders
+			// files, an agent's thread, work objects, workflows, pins, bot
+			// and app senders
 			sz = fakeslack.Small
 			sz.Unread = 0
-			sz.Gallery, sz.Embeds, sz.Files, sz.AgentThread, sz.CodeChannels = true, true, true, true, true
+			sz.Gallery, sz.Embeds, sz.Files, sz.AgentThread = true, true, true, true
 			sz.WorkObjects, sz.Workflows, sz.PinsFolders, sz.Identity = true, true, true, true
 			e = newIdleEnv(t, sz, motion.override)
 			measured.Store(e.a)
@@ -235,7 +235,6 @@ func TestIdleFrames(t *testing.T) {
 				{"#embeds-gallery", fakeslack.EmbedsChannelID},
 				{"#files-gallery", fakeslack.FilesChannelID},
 				{"the agent's DM", fakeslack.AgentDMID},
-				{"a working code channel", fakeslack.CodeWorkingID},
 				{"#work-objects", fakeslack.WorkObjectsChannelID},
 				{"#workflows-gallery", fakeslack.WorkflowsChannelID},
 				{"#pins-gallery", fakeslack.PinsChannelID},
@@ -245,8 +244,26 @@ func TestIdleFrames(t *testing.T) {
 				if !e.untilSoft(20*time.Second, func() bool { return e.loadedMessages(g.ch) > 0 }) {
 					t.Logf("%s: no history loaded", g.name)
 				}
-				e.idle(t, p, g.name, false)
+				e.idle(t, p, g.name, true)
 			}
+			e.shutdown()
+
+			// a code channel whose agent works: the sidebar's dot is
+			// Slack's slow spinner, pulsing, which turns while the window
+			// is active and holds still in the background (indicatorFrame;
+			// it drew 30 frames a second there)
+			sz = fakeslack.Small
+			sz.Unread = 0
+			sz.CodeChannels = true
+			e = newIdleEnv(t, sz, motion.override)
+			measured.Store(e.a)
+			ch = e.fs.ChannelIDs()[0]
+			e.openChannel(ch)
+			e.untilSoft(20*time.Second, func() bool { return e.loadedMessages(ch) > 0 })
+			e.idle(t, p, "a working code channel in the sidebar", true, "ui.codeSpinner")
+			e.blur()
+			e.idle(t, p, "a working code channel in the sidebar, window in the background", false)
+			e.unblur()
 		})
 	}
 }
@@ -264,10 +281,12 @@ func (e *perfEnv) untilSoft(d time.Duration, cond func() bool) bool {
 }
 
 // idleOtherFrames is what a surface may draw in idleFor besides caret
-// blinks: a minute tick, with room for two more.
+// blinks: a minute tick, with room for two more. indicatorEvery is an
+// indicator's frame interval while the window is active (indicatorFrame).
 const (
 	idleFor         = 10 * time.Second
 	idleOtherFrames = 3
+	indicatorEvery  = 33 * time.Millisecond
 )
 
 // newIdleEnv is startEnv with live updates on and motion set (-1 full
@@ -360,8 +379,11 @@ func (e *perfEnv) idleFrame(now time.Time) {
 // idle settles the surface (loads, opening animations), then counts 10 s
 // of frames with no input and checks them against the budget. caret is
 // whether a text field has the focus (Slack focuses the composer when a
-// conversation opens).
-func (e *perfEnv) idle(t *testing.T, p *idleprobe.Probe, name string, caret bool) {
+// conversation opens). indicators name the callers of an indicator that
+// turns as long as its state holds (a working agent's spinner): their
+// frames count apart, at most one per indicatorEvery, and only in an
+// active window.
+func (e *perfEnv) idle(t *testing.T, p *idleprobe.Probe, name string, caret bool, indicators ...string) {
 	t.Helper()
 	e.settle(2 * time.Second)
 	// core's deferred boot loads (usergroups, client extras: a.later 5 s
@@ -372,7 +394,18 @@ func (e *perfEnv) idle(t *testing.T, p *idleprobe.Probe, name string, caret bool
 	res := p.Run(name, idleFor, &e.r, e.idleFrame)
 	res.Log(t)
 	blinks := res.CountMatching("Editor).Layout")
-	other := res.Count() - blinks
+	anim := 0
+	if len(indicators) > 0 {
+		anim = res.CountMatching(append([]string{"Editor).Layout"}, indicators...)...) - blinks
+	}
+	other := res.Count() - blinks - anim
+	maxAnim := 0
+	if e.a.focused && len(indicators) > 0 {
+		maxAnim = int(idleFor/indicatorEvery) + 2
+	}
+	if anim > maxAnim {
+		t.Errorf("%s: %d indicator frames in %v idle, want at most %d (focused window: %v)", name, anim, idleFor, maxAnim, e.a.focused)
+	}
 	maxBlinks := 0
 	if blink := widget.CaretBlinkInterval(); caret && e.a.focused && blink > 0 {
 		// 500 ms, or Windows' GetCaretBlinkTime once a window opened

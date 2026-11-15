@@ -9,6 +9,7 @@ package core
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/some-du6e/clack/internal/richtext"
 	"github.com/some-du6e/clack/internal/slack"
@@ -339,10 +340,13 @@ type Event struct {
 	// message event (Slack's messageChanged shows the deferred
 	// notification then, under defer_notification_3p_streaming).
 	StreamDone bool
-	Connected  bool   // connection: socket up; realtime: live updates on
-	Presence   string // presence: active | away
-	Users      []string
-	Prefs      *Prefs
+	Connected  bool // connection: socket up; realtime: live updates on
+	// Seen (user): when a view last read the member before this change
+	// (store.MemberAccessed); zero: none did, or the store didn't hold them
+	Seen     time.Time
+	Presence string // presence: active | away
+	Users    []string
+	Prefs    *Prefs
 	// sent: the confirmed message replaces the local pending row whose TS
 	// is ReplacesTS. message/sent/update/delete of own sends carry ClientMsgID.
 	ReplacesTS  string

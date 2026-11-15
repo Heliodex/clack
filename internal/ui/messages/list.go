@@ -665,6 +665,7 @@ func (s *listState) layoutList(gtx layout.Context, h Host, origin image.Point) l
 	now := time.Now()
 	lastHost = h
 	s.hb.ensureLoaded(s.m)
+	s.hb.markDrawn(s.m, gtx.Now)
 	s.sync(h, now)
 	s.placeSendJump(gtx, now)
 	sweepRows(now)

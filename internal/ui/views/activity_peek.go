@@ -163,6 +163,7 @@ func (v *Activity) LayoutPeekLead(gtx C) D {
 
 // LayoutPeek draws the page's list on the card.
 func (v *Activity) LayoutPeek(gtx C) D {
+	v.shown.mark(v.h)
 	v.pk.peeking = true
 	defer func() { v.pk.peeking = false }()
 	v.frame()

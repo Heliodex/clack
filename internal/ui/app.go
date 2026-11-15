@@ -220,6 +220,7 @@ type App struct {
 	title       string
 	firstPaint  bool
 	frameStats  frameStats
+	frameSeq    atomic.Uint64 // frames laid out (FrameSeq)
 	lastChannel string
 	dock        dockState // the macOS Dock badge last set (dock.go)
 	// previewFrom is the channel-browser route previewFromCh was opened
@@ -394,6 +395,11 @@ func (a *App) postLazy(f func()) {
 	a.mu.Unlock()
 }
 
+// FrameSeq counts the frames laid out so far (any goroutine): a view that
+// notes it as it draws knows, from an event's goroutine, whether it is
+// still on screen (views' shownTracker).
+func (a *App) FrameSeq() uint64 { return a.frameSeq.Load() }
+
 // Invalidate requests a redraw. It is safe from any goroutine, including the
 // UI goroutine mid-layout and AppKit callbacks: it never calls into Gio itself.
 //
@@ -537,6 +543,9 @@ func (a *App) Run() error {
 			if e.Config.Focused && !a.focused {
 				a.nudgeUpdates()       // back from sleep, often: is a check due?
 				a.loginWindowFocused() // a sign-in link copied in the browser (login.go)
+			}
+			if e.Config.Focused != a.focused {
+				a.Invalidate() // the indicators an inactive window held still move on (indicatorFrame)
 			}
 			a.focused = e.Config.Focused
 			a.drainIdle()
@@ -688,6 +697,8 @@ func (a *App) frame(gtx layout.Context) {
 	sz := gtx.Constraints.Max
 	a.pxPerDp = gtx.Metric.PxPerDp
 	a.winSize = sz
+	windowActive.Store(a.focused) // the indicators turn only in an active window (indicatorFrame)
+	a.frameSeq.Add(1)
 	a.syncWheelAnimation()
 	a.syncThemeTokens()
 	a.focusFadeFrame(gtx) // focus mode's view transition (focus_fade.go)
