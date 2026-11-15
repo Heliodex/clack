@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"image"
 	"image/color"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -84,6 +85,10 @@ type thrCard struct {
 	also                   string // "Also send to #general"
 	built                  bool
 	gen                    uint64 // i18n.Gen the strings were made in
+	// waits are the members (and bots) name and people left out for
+	// want of a name (missing_member.go): "names" listing one makes the
+	// card again (membersIn)
+	waits []string
 	// icon is getChannelIconType's name for a channel's header
 	// (InlineChannelEntity), "" for a DM or group DM
 	icon string
@@ -119,6 +124,7 @@ type thrMsg struct {
 	m           *core.Message
 	top         unit.Dp
 	name, stamp string
+	missTip     missTip // the sender's BaseMissingMember tooltip
 }
 
 // Threads is the Threads view.
@@ -193,6 +199,17 @@ func NewThreads(h Host) *Threads {
 // badges, so neither reloads.
 func (v *Threads) match(ev core.Event) bool {
 	switch ev.Type {
+	case "names":
+		// the member fetcher (or bots.info) named people: the cards that
+		// left one out make their header again (membersIn), as Slack's
+		// ThreadParticipantList re-renders when the fetch upserts them
+		if ids := ev.Users; len(ids) > 0 {
+			v.notes.mu.Lock()
+			v.notes.fns = append(v.notes.fns, func() { v.membersIn(ids) })
+			v.notes.mu.Unlock()
+			v.h.Invalidate()
+		}
+		return false
 	case "message":
 		return ev.Reply
 	case "thread_subscription":
@@ -213,6 +230,17 @@ func (v *Threads) match(ev core.Event) bool {
 		}
 	}
 	return false
+}
+
+// membersIn makes the cards whose header left out a member (or bot)
+// "names" lists (thrCard.waits) again: the store has them now, or knows
+// they don't exist.
+func (v *Threads) membersIn(ids []string) {
+	for _, c := range v.cards {
+		if c.built && namesAny(c.waits, ids) {
+			c.built = false
+		}
+	}
 }
 
 // applyMarks moves thread_marked last reads into the local read state.
@@ -637,34 +665,49 @@ func (v *Threads) footer(gtx C, failed bool) D {
 }
 
 // people is the participants line: "Just you", "Ada and you", "Ada,
-// Grace, and you", or "Ada, Grace, Linus, and 4 others".
+// Grace, and you", or "Ada, Grace, Linus, and 4 others". A participant
+// without a name yet (getPrefCompliantMemberNameById's "" for the stub,
+// a bot whose name isn't loaded) is left out and asked for, as
+// getThreadRepliersNamesFromState (client-boot V4VG) leaves them out;
+// "names" makes the card again.
 func (v *Threads) people(root *core.Message, replies []core.Message) string {
 	self := v.selfID()
 	seen := map[string]bool{}
 	var names []string
-	hasSelf := false
+	all, hasSelf := 0, false
 	add := func(id string) {
 		if id == "" || seen[id] {
 			return
 		}
 		seen[id] = true
+		all++
 		if id == self {
 			hasSelf = true
 			return
 		}
-		if _, ok := v.user(id); !ok && strings.HasPrefix(id, "B") {
-			// a bot id (ReplyUsers can hold them): use the name its
-			// messages carry, never the raw B… id
+		if !core.LooksLikeMemberID(id) {
+			// a bot id (ReplyUsers can hold them): the name its messages
+			// carry, else getBotNameById's; never the raw B… id
 			if n := botName(id, root, replies); n != "" {
+				names = append(names, n)
+			} else if n := v.personName(id); n != "" {
 				names = append(names, n)
 			}
 			return
 		}
-		names = append(names, v.userName(id))
-	}
-	if root.User == "" {
-		if n, _ := v.authorOf(root); n != "" {
+		if n := v.userName(id); n != "" {
 			names = append(names, n)
+		}
+	}
+	if root.User == "" && !slices.Contains(root.ReplyUsers, root.BotID) {
+		// a bot's root without a user: its bot first (mapStateToProps
+		// puts the root's bot_id before the reply users without it)
+		if n, _ := v.authorOf(root); root.BotID != "" || n != "" {
+			seen[root.BotID] = true
+			all++
+			if n != "" {
+				names = append(names, n)
+			}
 		}
 	}
 	add(root.User)
@@ -674,26 +717,35 @@ func (v *Threads) people(root *core.Message, replies []core.Message) string {
 	for i := range replies {
 		add(replies[i].User)
 	}
-	return thrParticipants(names, hasSelf)
+	return thrParticipants(names, hasSelf, all)
 }
 
 // thrParticipants is Slack's ThreadParticipantList (client-boot-shared
-// oYYP) over getThreadRepliersNamesFromState's names (the viewer last, as
-// "you"): up to three people, getSimpleNameList ("Just you", "{userName}
-// and you", "{userName1}, {userName2}, and you", else listify's "Ada and
-// Grace"); past three, getOverflowNameList ("{userName1}, {userName2},
-// and # others", the count being everyone but the two named).
-func thrParticipants(names []string, hasSelf bool) string {
-	n := len(names)
+// oYYP) over getThreadRepliersNamesFromState's names (names: the named
+// participants other than the viewer; hasSelf: the viewer is one, named
+// "you", last; all: how many participants there are, named or not).
+// useSimpleNameList is all of them three or fewer: getSimpleNameList
+// ("Just you", "{userName} and you", "{userName1}, {userName2}, and
+// you", else listify's "Ada and Grace"); past three getOverflowNameList
+// ("{userName1}, {userName2}, and # others"). Both count only the named
+// (replyUsersCount becomes the names' count), so a thread with someone
+// left out reads one person shorter until "names" brings them.
+//
+// One divergence: past three people with fewer than two of them named,
+// Slack's overflow text has no second name ("undefined") and -1 others;
+// Clack draws the simple list of the named ones until two are.
+func thrParticipants(names []string, hasSelf bool, all int) string {
+	j := slices.Clip(names)
 	if hasSelf {
-		n++
+		j = append(j, nsThreads.T("you"))
 	}
+	n := len(j)
 	switch {
 	case n == 0:
 		return ""
-	case n > 3:
+	case all > 3 && n >= 2:
 		return i18n.StripTags(nsThreads.T("{userName1}, {userName2}, and <span>{numOthers,plural,=1{# other}other{# others}}</span>",
-			"userName1", names[0], "userName2", names[1], "numOthers", n-2))
+			"userName1", j[0], "userName2", j[1], "numOthers", n-2))
 	case !hasSelf:
 		return listify(names, false)
 	case n == 1:
@@ -783,14 +835,21 @@ func (v *Threads) cardFor(t *thrItem, convs map[string]core.ConvRef) *thrCard {
 			c.built = false
 		}
 	}
+	if c.built && len(c.waits) > 0 && v.waitOver(c.waits) {
+		// a member the card couldn't name is in the store now (or known
+		// not to exist) before a "names" said so: make it again
+		c.built = false
+	}
 	if !c.built || c.gen != i18n.Gen() || v.viewsPatched() {
 		c.gen = i18n.Gen()
-		c.name = v.convTitle(t.Channel, convs)
-		if strings.HasPrefix(t.Channel, "D") && (c.name == t.Channel || c.name == dmFallbackName()) {
-			// a DM core doesn't know yet: name it after the other person
-			c.name = v.dmPartner(&t.Root, t.Replies)
-		}
-		c.people = v.people(&t.Root, t.Replies)
+		c.waits = v.recording(func() {
+			c.name = v.convTitle(t.Channel, convs)
+			if strings.HasPrefix(t.Channel, "D") && (c.name == t.Channel || c.name == dmFallbackName()) {
+				// a DM core doesn't know yet: name it after the other person
+				c.name = v.dmPartner(&t.Root, t.Replies)
+			}
+			c.people = v.people(&t.Root, t.Replies)
+		})
 		c.moreText = thrMoreText(t, c)
 		kind := ""
 		if r, ok := convs[t.Channel]; ok {
@@ -1328,8 +1387,21 @@ func (s *thrMsg) layoutSender(gtx C, p slackc.Props) D {
 func (s *thrMsg) line(gtx C, st slackc.Styled, name, stamp string) D {
 	v := s.v
 	col, size := st.Color(v.p.Text), st.FontSize(15)
+	sender := func(gtx C) D { return v.para(gtx, size, 22, wBlack, col, 1, name) }
+	if name == "" && s.m != nil && core.LooksLikeMemberID(s.m.User) {
+		// BaseMessageSender: BaseMissingMember for a sender the store
+		// can't name, "unknown" while users/info runs, "non-existent"
+		// (outlined) once it didn't return them (missing_member.go)
+		if miss := v.memberState(s.m.User); miss != core.MemberKnown {
+			sender = func(gtx C) D {
+				return v.missingBar(gtx, miss == core.MemberNonExistent, &s.missTip, func(gtx C) D {
+					return v.para(gtx, size, 22, wBlack, col, 1, "")
+				})
+			}
+		}
+	}
 	return row(gtx, layout.Baseline,
-		layout.Rigid(func(gtx C) D { return v.para(gtx, size, 22, wBlack, col, 1, name) }),
+		layout.Rigid(sender),
 		hgap(7),
 		layout.Rigid(func(gtx C) D {
 			if stamp == "" {

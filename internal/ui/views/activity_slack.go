@@ -494,6 +494,12 @@ func (v *Activity) reactionSender(it *core.ActivityItem, d *actDesc) {
 	if u, ok := v.user(main); ok {
 		d.avatar = u.Avatar
 	}
+	if d.name == "" {
+		// the reactor's name is "" (the store can't name them yet):
+		// BaseMissingMember, no "+N"
+		d.nameDense = ""
+		return
+	}
 	// both rows pass density "dense" to the sender (U5s4), so Detailed
 	// reads "{name} +{count}" too
 	if n := len(actOthers(users, v.selfID(), main)); n > 0 {
@@ -505,11 +511,24 @@ func (v *Activity) reactionSender(it *core.ActivityItem, d *actDesc) {
 // threadSender is wM7g ThreadSender: the reply's author, then the other
 // participants (the root's reply_users, minus the viewer, the author and
 // Slackbot): "{a} and {b}", "{a} & {n} others", or "{a} +{n}" in Dense.
+// While a participant has no name yet (getPrefCompliantMemberNameById,
+// else getBotNameById: both ask) the whole sender is BaseMissingMember
+// (g.length < p.length), as is an author the store can't name.
 func (v *Activity) threadSender(it *core.ActivityItem, d *actDesc, author string) {
-	if author == "" || it.Root == nil {
+	if author == "" || it.Root == nil || d.name == "" {
 		return
 	}
 	o := actOthers(it.Root.ReplyUsers, v.selfID(), author, "USLACKBOT")
+	named := 0
+	for _, id := range o {
+		if v.personName(id) != "" {
+			named++
+		}
+	}
+	if named < len(o) {
+		d.name, d.nameDense = "", ""
+		return
+	}
 	if len(o) > 0 { // density "dense" in both rows: "{name} +{count}"
 		d.name += " +" + strconv.Itoa(len(o))
 	}

@@ -29,6 +29,7 @@ var palTokens = []struct {
 	{func(p *pal) *color.NRGBA { return &p.Red }, theme.Both("var(--dt_color-content-imp)")},
 	{func(p *pal) *color.NRGBA { return &p.Badge }, theme.Both("var(--dt_color-theme-base-imp)")},
 	{func(p *pal) *color.NRGBA { return &p.Skel }, theme.Both("var(--dt_color-base-ter)")},
+	{func(p *pal) *color.NRGBA { return &p.MissingLine }, theme.Both("rgb(var(--sk_foreground_low_solid))")},
 	{func(p *pal) *color.NRGBA { return &p.Focus }, theme.Both("var(--dt_color-otl-hgl-1-sec)")},
 	{func(p *pal) *color.NRGBA { return &p.Chip }, theme.Both("var(--dt_color-base-pry-hover)")},
 	{func(p *pal) *color.NRGBA { return &p.ChipSel }, theme.Both("var(--dt_color-base-hgl-1)")},

@@ -564,7 +564,9 @@ func (v *Huddles) truncatedNames(ids []string) string {
 		if id == self {
 			continue
 		}
-		names = append(names, v.userName(id))
+		if n := v.userName(id); n != "" { // "" until the store can name them, never the id
+			names = append(names, n)
+		}
 	}
 	vis := names
 	if len(vis) > 5 {
@@ -973,8 +975,11 @@ func (v *Huddles) openJoinLive(ch string, h huddleRoom) {
 	self := v.selfID()
 	var others []string
 	for _, id := range h.Participants {
-		if id != self {
-			others = append(others, v.userName(id))
+		if id == self {
+			continue
+		}
+		if n := v.userName(id); n != "" {
+			others = append(others, n)
 		}
 	}
 	title := nsHuddles.T("Join huddle in {channelEntity}", "channelEntity", chName)
