@@ -3,6 +3,9 @@
 package ui
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -11,20 +14,31 @@ import (
 
 // TestMacInspectKeys is the inspect tool's keys on App.Run's own window
 // on a real macOS desktop (CLACK_MACOS_WINDOW_TESTS=1, ci's macos job;
-// TestMain runs app.Main), signed in to internal/fakeslack. The keys are
-// posted as a keyboard makes them (cocoatest.PostKey: the modifiers'
-// flagsChanged, the key's down and up with the current layout's
-// characters) and AppKit delivers them: NSApp sendEvent:, the menu bar's
-// key equivalents, then Gio's view, whose interpretKeyEvents: hands them
-// to Gio. The log shows what the view got of each (cocoatest.TraceKeys).
+// TestMain runs app.Main), signed in to internal/fakeslack, with its menu
+// bar. The keys are posted as a keyboard makes them (cocoatest.PostKey:
+// the modifiers' flagsChanged, the key's down and up with the current
+// layout's characters) and AppKit delivers them: NSApp sendEvent:, the
+// menu bar's key equivalents, Gio's view and its interpretKeyEvents:.
 //
-// Reproduction: with CLACK_INSPECT=1, ⌘⌥⇧D through AppKit starts a
-// session and again ends it.
+//  1. With no CLACK_INSPECT and no pref, Hyper+D (⌃⌥⇧⌘D) does nothing.
+//  2. The Konami code, ↑ ↑ ↓ ↓ ← → ← → B A, turns the tool on at once and
+//     writes inspect_tool to ui.json.
+//  3. Hyper+D starts a session and again ends it; Esc ends one too.
+//  4. ⌘⌥⇧D, the old shortcut, starts none and leaves the sidebar (the
+//     menu's Hide Sidebar is ⌘⇧D).
+//  5. The code again turns the tool off, in ui.json too.
+//
+// Before Gio patch 29 no ⌘ press AppKit's text system sends no command
+// for reached the window: the view got ⌘⌥⇧D's and ⌃⌥⇧⌘D's keyDown:, its
+// interpretKeyEvents: called neither doCommandBySelector: nor
+// insertText:, and Gio dropped the press (ci run 43661396830). The log
+// has what the view got of each key (cocoatest.TraceKeys).
 func TestMacInspectKeys(t *testing.T) {
 	if !macWindowTests {
 		t.Skip("CLACK_MACOS_WINDOW_TESTS not set")
 	}
-	t.Setenv("CLACK_INSPECT", "1")
+	t.Setenv("CLACK_INSPECT", "")
+	t.Setenv("YOLOSLACK_INSPECT", "")
 	ma := runMacBoundsApp(t, nil)
 	defer ma.quit(t, true)
 	var layout string
@@ -35,86 +49,96 @@ func TestMacInspectKeys(t *testing.T) {
 	})
 	t.Logf("keyboard layout %s", layout)
 	ma.until(t, "the key window", func() bool { return ma.state().Key })
-	var hasTool bool
-	ma.onUI(t, func() { hasTool = ma.a.insp != nil })
-	if !hasTool {
-		t.Fatal("CLACK_INSPECT=1 but the window has no inspect tool")
-	}
-	active := func() (on bool) {
-		ma.onUI(t, func() { on = ma.a.insp != nil && ma.a.insp.Active() })
-		return on
+
+	tool := func() (on, active bool) {
+		ma.onUI(t, func() { on, active = ma.a.insp != nil, ma.a.insp != nil && ma.a.insp.Active() })
+		return on, active
 	}
 	sidebarHidden := func() (h bool) {
 		ma.onUI(t, func() { h = ma.a.sidebar.hidden })
 		return h
 	}
+	saved := func() bool {
+		b, err := os.ReadFile(filepath.Join(ma.dir, "ui.json"))
+		if err != nil {
+			return false
+		}
+		var p prefs
+		return json.Unmarshal(b, &p) == nil && p.InspectTool
+	}
 	trace := func() (s string) {
 		onMain(func() { s = cocoatest.KeyTrace() })
 		return s
 	}
-	press := func(name string, code, mods int, direct bool) {
+	press := func(name string, code, mods int) {
 		t.Helper()
 		var c, ign string
-		onMain(func() {
-			if direct {
-				c, ign = cocoatest.SendKey(ma.view, code, mods)
-			} else {
-				c, ign = cocoatest.PostKey(ma.view, code, mods)
-			}
-		})
-		time.Sleep(300 * time.Millisecond) // the run loop delivers, a frame reads
+		onMain(func() { c, ign = cocoatest.PostKey(ma.view, code, mods) })
+		time.Sleep(150 * time.Millisecond) // the run loop delivers them in order
 		t.Logf("%s (characters %+q, ignoring modifiers %+q); the view got:\n%s", name, c, ign, trace())
 	}
-	waitActive := func(want bool) bool {
-		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) {
-			if active() == want {
-				return true
+	// eventually waits up to 10 s for ok, which reads the tool.
+	eventually := func(what string, ok func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for !ok() {
+			if time.Now().After(deadline) {
+				on, active := tool()
+				t.Fatalf("%s: tool %v, session %v, ui.json inspect_tool %v", what, on, active, saved())
 			}
 			time.Sleep(50 * time.Millisecond)
 		}
-		return false
 	}
 	const cmd, opt, shift, ctrl = cocoatest.Cmd, cocoatest.Opt, cocoatest.Shift, cocoatest.Ctrl
-
-	// 1. ⌘⌥⇧D, as Karim pressed it
-	sb := sidebarHidden()
-	press("⌘⌥⇧D through NSApp", cocoatest.KeyD, cmd|opt|shift, false)
-	started := waitActive(true)
-	if sbNow := sidebarHidden(); sbNow != sb {
-		t.Errorf("⌘⌥⇧D toggled the sidebar (hidden %v → %v): the menu's Hide Sidebar ⌘⇧D took it", sb, sbNow)
-	}
-	if !started {
-		var took bool
-		onMain(func() { took = cocoatest.KeyEquivalent("d", cmd|opt|shift) })
-		t.Logf("the main menu's performKeyEquivalent: for ⌘⌥⇧D: took %v", took)
-		press("⌘⌥⇧D straight to the view", cocoatest.KeyD, cmd|opt|shift, true)
-		t.Errorf("⌘⌥⇧D through AppKit started no session (straight to the view: session %v)", waitActive(true))
-	} else {
-		// 2. again ends it
-		press("⌘⌥⇧D again", cocoatest.KeyD, cmd|opt|shift, false)
-		if !waitActive(false) {
-			t.Error("⌘⌥⇧D again didn't end the session")
+	hyper := func() { press("⌃⌥⇧⌘D", cocoatest.KeyD, cmd|opt|shift|ctrl) }
+	konami := func() {
+		for _, k := range []struct {
+			name string
+			code int
+		}{
+			{"↑", cocoatest.KeyUp}, {"↑", cocoatest.KeyUp}, {"↓", cocoatest.KeyDown}, {"↓", cocoatest.KeyDown},
+			{"←", cocoatest.KeyLeft}, {"→", cocoatest.KeyRight}, {"←", cocoatest.KeyLeft}, {"→", cocoatest.KeyRight},
+			{"B", cocoatest.KeyB}, {"A", cocoatest.KeyA},
+		} {
+			press(k.name, k.code, 0)
 		}
 	}
-	if active() {
-		press("Esc", cocoatest.KeyEscape, 0, false)
-		waitActive(false)
+
+	// 1. off: Hyper+D does nothing
+	hyper()
+	time.Sleep(time.Second)
+	if on, _ := tool(); on {
+		t.Fatal("the tool exists with no CLACK_INSPECT, no pref and no code")
 	}
 
-	// 3. what AppKit makes of Hyper+D and the Konami code's keys (logged)
-	press("⌃⌥⇧⌘D through NSApp", cocoatest.KeyD, cmd|opt|shift|ctrl, false)
-	t.Logf("⌃⌥⇧⌘D: session %v", active())
-	if active() {
-		press("Esc", cocoatest.KeyEscape, 0, false)
+	// 2. the Konami code turns it on, now and in ui.json
+	konami()
+	eventually("the tool on after the Konami code", func() bool { on, _ := tool(); return on })
+	eventually("inspect_tool in ui.json", saved)
+
+	// 3. Hyper+D starts a session, again ends it; Esc ends one
+	hyper()
+	eventually("a session after Hyper+D", func() bool { _, a := tool(); return a })
+	hyper()
+	eventually("the session ended by Hyper+D again", func() bool { _, a := tool(); return !a })
+	hyper()
+	eventually("a session after Hyper+D", func() bool { _, a := tool(); return a })
+	press("Esc", cocoatest.KeyEscape, 0)
+	eventually("the session ended by Esc", func() bool { _, a := tool(); return !a })
+
+	// 4. the old shortcut starts none, and isn't the menu's ⌘⇧D
+	sb := sidebarHidden()
+	press("⌥⇧⌘D", cocoatest.KeyD, cmd|opt|shift)
+	time.Sleep(time.Second)
+	if _, a := tool(); a {
+		t.Error("⌘⌥⇧D, the old shortcut, started a session")
 	}
-	for _, k := range []struct {
-		name string
-		code int
-	}{
-		{"↑", cocoatest.KeyUp}, {"↓", cocoatest.KeyDown}, {"←", cocoatest.KeyLeft}, {"→", cocoatest.KeyRight},
-		{"B", cocoatest.KeyB}, {"A", cocoatest.KeyA},
-	} {
-		press(k.name, k.code, 0, false)
+	if now := sidebarHidden(); now != sb {
+		t.Errorf("⌘⌥⇧D toggled the sidebar (hidden %v → %v)", sb, now)
 	}
+
+	// 5. the code again turns it off
+	konami()
+	eventually("the tool off after the code again", func() bool { on, _ := tool(); return !on })
+	eventually("inspect_tool gone from ui.json", func() bool { return !saved() })
 }

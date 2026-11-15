@@ -60,6 +60,8 @@ type Router struct {
 	deferring bool
 	// scratchFilters is for garbage-free construction of ephemeral filters.
 	scratchFilters []taggedFilter
+	// Clack patch 28: the key presses for Source.KeyPresses.
+	keyLog keyLog
 }
 
 // Source implements the interface between a Router and user interface widgets.
@@ -362,6 +364,7 @@ func (q *Router) collapseState(idx int) {
 // handlers from the frame argument. Remaining events are discarded,
 // unless they were deferred by a command.
 func (q *Router) Frame(frame *op.Ops) {
+	q.frameKeyLog() // Clack patch 28
 	var remaining []event.Event
 	if n := len(q.changes); n > 0 {
 		if q.deferring {
@@ -410,7 +413,7 @@ func (q *Router) Frame(frame *op.Ops) {
 		}
 	}
 	q.executeCommands()
-	q.Queue(remaining...)
+	q.requeue(remaining...) // Clack patch 28: Queue, not logged again
 	st := q.lastState()
 	pst, evts := q.pointer.queue.Frame(q.handlers, st.pointerState)
 	st.pointerState = pst
@@ -428,6 +431,7 @@ func (q *Router) Queue(events ...event.Event) {
 		if system {
 			e = se.Event
 		}
+		q.noteKey(e) // Clack patch 28
 		q.processEvent(e, system)
 	}
 }
@@ -540,7 +544,7 @@ func (q *Router) execute(c Command) {
 				q.changes = q.changes[:1]
 			}
 			q.changeState(nil, ch.state, ch.events)
-			q.Queue(evts...)
+			q.requeue(evts...) // Clack patch 28: Queue, not logged again
 			return
 		}
 	}

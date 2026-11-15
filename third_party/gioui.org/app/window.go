@@ -763,6 +763,11 @@ func (w *Window) processEvent(e event.Event) bool {
 		if handled {
 			w.setNextFrame(t)
 			w.updateAnimation()
+		} else if w.queue.KeyLogged() {
+			// Clack patch 28: a frame for Source.KeyPresses, the key
+			// still unhandled
+			w.setNextFrame(time.Time{})
+			w.updateAnimation()
 		}
 		return handled
 	}

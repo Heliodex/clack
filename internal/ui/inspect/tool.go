@@ -1,16 +1,16 @@
 // Package inspect is Clack's inspect tool: a developer shortcut, not a
 // Slack feature, that makes a UI bug report one paste. The shortcut
-// (off unless CLACK_INSPECT=1 or the hidden ui.json pref inspect_tool is
-// set) starts an inspect session, like a browser's inspect element: the
-// Slack component under the pointer gets an outline and a label, ↑ and ↓
-// pick its parent or go back, Esc ends the session, and a click picks the
-// element. Clack then copies one image to the clipboard: the window as it
-// was drawn with the element outlined, over a panel with a report (which
-// component and element, its classes, its rect, the colours drawn there,
-// the theme, the experiments its code read, and tags for the ids it was
-// drawn for: one-way hashes, salted per report, so the report is safe to
-// paste in #clack). The image and the report's text are also saved in
-// <config>/inspect-reports.
+// (off until the Konami code, CLACK_INSPECT=1 or the hidden ui.json pref
+// inspect_tool turns it on) starts an inspect session, like a browser's
+// inspect element: the Slack component under the pointer gets an outline
+// and a label, ↑ and ↓ pick its parent or go back, Esc ends the session,
+// and a click picks the element. Clack then copies one image to the
+// clipboard: the window as it was drawn with the element outlined, over
+// a panel with a report (which component and element, its classes, its
+// rect, the colours drawn there, the theme, the experiments its code
+// read, and tags for the ids it was drawn for: one-way hashes, salted
+// per report, so the report is safe to paste in #clack). The image and
+// the report's text are also saved in <config>/inspect-reports.
 //
 // While a session runs the window is laid out with a hover-only input
 // source (Gio patch 21): hover states, scrolling, carets and animations
@@ -146,6 +146,16 @@ func (t *Tool) Hovered() (label string, rect image.Rectangle, ok bool) {
 		return "", image.Rectangle{}, false
 	}
 	return t.hover.label, t.hover.rect, true
+}
+
+// Close ends a session, a pick waiting for its frame included, before
+// the window drops the tool.
+func (t *Tool) Close() {
+	if t.state != off {
+		t.stop()
+	}
+	t.capture = nil
+	t.host.Invalidate()
 }
 
 // Toggle starts a session, or ends the one running.
@@ -288,6 +298,12 @@ func (t *Tool) keyFilters() []event.Filter {
 	}
 }
 
+// comboPress reports that e is the shortcut f: its key, its required
+// modifiers and no others than its optional ones (the router's match).
+func comboPress(f key.Filter, e key.Event) bool {
+	return e.Name == f.Name && e.Modifiers&f.Required == f.Required && e.Modifiers&^(f.Required|f.Optional) == 0
+}
+
 // readPointer reads the window-wide area's events and reports a primary
 // press, and a release after it in the same batch.
 func (t *Tool) readPointer(gtx layout.Context) (clicked, released bool) {
@@ -362,7 +378,7 @@ func (t *Tool) readKeys(gtx layout.Context) {
 		switch {
 		case ke.Name == key.NameEscape:
 			t.stop()
-		case ke.Name == t.combo.Name && ke.Modifiers == t.combo.Required:
+		case comboPress(t.combo, ke):
 			t.stop()
 		case ke.Name == key.NameUpArrow:
 			t.up++

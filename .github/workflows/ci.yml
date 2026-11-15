@@ -149,6 +149,12 @@ jobs:
       - name: Gio lets go of what earlier frames held (vendored gioui.org/io/input, gpu, text)
         if: ${{ !cancelled() }}
         run: go test -count=1 -v -run 'ReleasesTagsOfEarlierFrames|ReleaseImagesOfEarlierFrames|ShaperReleasesSource' gioui.org/io/input gioui.org/gpu gioui.org/text
+      # Gio patch 28: Source.KeyPresses has every key press, the ones
+      # widgets take included (the inspect tool's Konami code), once each;
+      # a press no filter matches gets a frame and stays unhandled
+      - name: Gio key presses whoever takes them (vendored gioui.org/io/input)
+        if: ${{ !cancelled() }}
+        run: go test -count=1 -v -run 'KeyPresses' gioui.org/io/input
       # Gio patch 21: a hover-only Source (the inspect tool lays the window
       # out with one): hover, scroll and focus stay, clicks and keys don't
       - name: Gio hover-only input (vendored gioui.org/io/input)
@@ -965,16 +971,25 @@ jobs:
           go test -count=1 -v -timeout 10m -run '^TestMacWindowCloseHides$' ./internal/ui
           ui=$?
           exit $((gio | ui))
-      # The inspect tool's keys on App.Run's own window, posted as a
-      # keyboard makes them (cocoatest.PostKey: the layout's characters)
-      # and delivered by AppKit: NSApp sendEvent:, the menu bar's key
-      # equivalents, Gio's view and its interpretKeyEvents:. The log has
-      # what the view got of each key (cocoatest.TraceKeys).
-      - name: macOS inspect keys (AppKit's key path)
+      # Keys posted as a keyboard makes them (cocoatest.PostKey: the
+      # layout's characters) and delivered by AppKit: NSApp sendEvent:, the
+      # menu bar's key equivalents, Gio's view and its interpretKeyEvents:.
+      # Gio patch 29: ⌘ presses AppKit's text system sends no command for
+      # (⌘⌥⇧D, ⌃⌥⇧⌘D) reach a window's filters, once. Then the inspect
+      # tool on App.Run's own window: the Konami code turns it on and off,
+      # Hyper+D starts and ends a session. The logs have what the view got
+      # of each key (cocoatest.TraceKeys).
+      - name: macOS keys through AppKit (Gio patch 29, the inspect tool)
         if: ${{ !cancelled() }}
         env:
           CLACK_MACOS_WINDOW_TESTS: "1"
-        run: go test -count=1 -v -timeout 10m -run '^TestMacInspectKeys$' ./internal/ui
+        run: |
+          set +e
+          go test -count=1 -v -timeout 10m -run '^TestMacCommandKeys$' gioui.org/app
+          gio=$?
+          go test -count=1 -v -timeout 10m -run '^TestMacInspectKeys$' ./internal/ui
+          ui=$?
+          exit $((gio | ui))
       # docs/GAPS-2026-11-14.md gap 9 (W40). Gio patch 25 on real NSWindows:
       # Displays against NSScreen, a window opened at Bounds (points from
       # the primary screen's top left), its ConfigEvents' bounds through a

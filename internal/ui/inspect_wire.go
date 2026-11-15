@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"image"
+	"slices"
 	"strings"
 
 	"gioui.org/io/key"
@@ -10,37 +11,110 @@ import (
 	"gioui.org/op"
 
 	"github.com/some-du6e/clack/internal/ui/inspect"
+	"github.com/some-du6e/clack/internal/ui/shortcut"
 	"github.com/some-du6e/clack/internal/ui/slackc"
 	"github.com/some-du6e/clack/internal/ui/theme"
 )
 
 // The inspect tool (internal/ui/inspect): a Clack developer shortcut for
 // bug reports, not a Slack feature, so nothing about it shows until it
-// runs. It's off unless CLACK_INSPECT=1 is set or ui.json has
-// "inspect_tool": true (no Preferences row); then ⌘⌥⇧D (Ctrl+Alt+Shift+D)
-// starts a session, Esc or the shortcut again ends it, and a click copies
-// a report of the element under the pointer.
+// runs (no Preferences row, no menu item). The Konami code typed in the
+// main window, ↑ ↑ ↓ ↓ ← → ← → B A, turns it on at once and keeps it on in
+// ui.json ("inspect_tool": true); the code again turns it off.
+// CLACK_INSPECT=1 turns it on too, read at launch like ui.json. Then
+// Hyper+D (⌃⌥⇧⌘D; Ctrl+Alt+Shift+D on Linux and Windows) starts a
+// session, Esc or Hyper+D again ends it, and a click copies a report of
+// the element under the pointer.
 
-// inspectCombo is the tool's shortcut (internal/ui/shortcut syntax).
-const inspectCombo = "Mod+Alt+Shift+D"
+// inspectCombo is the tool's shortcut (internal/ui/shortcut syntax):
+// Hyper+D, all four modifiers (off macOS Mod is Ctrl, so three).
+const inspectCombo = "Mod+Alt+Ctrl+Shift+D"
+
+// inspectFilter is inspectCombo's key filter. Super may be held as well:
+// a Linux Hyper key can add it to the other four.
+func inspectFilter() key.Filter {
+	n, m := parseCombo(inspectCombo)
+	return key.Filter{Name: n, Required: m, Optional: key.ModSuper}
+}
 
 // inspectGated reports the tool's gate.
 func (a *App) inspectGated() bool { return envFlag("INSPECT") || a.prefs.InspectTool }
 
-// initInspect makes the tool when it's gated on (after loadPrefs).
+// initInspect makes the tool when it's gated on and not made yet (after
+// loadPrefs, and when the Konami code turns it on).
 func (a *App) initInspect() {
-	if !a.inspectGated() {
+	if !a.inspectGated() || a.insp != nil {
 		return
 	}
-	n, m := parseCombo(inspectCombo)
-	a.inspKey = key.Filter{Name: n, Required: m}
+	a.inspKey = inspectFilter()
 	a.insp = inspect.New(inspectHost{a}, a.inspKey)
 }
 
-// inspectBegin reads the shortcut before anything else reads keys (it
-// works over a modal too), and while a session runs returns the
-// hover-only context the window lays out with.
+// setInspectTool turns the tool on or off at once, and for the next
+// launches (ui.json; CLACK_INSPECT=1 still turns it on at launch).
+func (a *App) setInspectTool(on bool) {
+	a.prefs.InspectTool = on
+	a.savePrefs()
+	if on {
+		a.initInspect()
+		a.Toast("Inspect tool on: " + shortcut.Format(inspectCombo) + " to inspect")
+		return
+	}
+	if a.insp != nil {
+		a.insp.Close() // a session, a pick's included, ends
+		a.insp = nil
+	}
+	a.Toast("Inspect tool off")
+}
+
+// konamiCode turns the inspect tool on, and again off.
+var konamiCode = [...]key.Name{
+	key.NameUpArrow, key.NameUpArrow, key.NameDownArrow, key.NameDownArrow,
+	key.NameLeftArrow, key.NameRightArrow, key.NameLeftArrow, key.NameRightArrow,
+	"B", "A",
+}
+
+// konami follows the Konami code through the window's key presses.
+type konami struct {
+	n int // the code's first n keys are the last ones pressed
+}
+
+// press takes the next key press (Gio patch 28 keeps modifier keys' own
+// out) and reports the code complete. Shift may be held (a capital B);
+// with any other modifier the press is a shortcut and starts it over.
+func (k *konami) press(e key.Event) bool {
+	if e.Modifiers&^key.ModShift != 0 {
+		k.n = 0
+		return false
+	}
+	// the longest start of the code the presses end with: after ↑ ↑ a
+	// third ↑ still leaves ↑ ↑
+	for m := min(k.n+1, len(konamiCode)); m > 0; m-- {
+		if konamiCode[m-1] == e.Name && slices.Equal(konamiCode[:m-1], konamiCode[k.n-m+1:k.n]) {
+			if m == len(konamiCode) {
+				k.n = 0
+				return true
+			}
+			k.n = m
+			return false
+		}
+	}
+	k.n = 0
+	return false
+}
+
+// inspectBegin follows the Konami code, reads the shortcut before
+// anything else reads keys (it works over a modal too), and while a
+// session runs returns the hover-only context the window lays out with.
 func (a *App) inspectBegin(gtx layout.Context) layout.Context {
+	// every key press, whichever widget takes it (the composer takes the
+	// arrows and the letters): Gio patch 28. Once per frame: a frame
+	// laid out again reads none.
+	for _, e := range gtx.Source.KeyPresses() {
+		if a.konami.press(e) {
+			a.setInspectTool(a.insp == nil)
+		}
+	}
 	if a.insp == nil {
 		return gtx
 	}
