@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime/pprof"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,7 +37,8 @@ import (
 // (<prefix>-<n>-<surface>.pprof; ci prints their tops).
 //
 // A surface may draw what TestIdleFrames allows (a focused caret's
-// blinks and idleOtherFrames more), and a hidden window draws nothing.
+// blinks and idleOtherFrames more), also when every frame takes longer
+// than a vsync, and a hidden window draws nothing.
 func TestMacIdleCPU(t *testing.T) {
 	if !macWindowTests {
 		t.Skip("CLACK_MACOS_WINDOW_TESTS not set")
@@ -55,6 +57,9 @@ func TestMacIdleCPU(t *testing.T) {
 	defer rec.Close()
 	views := make(chan uintptr, 1)
 	var a *App
+	// slow: every frame takes longer than a vsync, as a busy or swapping
+	// Mac's do (Karim's 8 GB one, 2026-11-14)
+	var slow atomic.Bool
 	images := imgcache.New(fs.Fetch, "", nil)
 	a = New(Options{ConfigDir: home, Started: time.Now(), OnWindowEvent: func(e event.Event) {
 		switch e := e.(type) {
@@ -67,6 +72,9 @@ func TestMacIdleCPU(t *testing.T) {
 			}
 		case app.FrameEvent:
 			rec.Frame()
+			if slow.Load() {
+				time.Sleep(30 * time.Millisecond)
+			}
 		}
 	}}, images)
 	invalidateHook = func(b *App) {
@@ -202,6 +210,11 @@ func TestMacIdleCPU(t *testing.T) {
 
 	var reps []idleprobe.Report
 	reps = append(reps, measure("channel", true))
+	// a frame slower than a vsync: the display link's tick during it
+	// asked AppKit for one more frame after it, nobody's (Gio patch 28)
+	slow.Store(true)
+	reps = append(reps, measure("channel, frames slower than a vsync", true))
+	slow.Store(false)
 	onUI(func() { a.OpenThread(ch, fakeslack.ThreadRootTS) })
 	focus(fakeslack.ThreadRootTS)
 	reps = append(reps, measure("thread", true))

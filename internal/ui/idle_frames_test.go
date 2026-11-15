@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"gioui.org/f32"
 	"gioui.org/io/key"
 	"gioui.org/io/pointer"
 	"gioui.org/widget"
@@ -115,13 +116,109 @@ func TestIdleFrames(t *testing.T) {
 			ch = fakeslack.ThreadPublicID
 			e.openChannel(ch)
 			e.until("history", 20*time.Second, func() bool { return e.loadedMessages(ch) > 0 })
-			for _, page := range []string{"threads", "later", "dms", "files", "huddles", "unreads", "drafts", "directories", "saved"} {
+			for _, page := range []string{"threads", "later", "dms", "files", "huddles", "unreads", "drafts", "saved"} {
 				e.a.Navigate(page)
 				e.frame()
 				e.idle(t, p, page, false)
 			}
+			e.a.Navigate("directories")
+			e.frame()
+			e.idle(t, p, "directories", true) // Slack focuses its search field
+			if motion.override >= 0 {
+				return // the rest with full motion only
+			}
+			e.shutdown()
+
+			// a pointer resting over the window: hover states (a row's
+			// background and actions, the sidebar's row, tooltips after
+			// their delays) settle, and nothing keeps animating
+			sz = fakeslack.Small
+			sz.Unread = 0
+			sz.ThreadHeader = true
+			e = newIdleEnv(t, sz, motion.override)
+			measured.Store(e.a)
+			ch = fakeslack.ThreadPublicID
+			e.openChannel(ch)
+			e.until("history", 20*time.Second, func() bool { return e.loadedMessages(ch) > 0 })
+			for _, at := range []struct {
+				name string
+				x, y float32
+			}{
+				{"pointer on the newest message", 900, 720},
+				{"pointer on the message list", 900, 400},
+				{"pointer on a sidebar row", 160, 260},
+				{"pointer on the channel header", 800, 64},
+				{"pointer on the top nav", 700, 18},
+				{"pointer on the rail", 34, 180},
+			} {
+				e.r.Queue(pointer.Event{Kind: pointer.Move, Source: pointer.Mouse, Position: f32.Pt(at.x, at.y)})
+				e.frame()
+				e.idle(t, p, at.name, false)
+			}
+			e.r.Queue(pointer.Event{Kind: pointer.Leave, Source: pointer.Mouse, Position: f32.Pt(-1, -1)})
+			e.frame()
+
+			// a huddle on in the open channel and in another (the header's
+			// button, the sidebar's Huddles link and rows)
+			if users := e.fs.GroupDMUsers(); len(users) >= 4 {
+				other := ""
+				for _, id := range e.fs.ChannelIDs() {
+					if id != ch {
+						other = id
+						break
+					}
+				}
+				now := time.Now().Unix()
+				e.fs.PushHuddleRoom("sh_room_join", ch, "R0IDLE0001", []string{users[0].ID, users[1].ID, users[2].ID}, now-120, nil)
+				e.fs.PushHuddleRoom("sh_room_join", other, "R0IDLE0002", []string{users[3].ID}, now-60, nil)
+				hud := e.a.huddles()
+				e.untilSoft(10*time.Second, func() bool { _, on := hud.Live(ch); return on })
+				e.idle(t, p, "huddles on in the channel and another", false)
+			}
+			e.shutdown()
+
+			// every fixture gallery's messages laid out at once (a window
+			// tall enough for most of them): Block Kit, link previews,
+			// files, an agent's thread, code channels, work objects,
+			// workflows, pins, bot and app senders
+			sz = fakeslack.Small
+			sz.Unread = 0
+			sz.Gallery, sz.Embeds, sz.Files, sz.AgentThread, sz.CodeChannels = true, true, true, true, true
+			sz.WorkObjects, sz.Workflows, sz.PinsFolders, sz.Identity = true, true, true, true
+			e = newIdleEnv(t, sz, motion.override)
+			measured.Store(e.a)
+			e.size = image.Pt(1440, 4000)
+			for _, g := range []struct{ name, ch string }{
+				{"#blockkit-gallery", fakeslack.GalleryChannelID},
+				{"#embeds-gallery", fakeslack.EmbedsChannelID},
+				{"#files-gallery", fakeslack.FilesChannelID},
+				{"the agent's DM", fakeslack.AgentDMID},
+				{"a working code channel", fakeslack.CodeWorkingID},
+				{"#work-objects", fakeslack.WorkObjectsChannelID},
+				{"#workflows-gallery", fakeslack.WorkflowsChannelID},
+				{"#pins-gallery", fakeslack.PinsChannelID},
+				{"#identity-fixtures", fakeslack.IdentityChannelID},
+			} {
+				e.openChannel(g.ch)
+				if !e.untilSoft(20*time.Second, func() bool { return e.loadedMessages(g.ch) > 0 }) {
+					t.Logf("%s: no history loaded", g.name)
+				}
+				e.idle(t, p, g.name, false)
+			}
 		})
 	}
+}
+
+// untilSoft runs frames until cond holds or d passes, and reports which.
+func (e *perfEnv) untilSoft(d time.Duration, cond func() bool) bool {
+	for dl := time.Now().Add(d); time.Now().Before(dl); time.Sleep(time.Millisecond) {
+		if cond() {
+			e.frame()
+			return true
+		}
+		e.frame()
+	}
+	return false
 }
 
 // idleOtherFrames is what a surface may draw in idleFor besides caret
