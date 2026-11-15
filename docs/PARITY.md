@@ -15,7 +15,7 @@ python3 -I tools/parity.py --refresh emoji-rank  # rerun Slack's side, rewrite i
 python3 -I tools/parity.py --from DIR            # read go test -json files instead of running go
 ```
 
-The default run is `go test -json -run <the registered tests>` over their packages, then a comparison. Slack's side is committed, so nothing on this path starts node or touches the network, and Go's test cache answers for packages you didn't change. Run it after each change and it tells you whether you drifted from Slack. It prints one line per dimension. This is CI's run of 2026-11-14 (ci run 43644570005), cut a little:
+The default run is `go test -json -run <the registered tests>` over their packages, then a comparison. Slack's side is committed, so nothing on this path starts node or touches the network, and Go's test cache answers for packages you didn't change. Run it after each change and it tells you whether you drifted from Slack. It prints one line per dimension, and under a dimension that differs, each case that differs. This is CI's run of 2026-11-14 (ci run 43644570005), cut a little, from before branch emoji-v17 fixed the two cases it shows as known divergences; since then (ci run 43655459669) its first line reads `parity: 10 of 10 dimensions the same as Slack; 26 of 26 checks, 122 of 122 itemised cases.`
 
 ```
 parity: 9 of 10 dimensions the same as Slack (1 with known divergences); 23 of 24 checks, 116 of 118 itemised cases.
