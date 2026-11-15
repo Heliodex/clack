@@ -125,6 +125,28 @@ func (w *World) edge(method string, body map[string]json.RawMessage) (any, bool)
 		}
 		w.mu.Unlock()
 		return okMap("results", res), true
+	case "edge/channels/membership":
+		// getChannelMembershipInfoForUsers (App details' primary action,
+		// the invite dialog): which of users are in channel
+		var users []string
+		_ = json.Unmarshal(body["users"], &users)
+		members, non := []string{}, []string{}
+		w.mu.Lock()
+		in := map[string]bool{}
+		if c, ok := w.convLocked(str("channel")); ok {
+			for _, id := range w.membersLocked(c) {
+				in[id] = true
+			}
+		}
+		w.mu.Unlock()
+		for _, u := range users {
+			if in[u] {
+				members = append(members, u)
+			} else {
+				non = append(non, u)
+			}
+		}
+		return okMap("members", members, "non_members", non), true
 	case "edge/channels/info":
 		res, failed := []slack.Conversation{}, []string{}
 		w.mu.Lock()
