@@ -677,6 +677,44 @@ func withListViewName(t chTab) chTab {
 	return t
 }
 
+// tabSpans is a tab's label spans: an unlabeled canvas tab's title_blocks
+// (core.Tab.TitleSpans) drawn as Slack's tab draws them, else the label
+// with its :emoji: resolved (tabLabelSpans).
+func tabSpans(t core.Tab, label string, emoji func(name string) (url, text string, ok bool)) []richtext.Span {
+	if len(t.TitleSpans) > 0 {
+		return tabTitleSpans(t.TitleSpans)
+	}
+	return tabLabelSpans(label, emoji)
+}
+
+// tabTitleSpans is a canvas title's spans in the tab bar: bold, and every
+// mention or link plain text in the tab's colour. Slack renders the title
+// blocks with noInlineLinks (QuipTitleParsedId), so BaseMrkdwnChannel and
+// the member slugs draw an unlinked c-member_slug, which
+// .p-quip_title__blocks_simple gives color: inherit and no background.
+// Emoji stay images; the rest stops at the first line break.
+func tabTitleSpans(in []richtext.Span) []richtext.Span {
+	out := make([]richtext.Span, 0, len(in))
+	for _, s := range in {
+		if s.Kind == richtext.Break {
+			break
+		}
+		if s.Kind == richtext.Emoji && s.URL != "" {
+			out = append(out, s)
+			continue
+		}
+		if s.Text == "" {
+			continue
+		}
+		if n := len(out); n > 0 && out[n-1].Kind == richtext.Text && out[n-1].Style == s.Style|richtext.Bold {
+			out[n-1].Text += s.Text
+			continue
+		}
+		out = append(out, richtext.Span{Kind: richtext.Text, Text: s.Text, Style: s.Style | richtext.Bold})
+	}
+	return out
+}
+
 // tabLabelSpans resolves a tab label's :emoji: codes to emoji spans, as
 // Slack's tab label does; nil when the label has none that resolve.
 func tabLabelSpans(label string, emoji func(name string) (url, text string, ok bool)) []richtext.Span {
