@@ -52,7 +52,7 @@ func loadFonts() error {
 // PanelMinWidth is the narrowest the report panel gets, in the panel's
 // dp (its text is 12 of them): a small element's image is this wide, the
 // element at its own size centred above the panel.
-const PanelMinWidth = 420
+const PanelMinWidth = 600
 
 // MarginBlur is how far the margin around the element is blurred, dp: a
 // box blur this far each way, three times (near a Gaussian of this

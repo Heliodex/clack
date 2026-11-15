@@ -14,15 +14,15 @@ import (
 // outlined (a halo, the outline's colour, a faint wash inside), and under
 // a band of the same colour the report's panel with its text.
 func TestComposeOutlineAndPanel(t *testing.T) {
-	shot := image.NewRGBA(image.Rect(0, 0, 480, 240))
+	shot := image.NewRGBA(image.Rect(0, 0, 640, 240))
 	draw.Draw(shot, shot.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
 	rect := image.Rect(100, 50, 200, 100)
 	img, err := Compose(shot, rect, 1, testReport().Lines())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b := img.Bounds(); b.Dx() != 480 || b.Dy() <= 240+100 {
-		t.Fatalf("composed size %v: want 480 wide (the shot, wider than the panel's minimum), the shot plus a panel", b)
+	if b := img.Bounds(); b.Dx() != 640 || b.Dy() <= 240+100 {
+		t.Fatalf("composed size %v: want 640 wide (the shot, wider than the panel's minimum), the shot plus a panel", b)
 	}
 	at := func(x, y int) color.RGBA { return img.RGBAAt(x, y) }
 	oc := color.RGBA{R: outlineCol.R, G: outlineCol.G, B: outlineCol.B, A: 0xff}
@@ -46,7 +46,7 @@ func TestComposeOutlineAndPanel(t *testing.T) {
 	}
 	ink := 0
 	for y := 244; y < img.Bounds().Max.Y; y++ {
-		for x := 0; x < 480; x++ {
+		for x := 0; x < 640; x++ {
 			if c := at(x, y); int(c.R)+int(c.G)+int(c.B) > 500 {
 				ink++
 			}
@@ -122,9 +122,9 @@ func TestComposeSmallElement(t *testing.T) {
 // caught of the neighbours: 1 px stripes, sharper than any text), the
 // element stays sharp.
 func TestComposeBlursTheMargin(t *testing.T) {
-	shot := image.NewRGBA(image.Rect(0, 0, 480, 120))
+	shot := image.NewRGBA(image.Rect(0, 0, 640, 120))
 	for y := 0; y < 120; y++ {
-		for x := 0; x < 480; x++ {
+		for x := 0; x < 640; x++ {
 			c := color.RGBA{A: 0xff}
 			if x%2 == 0 {
 				c = color.RGBA{0xff, 0xff, 0xff, 0xff}
@@ -141,7 +141,7 @@ func TestComposeBlursTheMargin(t *testing.T) {
 	abs := func(v int) int { return max(v, -v) }
 	sharp := 0
 	for y := 0; y < 120; y++ {
-		for x := 0; x+1 < 480; x++ {
+		for x := 0; x+1 < 640; x++ {
 			p := image.Pt(x, y)
 			if p.In(elem.Inset(-12)) {
 				continue // the element, its outline, and the blur's edge next to it

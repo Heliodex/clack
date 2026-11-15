@@ -26,7 +26,7 @@ The window keeps working while the session runs, minus clicks and keys. Hover st
 A click picks the outlined element and ends the session. Clack then:
 
 1. renders the element and 24 dp around it, and nothing else of the window, from the click's frame again through a headless GPU context (the window's own GPU can't read frames back). It draws that crop at 4 px per dp whatever the display, under a transform over the frame's ops (Gio patch 31, `Ops.Whole`). Paths and glyphs are vectors, so the element comes out as sharp as a window four times as dense, and the image stays small enough that Slack shows it near its own size. An element whose image would pass 3200 px is drawn less dense, never below the window's own px,
-2. blurs the 24 dp margin past reading (a 5 dp box blur, three passes), so the neighbouring messages, channels and names are smears and only the element is sharp, outlines the element, and draws the report as a panel under it, on the CPU with the Go fonts. The image is as wide as the crop, or as the panel's 420 dp minimum for a small element (the crop sits centred above the panel at its own size),
+2. blurs the 24 dp margin past reading (a 5 dp box blur, three passes), so the neighbouring messages, channels and names are smears and only the element is sharp, outlines the element, and draws the report as a panel under it, on the CPU with the Go fonts. The image is as wide as the crop, or as the panel's 600 dp minimum for a small element (the crop sits centred above the panel at its own size),
 3. copies that one image to the clipboard, so a paste in #clack carries both,
 4. saves the image and the report's text as `inspect-reports/inspect-<date>-<time>.png` and `.txt` in the config folder, readable by the owner only.
 

@@ -314,8 +314,8 @@ func TestInspectReactionPill(t *testing.T) {
 	if shotW/inspect.ShotDensity*5 > e.size.X {
 		t.Errorf("the copied image shows %d dp of the %d dp window: more than the pill", shotW/inspect.ShotDensity, e.size.X)
 	}
-	if b.Dx() < shotW || b.Dx() >= e.size.X || b.Dy() <= shotH+100 {
-		t.Errorf("the copied image is %v (shot %dx%d): want the pill's crop with the report under it, narrower than the %d px window", b, shotW, shotH, e.size.X)
+	if b.Dx() < shotW || b.Dx() >= e.size.X*inspect.ShotDensity/2 || b.Dy() <= shotH+100 {
+		t.Errorf("the copied image is %v (shot %dx%d): want the pill's crop with the report under it, far narrower than the window at that density (%d px)", b, shotW, shotH, e.size.X*inspect.ShotDensity)
 	}
 	if !strings.Contains(e.a.toast.text, "Copied the inspect report") {
 		t.Errorf("toast %q", e.a.toast.text)
