@@ -42,7 +42,7 @@ func TestTabTitleSpans(t *testing.T) {
 	if s := tabSpans(core.Tab{Title: "<#C2> plain"}, "<#C2> plain", nil); s != nil {
 		t.Errorf("plain title: %+v", s)
 	}
-	if s := tabSpans(core.Tab{TitleSpans: in[:2]}, "#ship-guidelines Guidelines", nil); richtext.PlainSpans(s) != "#ship-guidelines Guidelines" {
+	if s := tabSpans(core.Tab{TitleSpans: in[:2]}, "#ship-guidelines Guidelines ", nil); richtext.PlainSpans(s) != "#ship-guidelines Guidelines " {
 		t.Errorf("title spans: %+v", s)
 	}
 }
