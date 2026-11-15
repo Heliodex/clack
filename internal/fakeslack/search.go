@@ -573,6 +573,9 @@ func (s *Server) handleSearch(method string, f url.Values) (any, bool) {
 	case "search.modules.dms":
 		return s.searchMessages(f, true), true
 	case "search.modules.files": // canvases (type:quip) are canvas.go's
+		if out, handled := s.filesBrowserImages(f); handled { // files_view.go
+			return out, true
+		}
 		o := parseSQ(f.Get("query"))
 		var items []any
 		if len(o.terms) > 0 && strings.Contains(strings.ToLower(SearchFileTitle), o.terms[0]) {

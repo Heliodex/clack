@@ -175,8 +175,8 @@ func convertFile(f *slack.File) *File {
 	mime := strings.ToLower(f.Mimetype)
 	switch {
 	case strings.HasPrefix(mime, "image/"):
-		if !fileIsImage(f) {
-			break // getFileType "generic": a file card, no thumb
+		if !slack.FileIsImage(f) {
+			break // getFileType "generic": a file card, no thumb (FileIsImage)
 		}
 		out.IsImage = true
 		out.Thumb = imageThumb(f)
@@ -233,18 +233,6 @@ func (c *builder) expandable(out *File) {
 	}
 }
 
-// fileIsImage is Slack's fileIsImage (2HRR, build c07ab895506f) for an
-// image/* file: a Salesforce file, or one Slack made a thumb_360 (or the
-// animated thumb_360_gif) for, or a HEIC/HEIF with thumb_800. Slack makes
-// no thumbs at all for some huge images (a 828×25208 phone screenshot has
-// no thumb_* and no original_w/h), and its getFileType (e4n/) calls them
-// "generic": FileGallery (T4f+) puts a lone one in SINGLE_FILE mode, a
-// file card that opens the file's page, never the original inline.
-func fileIsImage(f *slack.File) bool {
-	t := strings.ToLower(f.Filetype)
-	return f.IsSalesforceFile || f.Thumb360 != "" || f.Thumb360GIF != "" || (t == "heic" || t == "heif") && f.Thumb800 != ""
-}
-
 // imageThumb picks the thumbnail Slack shows inline (thumb_1024 first, then
 // the next largest) with its pixel size: Slack sizes inline images from the
 // 1024 thumb's dimensions, up to the gallery width. An animated GIF plays
@@ -252,7 +240,7 @@ func fileIsImage(f *slack.File) bool {
 // 720, 2HRR: thumb_480_gif, then thumb_360_gif); one without either draws
 // its static thumbs, as in Slack. Small images have no thumb past their
 // own size (a 223px screenshot stops at thumb_360, which is the
-// original's size). Only files fileIsImage takes get here: thumb_360 is
+// original's size). Only files slack.FileIsImage takes get here: thumb_360 is
 // there, or a HEIC's thumb_800; the original (url_private) and the small
 // thumbs are left for a Salesforce file.
 func imageThumb(f *slack.File) *Image {

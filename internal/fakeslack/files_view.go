@@ -8,13 +8,41 @@ package fakeslack
 // 24 hours: files.recentlyDeleted lists it ({id, title, date_delete,
 // file_type: quip | list}, filtered by file_type) and files.undelete
 // {file_id} puts it back. Every write is recorded (FilesViewCalls).
+//
+// One read: the browser's Images type (search.modules.files, search_context
+// desktop_files_browser, type:images) lists #files-gallery's images,
+// newest share first (FilesBrowserImages), the un-thumbnailed ones
+// (FilesUnthumbedImage, FilesUnthumbedSized) among them.
 
 import (
 	"net/url"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
+
+// FilesBrowserImages are the Files browser's Images results:
+// #files-gallery's image/* files, as search items.
+func (s *Server) FilesBrowserImages() []map[string]any {
+	var out []map[string]any
+	for _, it := range s.ChannelFilesTab(true) {
+		if mime, _ := it["mimetype"].(string); strings.HasPrefix(mime, "image/") {
+			out = append(out, it)
+		}
+	}
+	return out
+}
+
+// filesBrowserImages answers the browser's type:images search (handled
+// false for any other).
+func (s *Server) filesBrowserImages(f url.Values) (any, bool) {
+	if f.Get("search_context") != "desktop_files_browser" || !strings.Contains(" "+f.Get("query")+" ", " type:images ") {
+		return nil, false
+	}
+	items := s.FilesBrowserImages()
+	return ok("items", items, "pagination", map[string]any{"total_count": len(items), "page": 1, "page_count": 1}), true
+}
 
 type filesViewStore struct {
 	mu      sync.Mutex
