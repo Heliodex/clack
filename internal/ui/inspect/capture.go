@@ -9,11 +9,13 @@ import (
 	"image/color"
 	"image/png"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
 	"time"
 
+	"gioui.org/f32"
 	"gioui.org/gpu/headless"
 	"gioui.org/layout"
 	"gioui.org/op"
@@ -30,18 +32,36 @@ type capture struct {
 	rect  image.Rectangle // px, window
 	ptr   image.Point     // px
 	scale float32
+
+	// once shot: the element and the pointer in the shot (px), and the
+	// shot's image px per window px
+	elem    image.Rectangle
+	ptrShot image.Point
+	k       float32
 }
 
-// Shoot renders a frame's ops into a size image. The window's GPU can't
+// Shoot renders the part of a frame's ops in region (window px), each px
+// of it drawn as k: a ShotSize(region, k) image. The window's GPU can't
 // read its frames back, so the ops go once more through a headless GPU
-// context (a Metal device, D3D11, EGL). Tests replace it.
-var Shoot = func(ops *op.Ops, size image.Point) (*image.RGBA, error) {
+// context (a Metal device, D3D11, EGL), under a transform that scales
+// the region up and moves it to the origin; paths and glyph outlines are
+// vectors, so the region comes out as sharp as a window k times as dense
+// (Gio patch 31, Ops.Whole). Tests replace it.
+var Shoot = func(ops *op.Ops, region image.Rectangle, k float32) (*image.RGBA, error) {
+	size := ShotSize(region, k)
+	if size.X <= 0 || size.Y <= 0 {
+		return nil, errors.New("empty region")
+	}
 	w, err := headless.NewWindow(size.X, size.Y)
 	if err != nil {
 		return nil, err
 	}
 	defer w.Release()
-	if err := w.Frame(ops); err != nil {
+	var o op.Ops
+	tr := op.Affine(f32.AffineId().Offset(f32.Pt(-float32(region.Min.X), -float32(region.Min.Y))).Scale(f32.Point{}, f32.Pt(k, k))).Push(&o)
+	ops.Whole().Add(&o)
+	tr.Pop()
+	if err := w.Frame(&o); err != nil {
 		return nil, err
 	}
 	img := image.NewRGBA(image.Rectangle{Max: size})
@@ -49,6 +69,43 @@ var Shoot = func(ops *op.Ops, size image.Point) (*image.RGBA, error) {
 		return nil, err
 	}
 	return img, nil
+}
+
+// ShotSize is the size of Shoot's image of region at k.
+func ShotSize(region image.Rectangle, k float32) image.Point {
+	return image.Pt(int(float32(region.Dx())*k+.5), int(float32(region.Dy())*k+.5))
+}
+
+// The pick's image shows the element, not the window: the element and
+// CropMargin dp around it (blurred in Compose, so no neighbour's text
+// can be read), drawn at ShotDensity px per dp so the pasted element
+// stays sharp, at a lower density for an element so big its image would
+// be wider or taller than MaxShotSide px, never below the window's own.
+const (
+	CropMargin  = 24
+	ShotDensity = 4
+	MaxShotSide = 3200
+)
+
+// cropFor is the part of a size px window the image of rect (px) shows,
+// and how many image px each of its window px becomes.
+func cropFor(rect image.Rectangle, size image.Point, scale float32) (image.Rectangle, float32) {
+	m := int(math.Ceil(float64(CropMargin * scale)))
+	crop := rect.Inset(-m).Intersect(image.Rectangle{Max: size})
+	if crop.Empty() || rect.Intersect(crop).Empty() {
+		return image.Rectangle{}, 1
+	}
+	k := ShotDensity / scale
+	if side := float32(max(crop.Dx(), crop.Dy())); side*k > MaxShotSide {
+		k = MaxShotSide / side
+	}
+	return crop, max(k, 1)
+}
+
+// inShot maps r (window px) into the shot of crop at k.
+func inShot(r, crop image.Rectangle, k float32) image.Rectangle {
+	m := func(v, o int) int { return int(float32(v-o)*k + .5) }
+	return image.Rect(m(r.Min.X, crop.Min.X), m(r.Min.Y, crop.Min.Y), m(r.Max.X, crop.Min.X), m(r.Max.Y, crop.Min.Y))
 }
 
 // WriteImage puts the composed image on the clipboard (clipimg; tests
@@ -223,11 +280,20 @@ func (t *Tool) AfterFrame(ops *op.Ops, size image.Point) {
 		return
 	}
 	t.capture = nil
-	img, err := Shoot(ops, size)
+	crop, k := cropFor(c.rect, size, c.scale)
+	var img *image.RGBA
+	err := errors.New("the element is outside the window")
+	if !crop.Empty() {
+		img, err = Shoot(ops, crop, k)
+	}
 	if err != nil {
 		log.Printf("inspect: no screenshot: %v", err)
+		img = nil
 	} else {
-		c.rep.Colors = sampleColors(img, c.rect, c.ptr)
+		c.elem = inShot(c.rect, crop, k)
+		// the middle of the pointer's px
+		c.ptrShot = image.Pt(int((float32(c.ptr.X-crop.Min.X)+.5)*k), int((float32(c.ptr.Y-crop.Min.Y)+.5)*k))
+		c.k = k
 	}
 	t.deliver(c, img, err)
 }
@@ -235,19 +301,22 @@ func (t *Tool) AfterFrame(ops *op.Ops, size image.Point) {
 // deliver composes, saves and copies the report off the UI goroutine,
 // then says what it did in a toast.
 func (t *Tool) deliver(c *capture, shot *image.RGBA, shotErr error) {
-	lines := c.rep.Lines()
-	text := c.rep.Text()
 	dir := t.host.ConfigDir()
 	h := t.host
 	done := make(chan struct{})
 	t.lastDone = done
 	go func() {
 		defer close(done)
+		if shot != nil {
+			c.rep.Colors = sampleColors(shot, c.elem, c.ptrShot, max(int(c.k), 1))
+		}
+		lines := c.rep.Lines()
+		text := c.rep.Text()
 		var img *image.RGBA
 		var data []byte
 		if shot != nil {
 			var err error
-			if img, err = Compose(shot, c.rect, c.scale, lines); err != nil {
+			if img, err = Compose(shot, c.elem, c.scale*c.k, lines); err != nil {
 				log.Printf("inspect: composing the report image: %v", err)
 				img = nil
 			} else {
@@ -284,7 +353,7 @@ func (t *Tool) deliver(c *capture, shot *image.RGBA, shotErr error) {
 }
 
 // save writes the report's image and text to dir/inspect-reports (only
-// the owner can read them: the screenshot shows the workspace). It
+// the owner can read them: the image shows the element). It
 // returns the files' common stem.
 func save(dir string, when time.Time, img []byte, text string) (string, error) {
 	if dir == "" {
@@ -308,14 +377,16 @@ func save(dir string, when time.Time, img []byte, text string) (string, error) {
 
 // sampleColors reads the shot at the element: its background (the most
 // common colour in rect), its ink (the most common one clearly unlike the
-// background) and the pixel under the pointer.
-func sampleColors(img *image.RGBA, rect image.Rectangle, ptr image.Point) []string {
+// background) and the pixel under the pointer. It counts every step'th
+// pixel each way (the shot is denser than the window).
+func sampleColors(img *image.RGBA, rect image.Rectangle, ptr image.Point, step int) []string {
 	var out []string
 	r := rect.Intersect(img.Bounds())
+	step = max(step, 1)
 	if !r.Empty() {
 		counts := map[color.RGBA]int{}
-		for y := r.Min.Y; y < r.Max.Y; y++ {
-			for x := r.Min.X; x < r.Max.X; x++ {
+		for y := r.Min.Y; y < r.Max.Y; y += step {
+			for x := r.Min.X; x < r.Max.X; x += step {
 				counts[img.RGBAAt(x, y)]++
 			}
 		}
