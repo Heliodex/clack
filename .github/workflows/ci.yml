@@ -965,6 +965,16 @@ jobs:
           go test -count=1 -v -timeout 10m -run '^TestMacWindowCloseHides$' ./internal/ui
           ui=$?
           exit $((gio | ui))
+      # The inspect tool's keys on App.Run's own window, posted as a
+      # keyboard makes them (cocoatest.PostKey: the layout's characters)
+      # and delivered by AppKit: NSApp sendEvent:, the menu bar's key
+      # equivalents, Gio's view and its interpretKeyEvents:. The log has
+      # what the view got of each key (cocoatest.TraceKeys).
+      - name: macOS inspect keys (AppKit's key path)
+        if: ${{ !cancelled() }}
+        env:
+          CLACK_MACOS_WINDOW_TESTS: "1"
+        run: go test -count=1 -v -timeout 10m -run '^TestMacInspectKeys$' ./internal/ui
       # docs/GAPS-2026-11-14.md gap 9 (W40). Gio patch 25 on real NSWindows:
       # Displays against NSScreen, a window opened at Bounds (points from
       # the primary screen's top left), its ConfigEvents' bounds through a

@@ -1084,8 +1084,12 @@ the view and the window are still alive) and `TestHideLeavesFullscreenMac`
 (skipped on the runner: it enters full screen, but no `toggleFullScreen:`,
 AppKit's own from the main queue included, ever takes the window out
 again, so the full-screen hide is untested there). `internal/ui`
-`TestMacWindowCloseHides` is Clack's window on the same job. Not in
-`UPSTREAM.patch`.
+`TestMacWindowCloseHides` is Clack's window on the same job.
+`cocoatest.PostKey` posts a key press as a keyboard makes one (each
+modifier's `flagsChanged`, then the key's down and up with the characters
+the current layout types, `UCKeyTranslate`) for `NSApp` to deliver, and
+`TraceKeys` records what the view's key methods get (`internal/ui`
+`TestMacInspectKeys`). Not in `UPSTREAM.patch`.
 
 ## 25. app: Bounds, Displays, and where a window is (Windows, macOS)
 
