@@ -160,7 +160,9 @@ func fileClicks(t *testing.T, label string, h *fileClickHost, v clickView, size 
 			nu := len(*opened)
 			click(p, pointer.ButtonPrimary)
 			gotV, _ := h.counts()
-			switch img := strings.HasPrefix(want.Mimetype, "image/"); {
+			// fileIsImage: an image Slack made no thumb_360 for (a very
+			// tall screenshot) is a file card that opens its page
+			switch img := strings.HasPrefix(want.Mimetype, "image/") && (want.Thumb360 != "" || want.Thumb360GIF != ""); {
 			case img:
 				tiles++
 				if fr.R.Dy() < 100 {
@@ -178,6 +180,9 @@ func fileClicks(t *testing.T, label string, h *fileClickHost, v clickView, size 
 					t.Errorf("%s: clicking the snippet %s opened %v (viewer %v)", name, want.ID, (*opened)[nu:], gotV != nv)
 				}
 			default:
+				if strings.HasPrefix(want.Mimetype, "image/") && (fr.File.IsImage || fr.R.Dy() >= 100) {
+					t.Errorf("%s: unthumbed image %s is %v (image %v), want a file card", name, want.ID, fr.R, fr.File.IsImage)
+				}
 				if gotV != nv {
 					t.Errorf("%s: %s (%s) opened the image viewer", name, want.ID, want.Mimetype)
 				}

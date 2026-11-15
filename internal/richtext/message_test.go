@@ -47,7 +47,7 @@ func TestFiles(t *testing.T) {
 		 "thumb_720":"https://files.slack.com/files-tmb/T1-F1-x/a_720.png","thumb_720_w":720,"thumb_720_h":360,
 		 "original_w":1440,"original_h":720},
 		{"id":"F2","name":"b.jpg","title":"Holiday","mimetype":"image/jpeg","url_private":"https://files.slack.com/files-pri/T1-F2/b.jpg",
-		 "thumb_480":"https://files.slack.com/files-tmb/T1-F2-x/b_480.jpg","original_w":2000,"original_h":1000},
+		 "thumb_360":"https://files.slack.com/files-tmb/T1-F2-x/b_360.jpg","thumb_480":"https://files.slack.com/files-tmb/T1-F2-x/b_480.jpg","original_w":2000,"original_h":1000},
 		{"id":"F3","name":"c.gif","mimetype":"image/gif","size":5000,"url_private":"https://files.slack.com/files-pri/T1-F3/c.gif",
 		 "thumb_360":"https://files.slack.com/files-tmb/T1-F3-x/c_360.png","original_w":200,"original_h":100},
 		{"id":"F4","name":"v.mp4","mimetype":"video/mp4","url_private":"https://files.slack.com/files-pri/T1-F4/v.mp4",
@@ -294,12 +294,15 @@ func TestPlainText(t *testing.T) {
 	eq(t, "tombstone", PlainText(Doc{Blocks: []Block{tombstone("This message was deleted.")}}), "This message was deleted.")
 }
 
-// Images Slack draws inline whatever thumbs they carry (fileIsImage:
-// image/* plus an image filetype or thumb_360): a small screenshot with
-// thumbs only up to thumb_360 (the shape of a real 223px paste), a wide
-// short one whose thumb_360 is 44px tall, one with only the small thumbs,
-// and one with no thumbs at all (the original). An upload Slack hasn't
-// processed yet (no mimetype or filetype) isn't an image, as in Slack.
+// Images Slack draws inline (fileIsImage, 2HRR: image/* with thumb_360 or
+// thumb_360_gif, a HEIC/HEIF with thumb_800, or a Salesforce file): a
+// small screenshot with thumbs only up to thumb_360 (the shape of a real
+// 223px paste), a wide short one whose thumb_360 is 44px tall, a GIF with
+// only its animated thumb_360_gif, a HEIC with thumb_800. Ones without
+// thumb_360 are file cards in Slack (getFileType "generic"): only the
+// small thumbs, no thumbs at all, and the shape Slack sends for a
+// 828×25208 phone screenshot (no thumb_*, no original_w/h). An upload
+// Slack hasn't processed yet (no mimetype or filetype) isn't an image.
 func TestImageFileThumbs(t *testing.T) {
 	cases := []struct {
 		name, js   string
@@ -315,10 +318,20 @@ func TestImageFileThumbs(t *testing.T) {
 		{"wide short", `{"id":"F2","name":"image.png","mimetype":"image/png","filetype":"png","mode":"hosted","original_w":1022,"original_h":125,
 			"url_private":"https://files.slack.com/F2/image.png","thumb_160":"https://files.slack.com/F2/160.png",
 			"thumb_360":"https://files.slack.com/F2/360.png","thumb_360_w":360,"thumb_360_h":44}`, "https://files.slack.com/F2/360.png", 360, 44, false},
+		{"only the animated thumb_360_gif", `{"id":"F6","name":"a.gif","mimetype":"image/gif","filetype":"gif","mode":"hosted","original_w":300,"original_h":200,
+			"url_private":"https://files.slack.com/F6/a.gif","thumb_360_gif":"https://files.slack.com/F6/360.gif"}`, "https://files.slack.com/F6/360.gif", 300, 200, false},
+		{"HEIC with thumb_800", `{"id":"F7","name":"IMG_1.HEIC","mimetype":"image/heic","filetype":"heic","mode":"hosted","original_w":3024,"original_h":4032,
+			"url_private":"https://files.slack.com/F7/IMG_1.HEIC","thumb_800":"https://files.slack.com/F7/800.jpg"}`, "https://files.slack.com/F7/800.jpg", 600, 800, false},
 		{"only small thumbs", `{"id":"F3","name":"image.png","mimetype":"image/png","filetype":"png","mode":"hosted","original_w":1022,"original_h":125,
-			"thumb_64":"https://files.slack.com/F3/64.png","thumb_160":"https://files.slack.com/F3/160.png"}`, "https://files.slack.com/F3/160.png", 160, 19, false},
+			"thumb_64":"https://files.slack.com/F3/64.png","thumb_160":"https://files.slack.com/F3/160.png"}`, "", 0, 0, true},
 		{"no thumbs", `{"id":"F4","name":"image.png","mimetype":"image/png","filetype":"png","mode":"hosted","original_w":90,"original_h":40,
-			"url_private":"https://files.slack.com/F4/image.png"}`, "https://files.slack.com/F4/image.png", 90, 40, false},
+			"url_private":"https://files.slack.com/F4/image.png"}`, "", 0, 0, true},
+		{"unthumbed tall screenshot", `{"id":"F8","created":1794683290,"timestamp":1794683290,"mimetype":"image/png","filetype":"png","pretty_type":"PNG",
+			"user":"U1","editable":false,"size":3272505,"mode":"hosted","is_external":false,"external_type":"","is_public":true,"public_url_shared":false,
+			"display_as_bot":false,"username":"","name":"IMG_0001.png","title":"IMG_0001","is_modified_by_ai":false,
+			"url_private":"https://files.slack.com/files-pri/T1-F8/img_0001.png","url_private_download":"https://files.slack.com/files-pri/T1-F8/download/img_0001.png",
+			"media_display_type":"unknown","permalink":"https://ws.slack.com/files/U1/F8/img_0001.png","is_starred":false,"skipped_shares":true,
+			"has_rich_preview":false,"file_access":"visible"}`, "", 0, 0, true},
 		{"unprocessed upload", `{"id":"F5","name":"image.png","title":"image.png","mimetype":"","filetype":"","pretty_type":"","size":0,"mode":"hosted",
 			"media_display_type":"unknown","file_access":"visible","url_private":"https://files.slack.com/F5/image.png"}`, "", 0, 0, true},
 	}
@@ -330,8 +343,13 @@ func TestImageFileThumbs(t *testing.T) {
 			}
 			f := d.Blocks[0].File
 			if tc.notAnImage {
-				if f.IsImage {
-					t.Errorf("an unprocessed upload is an image: %+v", f)
+				// a file card: no inline image, nothing for a plugin's
+				// thumb_360 (messages/slack.go)
+				if f.IsImage || f.Thumb != nil || f.Still != nil {
+					t.Errorf("not an image in Slack, but IsImage %v thumb %+v still %+v", f.IsImage, f.Thumb, f.Still)
+				}
+				if tc.name == "unthumbed tall screenshot" && (f.URL == "" || f.Permalink == "" || f.PrettyType != "PNG" || f.Size != 3272505) {
+					t.Errorf("the card lost its file: %+v", f)
 				}
 				return
 			}
