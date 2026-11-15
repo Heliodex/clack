@@ -11,7 +11,7 @@ import (
 // A search item's IsImage is Slack's fileIsImage (slack.FileIsImage), the
 // check the Files browser and the channel Files tab open the viewer by: an
 // image/* file Slack made no thumbs for is a plain file.
-func TestBrowseFileIsImage(t *testing.T) {
+func TestFilesViewFileIsImage(t *testing.T) {
 	for _, c := range []struct {
 		name, raw string
 		image     bool
@@ -38,7 +38,7 @@ func TestBrowseFileIsImage(t *testing.T) {
 // Against fakeslack: the un-thumbnailed #files-gallery images come back in
 // the tab's media and the browser's Images, as Slack's search returns
 // them, but not as images.
-func TestUnthumbedImagesInFileBrowsers(t *testing.T) {
+func TestChannelFilesUnthumbedImages(t *testing.T) {
 	a, fs := channelFilesFake(t)
 	ctx := context.Background()
 	unthumbed := map[string]bool{}

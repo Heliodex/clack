@@ -31,7 +31,7 @@ func unthumbedIDs(t *testing.T, fs *fakeslack.Server) map[string]bool {
 // and a click opens its page (getMainFileAction "download"), not the
 // media viewer, which can't show the original; thumbnailed images still
 // draw their thumbnail and open in the viewer.
-func TestFilesBrowserUnthumbedImage(t *testing.T) {
+func TestFilesViewUnthumbedImage(t *testing.T) {
 	v, h, e, fs := filesView(t)
 	e.size = image.Pt(1200, 3000) // every Images row on screen
 	un := unthumbedIDs(t, fs)
