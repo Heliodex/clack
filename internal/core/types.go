@@ -256,6 +256,11 @@ type Section struct {
 	// values (all | active | hid | mentions | today | d7 | d30; default |
 	// recent | priority).
 	Filter, Sort string
+	// StarredBanner (Starred only) is showEmptyStarredSectionBanner (m1KW
+	// l, sidebar_rules.go starredBanner): the open section shows "Drag and
+	// drop important stuff here" while it has no rows, and its heading may
+	// carry the "New" badge (starred_section_new_badge).
+	StarredBanner bool
 }
 
 // Count is a conversation's unread state. DMs count every unread message
@@ -357,6 +362,11 @@ type SendOpts struct {
 	// Attachments go out as chat.postMessage attachments (prepareAndSendMessage's
 	// channelSectionBlocks: [{blocks: [channel_section]}]).
 	Attachments json.RawMessage
+	// ClientMsgID is the message's client_msg_id, as sendMessage's
+	// caller may pass one (`client_msg_id || uuid()`); "" makes one. The
+	// composer passes its own so its message list can find the message
+	// it jumps to (messages.ChannelView.JumpToOwnSend).
+	ClientMsgID string
 }
 
 // UploadOpts share one or more files (held in memory, never spooled to disk).
@@ -418,6 +428,10 @@ type SearchOpts struct {
 	// rZ6M getSearchParams, O8Qt's search in channel), so the server
 	// mustn't force the results newest first.
 	DisableSortOverride bool
+	// FetchSuggestions is fetchAll's fetchSuggestions: a new search (A+yj,
+	// the search box or a filter) whose messages answer merges its
+	// filter_suggestions into the window's (search_suggest.go).
+	FetchSuggestions bool
 }
 
 type SearchResult struct {

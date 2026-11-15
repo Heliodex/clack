@@ -157,6 +157,19 @@ func (s *Server) PostQuiet(ch, user, text string) (ts string, ev map[string]any)
 		"client_msg_id": m.ClientMsgID}
 }
 
+// PostBotQuiet adds a user-less bot message (subtype bot_message, the
+// bot's id and the username it posted under) to ch's history (newest)
+// and returns its ts, unpushed.
+func (s *Server) PostBotQuiet(ch, botID, username, text string) string {
+	ts, _ := s.PostQuiet(ch, "", text)
+	s.histMu.Lock()
+	defer s.histMu.Unlock()
+	if h := s.hist[ch]; len(h) > 0 && h[0].TS == ts {
+		h[0].Subtype, h[0].BotID, h[0].Username = "bot_message", botID, username
+	}
+	return ts
+}
+
 // PostReplyQuiet adds a reply from user to the thread under root (a
 // message of ch's history, which gets the reply metadata) and returns its
 // ts. conversations.replies then serves the root and its replies.

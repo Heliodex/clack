@@ -117,6 +117,11 @@ type Palette struct {
 	TooltipGlow                 color.NRGBA // the dark mode tooltip outline (none in light)
 	FooterSep                   color.NRGBA // content-inv-sec: a v3 footer's own color (its " | ")
 	HuddleJoinBorder            color.NRGBA // plt-jade-20: a huddle message's Join Huddle border (huddle.go)
+	// Missing and MissingLine are MissingText's bar for a member the
+	// store can't name (BaseMissingMember, msgcard.go missingMember):
+	// .c-missing_text--unknown's --dt_color-base-ter fill and
+	// --non-existent's rgb(--sk_foreground_low_solid) border
+	Missing, MissingLine color.NRGBA
 	// Dark is the dark theme: MemberSlug's c-member_slug--{clientTheme}
 	// (light otherwise).
 	Dark bool
@@ -174,6 +179,7 @@ func LightPalette() Palette {
 		TooltipBg: theme.LightPalette.Tooltip, TooltipText: theme.LightPalette.TooltipText,
 		FooterSep:        rgb(0xcb, 0xcc, 0xcf),
 		HuddleJoinBorder: rgb(116, 219, 175),
+		Missing:          rgb(234, 234, 234), MissingLine: rgb(221, 221, 221),
 	}.flat()
 }
 
@@ -205,6 +211,7 @@ func DarkPalette() Palette {
 	p.TooltipBg, p.TooltipText, p.TooltipGlow = theme.DarkPalette.Tooltip, theme.DarkPalette.TooltipText, theme.DarkPalette.TooltipGlow
 	p.FooterSep = rgb(0xb9, 0xba, 0xbd)
 	p.HuddleJoinBorder = rgb(0, 85, 61)
+	p.Missing, p.MissingLine = rgb(33, 36, 40), rgb(53, 55, 59) // base-ter #212428, foreground_low_solid
 	p.Dark = true
 	return p.flat()
 }

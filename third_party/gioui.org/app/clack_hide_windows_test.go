@@ -27,6 +27,7 @@ var (
 	testIsWindow          = testUser32.NewProc("IsWindow")
 	testSetCaretBlinkTime = testUser32.NewProc("SetCaretBlinkTime")
 	testGetWindowText     = testUser32.NewProc("GetWindowTextW")
+	testGetForeground     = testUser32.NewProc("GetForegroundWindow")
 )
 
 func testWindowText(hwnd syscall.Handle) string {
@@ -42,13 +43,25 @@ type hideTestWindow struct {
 	hwnd    syscall.Handle
 	frames  atomic.Int64
 	wakeups atomic.Int64 // events that are neither frames nor config
-	closing chan *ClosingEvent
-	done    chan struct{}
+	// onWakeup, when set, runs on the event goroutine for each of them,
+	// before the next Event call
+	onWakeup atomic.Pointer[func()]
+	closing  chan *ClosingEvent
+	done     chan struct{}
 }
 
 // hideTestWindow opens a Gio window whose ClosingEvents go to the test.
 // abort decides each close (the test's App: runFromTray).
 func newHideTestWindow(t *testing.T, abort func() bool, opts ...Option) *hideTestWindow {
+	t.Helper()
+	h := openHideTestWindow(t, abort, opts...)
+	waitUntil(t, "the first frame", func() bool { return h.frames.Load() > 0 })
+	time.Sleep(300 * time.Millisecond)
+	return h
+}
+
+// openHideTestWindow is newHideTestWindow without waiting for a frame.
+func openHideTestWindow(t *testing.T, abort func() bool, opts ...Option) *hideTestWindow {
 	t.Helper()
 	h := &hideTestWindow{w: new(Window), closing: make(chan *ClosingEvent, 4), done: make(chan struct{})}
 	h.w.Option(append([]Option{Title("Clack hide test"), Size(480, 360)}, opts...)...)
@@ -80,6 +93,9 @@ func newHideTestWindow(t *testing.T, abort func() bool, opts ...Option) *hideTes
 				return
 			default:
 				h.wakeups.Add(1)
+				if f := h.onWakeup.Load(); f != nil {
+					(*f)()
+				}
 			}
 		}
 	}()
@@ -88,8 +104,6 @@ func newHideTestWindow(t *testing.T, abort func() bool, opts ...Option) *hideTes
 	case <-time.After(30 * time.Second):
 		t.Fatal("no Win32ViewEvent")
 	}
-	waitUntil(t, "the first frame", func() bool { return h.frames.Load() > 0 })
-	time.Sleep(300 * time.Millisecond)
 	return h
 }
 
@@ -231,6 +245,87 @@ func TestOptionKeepsHiddenAndMinimized(t *testing.T) {
 	}
 }
 
+// An Invalidate made while the app handles a wake-up of a window that
+// draws no frames (hidden, minimized) gets a wake-up of its own (Clack
+// patch, CLACK_PATCHES.md §26). Clack runs posted work on those
+// wake-ups; a notification's taskbar flash, posted from a goroutine
+// while the notification's own wake-up was still being handled, waited
+// for the next event of any kind (internal/ui TestTaskbarWindow). The
+// Invalidate here comes from another goroutine, as Clack's invalidator's
+// does, and the wake-up waits for it, so it always lands while the
+// driver is still delivering the first.
+func TestInvalidateWhileHandlingWakesHidden(t *testing.T) {
+	if testing.Short() {
+		t.Skip("opens windows")
+	}
+	if !windowTestsEnabled() {
+		t.Skip("CLACK_WINDOWS_TRAY_TESTS not set")
+	}
+	for _, mode := range []string{"hidden", "minimized"} {
+		t.Run(mode, func(t *testing.T) {
+			var abort atomic.Bool
+			abort.Store(true)
+			h := newHideTestWindow(t, abort.Load)
+			if mode == "hidden" {
+				h.closeWindow(t) // aborted: Window.Hide
+				if h.visible() {
+					t.Fatal("still visible after Hide")
+				}
+			} else {
+				h.w.Option(Minimized.Option())
+				waitUntil(t, "minimized", func() bool { return windows.IsIconic(h.hwnd) })
+			}
+			time.Sleep(500 * time.Millisecond) // the hide's or minimize's own events
+
+			// armed: the next wake-up invalidates from another goroutine
+			// while the driver still delivers it (mayInvalidate false; a
+			// stray wake-up from an Invalidate that skipped the gate
+			// re-arms)
+			var armed, inner atomic.Bool
+			hook := func() {
+				if !armed.CompareAndSwap(true, false) {
+					return
+				}
+				h.w.invMu.Lock()
+				gated := !h.w.mayInvalidate
+				h.w.invMu.Unlock()
+				if !gated {
+					armed.Store(true)
+					return
+				}
+				done := make(chan struct{})
+				go func() { h.w.Invalidate(); close(done) }()
+				<-done
+				inner.Store(true)
+			}
+			h.onWakeup.Store(&hook)
+			defer h.onWakeup.Store(nil)
+			armed.Store(true)
+			var w1 int64
+			deadline := time.Now().Add(10 * time.Second)
+			for !inner.Load() {
+				if time.Now().After(deadline) {
+					t.Fatal("no wake-up while the driver was still delivering one")
+				}
+				w1 = h.wakeups.Load()
+				h.w.Invalidate()
+				time.Sleep(100 * time.Millisecond)
+			}
+			waitUntil(t, "a wake-up for the Invalidate made while the app handled one", func() bool { return h.wakeups.Load() > w1+1 })
+
+			h.w.Perform(system.ActionRaise)
+			waitUntil(t, "shown again", func() bool { return h.visible() && !windows.IsIconic(h.hwnd) })
+			abort.Store(false)
+			h.closeWindow(t)
+			select {
+			case <-h.done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the window didn't close")
+			}
+		})
+	}
+}
+
 // Window.Hide before the window exists, and on a destroyed one, is a
 // no-op that reports false.
 func TestHideWithoutDriver(t *testing.T) {
@@ -276,5 +371,60 @@ func TestCaretBlinkFromOS(t *testing.T) {
 		}
 		h.closeWindow(t)
 		<-h.done
+	}
+}
+
+// A window made with StartHidden (Clack patch, CLACK_PATCHES.md §23) is
+// never shown by its creation: not visible, not the foreground window;
+// past the frames its creation's configure draws (Gio's update on
+// WM_WINDOWPOSCHANGED and WM_STYLECHANGED), Invalidate draws nothing but
+// still wakes the app; a title change keeps it hidden (§20); ActionRaise
+// shows it and it draws; it closes as usual.
+func TestStartHidden(t *testing.T) {
+	if testing.Short() {
+		t.Skip("opens windows")
+	}
+	if !windowTestsEnabled() {
+		t.Skip("CLACK_WINDOWS_TRAY_TESTS not set")
+	}
+	var abort atomic.Bool
+	h := openHideTestWindow(t, abort.Load, StartHidden(true))
+	time.Sleep(time.Second)
+	if h.visible() {
+		t.Fatal("a StartHidden window is visible after its creation")
+	}
+	if fg, _, _ := testGetForeground.Call(); syscall.Handle(fg) == h.hwnd {
+		t.Error("a StartHidden window took the foreground")
+	}
+	f0, w0 := h.frames.Load(), h.wakeups.Load()
+	t.Logf("the creation drew %d frames", f0)
+	for range 5 {
+		h.w.Invalidate()
+		time.Sleep(100 * time.Millisecond)
+	}
+	if n := h.frames.Load() - f0; n != 0 {
+		t.Errorf("hidden from the start: %d frames after Invalidate, want none", n)
+	}
+	if h.wakeups.Load() == w0 {
+		t.Error("hidden from the start: Invalidate delivered no event to the app")
+	}
+	h.w.Option(Title("Clack hide test - 3 new items"))
+	time.Sleep(300 * time.Millisecond)
+	if h.visible() {
+		t.Fatal("a title change showed the window started hidden")
+	}
+
+	f1 := h.frames.Load()
+	h.w.Perform(system.ActionRaise)
+	waitUntil(t, "visible after ActionRaise", h.visible)
+	waitUntil(t, "a frame after ActionRaise", func() bool { return h.frames.Load() > f1 })
+	if got := testWindowText(h.hwnd); got != "Clack hide test - 3 new items" {
+		t.Errorf("title %q after the show", got)
+	}
+	h.closeWindow(t)
+	select {
+	case <-h.done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the window didn't close")
 	}
 }

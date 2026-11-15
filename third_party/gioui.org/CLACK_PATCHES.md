@@ -17,9 +17,10 @@ It should show only `gpu/gpu.go`, `widget/index.go`, `widget/editor.go`,
 `app/os_macos.m`, `app/os_windows.go`, `app/internal/windows/windows.go`,
 `app/os_wayland.go`, `io/pointer/pointer.go`, `gesture/gesture.go`,
 `gesture/clack_wheel.go`, `io/input/router.go`, `app/window.go`,
-`app/clack_drop*.go`, `app/clack_hide*.go`, `app/clack_pancursor_windows*.go`,
+`app/clack_drop*.go`, `app/clack_hide*.go`, `app/clack_wakeup_test.go`, `app/clack_pancursor_windows*.go`,
 `app/clack_titlebar*.go`, `app/internal/windows/clack_titlebar.go`,
-`app/clack_cursors/`, `app/os_unix.go`, `app/os_darwin.go`, `app/os_android.go`,
+`app/clack_bounds*.go`, `app/internal/windows/clack_bounds.go`,
+`app/cocoatest/`, `app/clack_cursors/`, `app/os_unix.go`, `app/os_darwin.go`, `app/os_android.go`,
 `app/os_js.go`, `gesture/clack_autoscroll.go`, `io/input/clack_values.go`,
 `internal/ops/clack_size.go`, `op/clack_size.go`, `op/clip/clack_size.go`,
 `io/input/clack_hover.go`, `io/input/clack_hover_test.go`,
@@ -511,8 +512,9 @@ not hide a window.
   (Electron's `hide()`), `SetWindowPos` with `SWP_HIDEWINDOW |
   SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOREPOSITION | SWP_NOSIZE |
   SWP_NOZORDER`, not `ShowWindow(SW_HIDE)`, which activates another window
-  itself. Other platforms return false and do nothing (Clack then lets the
-  close go on). It may be called while handling a `ClosingEvent`: the
+  itself. macOS hides since §24 (`orderOut:`). Other platforms return false
+  and do nothing (Clack then lets the close go on). It may be called while
+  handling a `ClosingEvent`: the
   window thread runs `Window.Run` functions while it waits for the app to
   take the next event.
 - A hidden window draws no frames, as a minimized one doesn't: `runLoop`
@@ -926,3 +928,364 @@ caption maximizes; a failure prints the window messages and Gio events
 around it, from `clackMsgTrace`, a hook only the tests set).
 `internal/ui` `TestTitleBarWindow` is Clack's window on the same job. Not
 in `UPSTREAM.patch`.
+
+## 23. app: StartHidden, a window created without being shown (Windows)
+
+`app/clack_hide.go` (new: `StartHidden`), `app/os.go`
+(`Config.startHidden`) and `app/os_windows.go` (`window.startedHidden`;
+`Configure`'s first run; `newWindow`'s focus). An addition: a window
+without the option shows as before.
+
+Slack's desktop window starts hidden when Launch on Login started the app
+(`--startup`, `environment.invokedOnStartup`) and the tray's Launch Control
+says Keep in Background (`hideOnStartup`, true by default): `sf`
+(`main.bundle.cjs` 4.53.276 win32 @929699) keeps the BrowserWindow, created
+with `show: false`, unshown until the tray icon brings the app forward.
+Gio's first `Configure` ends in `ShowWindow`, and `newWindow` then takes
+the foreground and the focus, so a window could only be hidden after it
+had flashed up and taken the focus.
+
+`StartHidden(true)` among a window's first options: that first `Configure`
+places, sizes and styles the window (`SetWindowPos` with `SWP_NOACTIVATE`)
+but leaves out the `ShowWindow`, and `newWindow` doesn't call
+`SetForegroundWindow` or `SetFocus`. The window is then hidden as
+`Window.Hide` leaves one (§13): it draws only the frames Gio's `update`
+draws on its own `WM_WINDOWPOSCHANGED` and `WM_STYLECHANGED` (the
+creation's two, and two for each option that changes it while hidden, as
+for a window hidden to the tray; Electron also paints a `show: false`
+window's first frame, `paintWhenInitiallyHidden`), `Invalidate` draws
+nothing but still wakes the app, options that leave the mode alone keep it
+hidden (§20), and `Perform(system.ActionRaise)` shows it (`SW_SHOWNORMAL`,
+or `SW_SHOW` for a maximized mode), after which it paints. Elsewhere the
+option does nothing.
+
+Tests: `app/clack_hide_windows_test.go` `TestStartHidden` (not visible and
+not the foreground window after its creation, no frames from `Invalidate`
+but wake-ups, a title change keeps it hidden, `ActionRaise` shows and draws
+it, the close works),
+and `internal/ui` `TestTrayWindow` (Clack's own window launched on login),
+on ci's windows-shell job (`CLACK_WINDOWS_TRAY_TESTS`). Not in
+`UPSTREAM.patch`.
+
+## 24. app: HiddenTitleBar and TrafficLightPosition on macOS, and Window.Hide there
+
+`app/clack_titlebar.go` (`HiddenTitleBar`'s macOS part, new
+`TrafficLightPosition`, `titlebarDoubleClickAction`), `app/os.go`
+(`Config.trafficLight`), `app/os_macos.go` (`Configure`, `updateWindowMode`,
+`gio_onMouse`'s click count and double-click, `hide`, `shown`, `draw`,
+`SetAnimating`, `Perform`'s `ActionRaise`, `newWindow`,
+`toggleFullScreenLater`), `app/os_macos.m` (`GioView`'s `titlebarHidden`,
+traffic-light and `orderedOut` properties,
+`_opaqueRectForWindowMoveWhenInTitlebar`, `viewDidChangeEffectiveAppearance`;
+`GioWindowDelegate`'s `windowWillClose:` and its resize, key, main,
+full-screen and occlusion methods; `gio_createWindow`'s `hiddenTitlebar`;
+`redrawTrafficLights`), `app/clack_hide.go` (the doc) and `app/cocoatest/`
+(new: the tests' AppKit helpers). Additions, but for two changes:
+`Window.Hide` hides on macOS where it returned false, and every macOS
+window now gets its `DestroyEvent` when it closes (below).
+
+Slack's main window on macOS is frameless (mac `main.bundle.cjs` 4.53.276
+@1145075: `frame: false`, `titleBarStyle: "hidden"`): the page runs under
+the title bar, which shows no title, and the traffic lights stay, at
+`{x, Math.floor(y / 2)}` of the `trafficLightPosition` setting (clamped
+to 0..40 by `sg`, @974771). The setting is `{x: 14, y: 22}` (@1117788)
+until the web client's top nav writes `{x: 12, y: 24}`
+(`injectCustomTitlebarStyling`, boot-render), so the window opens with
+the buttons at `{12, 12}` from then on. Closing it hides it
+(`MAIN_WINDOW_CLOSE`, @1148845: `BrowserWindow.hide()`, after leaving full
+screen). Gio's `Decorated(false)` on macOS hid the buttons with the title
+bar, a decorated window kept its title bar, which Clack's top nav sat
+under (gap 4), and nothing could hide a window, so a close quit Clack
+(gap 3).
+
+`HiddenTitleBar(true)` on a decorated macOS window is Electron's
+`titleBarStyle: "hidden"` (`NativeWindowMac`'s constructor, Electron
+45-x-y):
+
+- The window is created with `NSWindowStyleMaskFullSizeContentView`, so its
+  content is the size asked for and covers the title bar; the title bar is
+  transparent with its title hidden, and window tabs are off (Electron's
+  `NSWindowTabbingModeDisallowed` for a frameless window). The buttons
+  stay. `Config.Decorated` stays true, so Gio draws no decorations of its
+  own. In full screen the title bar AppKit reveals is an ordinary one with
+  the title (`NotifyWindowEnterFullScreen`), hidden again as the window
+  leaves it.
+- `GioView` answers its bounds to AppKit's
+  `_opaqueRectForWindowMoveWhenInTitlebar`, as Chromium's
+  `BridgedContentView` does: under a transparent title bar the window
+  server drags the window from whatever a view doesn't report as opaque,
+  without asking the app. So every click in the title bar band reaches the
+  view, and an `ActionMove` area drags the window as before
+  (`performWindowDragWithEvent:`).
+- The release of a double-click on an `ActionMove` area does what System
+  Settings' "Double-click a window's title bar to" says, as Chromium's
+  `NativeWidgetMacNSWindow` `sendEvent:` does for custom draggable areas:
+  `AppleActionOnDoubleClick` unset or `Maximize` zooms (`performZoom:`),
+  `Minimize` minimizes, `Fill` fills (`_zoomFill:`, macOS 15), anything
+  else does nothing. No native title bar sees these clicks, since the view
+  takes them all.
+
+`TrafficLightPosition(x, y)` is Electron's `trafficLightPosition`, laid
+out as its `WindowButtonsProxy` `redraw` does: the buttons' title bar
+container becomes their height plus 2y tall at the window's top and the
+buttons sit x from the left edge (from the right in a right-to-left title
+bar), centred in it. AppKit lays the title bar out again after a resize, a
+title or style change, the buttons' visibility (macOS 26), a key or main
+window change and a theme change, so the window moves them back after
+each, as Electron does; the container hides while the window leaves full
+screen and comes back moved.
+
+`Window.Hide` is `NativeWindowMac::Hide` (`orderOut:`). A full-screen
+window first leaves full screen and is ordered out once
+`windowDidExitFullScreen:` has returned, as Slack's `hx` awaits
+`leave-full-screen` before it hides (the mode is `Windowed` from then on,
+so an option given meanwhile doesn't send it back). The toggle waits for
+the run loop's default mode, outside the close button's click and
+`windowShouldClose:`, as Slack's handler leaves full screen after the close
+event returned. A hidden window draws no frames (Gio's
+Metal layer waits for a drawable without a timeout) and keeps its display
+link stopped; the app still gets its wake-ups. `ActionRaise` shows it, and
+so does any other order-front (the occlusion change that follows): it
+draws again.
+
+A closing window lets go of its content view (`windowWillClose:`), for
+every window. Gio's `DestroyEvent` comes from `GioView`'s `dealloc`, and the
+view only went with its window: on the macOS 26 runner every closed window,
+plain or with a hidden title bar, was still alive after its close
+(`TestMacCloseDestroys` holds weak references), so no `DestroyEvent` came
+within 10 s and Clack's Quit never ended `Run`. With the view let go, it
+deallocs at once and Gio sends `DestroyEvent`, as Chromium's
+`windowWillClose:` tears its widget down without waiting for AppKit to
+free the window.
+
+Clack's main window uses all three on macOS (`internal/ui/titlebar_darwin.go`,
+W35). Read in Electron 45-x-y (`shell/browser/native_window_mac.mm`,
+`shell/browser/ui/cocoa/window_buttons_proxy.mm`,
+`electron_ns_window.mm`, `electron_ns_window_delegate.mm`) and Chromium
+main (`components/remote_cocoa/app_shim/bridged_content_view.mm`,
+`native_widget_mac_nswindow.mm`).
+
+Tests: `app/clack_titlebar_test.go` (`TestHiddenTitleBarOption`'s
+`TrafficLightPosition`, `TestTitlebarDoubleClickAction`) on ci's linux-gio
+job, and on its macos job (`CLACK_MACOS_WINDOW_TESTS`: `TestMain` runs
+`Main` on the main goroutine) `app/clack_titlebar_darwin_test.go`:
+`TestHiddenTitleBarMac` (full-size content, the window the size asked
+for, a transparent title bar with no title and no tabs, the buttons at
+{12, 12} after a title change, a resize and a key change, `Decorated`
+still true, `_opaqueRectForWindowMoveWhenInTitlebar` the whole view, where
+AppKit sends clicks in the title bar band and on the close button, a click
+on a widget in the band the widget's), `TestTitlebarDoubleClickMac`
+(synthesized double-clicks with each `AppleActionOnDoubleClick`),
+`TestHideMac` (the red button's aborted close hides, no frames but
+wake-ups, `ActionRaise` and an order-front outside Gio show it, a close
+destroys a hidden window), `TestMacCloseDestroys` (a close of a plain
+window and of hidden-title-bar ones brings `DestroyEvent`, and logs whether
+the view and the window are still alive) and `TestHideLeavesFullscreenMac`
+(skipped on the runner: it enters full screen, but no `toggleFullScreen:`,
+AppKit's own from the main queue included, ever takes the window out
+again, so the full-screen hide is untested there). `internal/ui`
+`TestMacWindowCloseHides` is Clack's window on the same job. Not in
+`UPSTREAM.patch`.
+
+## 25. app: Bounds, Displays, and where a window is (Windows, macOS)
+
+`app/clack_bounds.go` (new: `Bounds`, `Config.Bounds`, `Config.Display`,
+`Display`, `Displays`), `app/clack_bounds_windows.go`,
+`app/clack_bounds_macos.go` and `app/clack_bounds_other.go` (new: each
+platform's `displays` and the window's place), `app/internal/windows/clack_bounds.go`
+(new: `EnumDisplayMonitors`, a monitor's information and effective DPI, a
+thread's per-monitor DPI awareness), `app/os.go` (`Config.bounds`,
+`boundsSet`, `display`), `app/os_windows.go` (`newWindow` and `init`
+create the window at the bounds; `update` reports them; `Configure`'s
+`Windowed` frame; `window.hiddenShow` and `Perform`'s `ActionRaise`),
+`app/os_macos.go` (`updateWindowMode` reports them; `Configure` places the
+window before the mode, its size limits in every mode, a first full
+screen once the window is on the screen; `newWindow` doesn't cascade a
+placed window; `gio_onWindowMove`), `app/os_macos.m` (`windowDidMove:`;
+`gioViewOf` in the delegate's other methods) and `app/cocoatest/` (`Window.ScreenFrame`, `Screens`, `SetTopLeft`,
+`ZoomWindow`). Additions, but for the macOS size limits (below).
+
+Slack reopens its main window where it was (gap 9). Its settings keep
+`mainWindowSettings`: bounds, maximized, fullScreen (and on macOS the
+window's Space, through its own native module). `MAIN_WINDOW_ACTIONS`
+(win32 `main.bundle.cjs` 4.53.276 @1146194) saves them a second after the
+window is maximized, unmaximized, restored, resized, moved, shown,
+focused or blurred, a maximized window's bounds replaced by the default
+bounds on its display (`rV(screen.getDisplayMatching(win.getBounds()))`).
+The window is created at the bounds (`{...bounds, fullscreen}`, @1143722),
+`validateBoundsForDisplay` (@1146420) keeps them on a display that is
+still connected, and `INITIALIZE_MAIN_WINDOW` maximizes it (or makes it
+full screen) before showing it. Gio had no way to place a window, to read
+where it is, or to list the displays: every Clack launch opened at
+1440×900 wherever the OS put it.
+
+- `Bounds(r)` places a window: r is its frame, the OS frame included, in
+  the OS's screen coordinates, which `Display` and `Config.Bounds` use
+  too. On Windows, physical pixels of the virtual screen (the primary
+  monitor's top left at the origin), the frame `GetWindowRect`'s with the
+  invisible resize borders; given with the first options, the window is
+  created there (`CreateWindowEx`'s position and size, where Gio passed
+  `CW_USEDEFAULT`), so it starts with the DPI of the monitor it opens on: a
+  `SetWindowPos` onto a monitor of another DPI afterwards would rescale it
+  through `WM_DPICHANGED` (Electron calls `SetPosition` twice for that,
+  its "dirty workaround" for electron#10862). On macOS, points from the
+  primary screen's top left with y down, as Electron's `NativeWindowMac`
+  `GetBounds` and `SetBounds` flip an `NSWindow` frame against
+  `NSScreen.screens[0]`; the size is raised to the window's minimum, as
+  `SetBounds` does (`setFrame:display:` doesn't check it), and a placed
+  window isn't cascaded. Like `Size`, the option sets the mode to
+  `Windowed`, so a `Maximized` or `Fullscreen` option after it maximizes
+  or fills the display the window was placed on, and a maximized window
+  restores to r (Windows' restored rectangle; AppKit's user frame). Later,
+  it moves and sizes a windowed window. On Windows a visible maximized or
+  minimized window is restored first (`SW_SHOWNOACTIVATE`), since the
+  `SW_SHOWNORMAL` after it would put the restored rectangle back over the
+  new one (Chromium's `SetBoundsInternal` takes `WS_MAXIMIZE` off for the
+  same reason); on macOS a full-screen window ignores it, as Electron's
+  `SetBounds` does.
+- `Config.Bounds` is the window's frame in a `ConfigEvent` (Windows:
+  `update`, on every `WM_WINDOWPOSCHANGED`; macOS: each draw, and a move,
+  which draws nothing, through the delegate's `windowDidMove:`), maximized
+  and full screen included. It is empty while the window isn't on the
+  screen: minimized (its place is the taskbar's or the Dock's: Windows'
+  `GetWindowRect` of an iconic window is the icon's), hidden by
+  `Window.Hide`, or started hidden. `Config.Display` is the display the
+  window is on, Electron's `getDisplayMatching(getBounds())`: Windows'
+  `MonitorFromWindow(MONITOR_DEFAULTTONEAREST)` (Chromium's ScreenWin
+  matches with `MonitorFromRect` and the same flag), macOS's
+  `NSWindow.screen`. Reading it there keeps a save off AppKit's main
+  thread, which the client's event handling holds.
+- `Displays()` is Electron's `screen.getAllDisplays()`: each display's
+  bounds, its work area (without the taskbar and app bars, or the menu
+  bar and the Dock), its scale (screen units per DIP: the effective DPI
+  over 96 on Windows, 1 on macOS) and whether it is the primary. Windows
+  enumerates the monitors (`EnumDisplayMonitors`, `GetMonitorInfo`,
+  `GetDpiForMonitor`) on a thread made per-monitor DPI aware for the call,
+  as Gio's window threads are, so the rectangles are physical; macOS reads
+  `NSScreen.screens` (frames and visible frames, flipped as Chromium's
+  `ScreenMac` flips them, the primary first) on the main thread, waiting
+  for it, so not from inside the window's event handling. Elsewhere it is
+  nil: X11 and Wayland windows go where the window manager or the
+  compositor puts them, so `Bounds` does nothing there and `Config.Bounds`
+  stays empty.
+- Windows, `StartHidden` (§23) with `Maximized` or `Fullscreen`: the
+  first `Configure` leaves out the `ShowWindow(SW_SHOWMAXIMIZED)` it would
+  have made and keeps it (`window.hiddenShow`) for the `ActionRaise` that
+  shows the window, which comes out maximized or full screen. Before, it
+  showed restored: a hidden window isn't maximized until it is shown, and
+  `ActionRaise` read `Windowed` from it. (Slack's `maximize()` shows the
+  window, then hides it again.) An option that changes the mode while it is
+  hidden shows it as before, and the kept show goes.
+- macOS, the size limits: `Configure` set `contentMinSize` and
+  `contentMaxSize` only for `Windowed`, so a window opened maximized (now
+  that one can open where it was) had no minimum until a later windowed
+  option; they apply in every mode. A first `Fullscreen` option runs
+  before `newWindow` orders the window front, and goes full screen once it
+  is on the screen (`toggleFullScreen:` on the next turn of the run loop).
+- macOS, a closed full-screen window: §24's `windowWillClose:` lets go of
+  the content view, and AppKit then takes the closing window out of full
+  screen; `windowWillExitFullScreen:` read the handle of the view that was
+  gone (0) and Gio panicked ("runtime/cgo: misuse of an invalid Handle"),
+  so Quit from full screen crashed Clack. The delegate's methods that call
+  into Go now go through `gioViewOf`, which is nil once the view is gone,
+  and do nothing then. Found by `TestBoundsMac` and
+  `TestMacWindowBoundsFullScreen`, which close full-screen windows.
+
+Clack's main window uses all of it (`internal/ui/winbounds.go`, W40):
+Slack's default bounds (`rV`), `validateBoundsForDisplay`, the minimum
+size and the save rule over `Displays`, `Config.Bounds` and
+`Config.Display`, kept in ui.json's `main_window_settings`; Linux, where
+Gio lists no displays (and doesn't see a window manager's maximize on X11),
+keeps the window's size in dp and nothing else. Read in Electron 45-x-y
+(`shell/browser/native_window_mac.mm`, `shell/browser/native_window.cc`)
+and Chromium main (`ui/display/win/screen_win.cc`,
+`ui/display/mac/screen_mac.mm`, `ui/display/display_finder.cc`,
+`ui/views/win/hwnd_message_handler.cc`).
+
+Tests: on ci's windows-applog job (`CLACK_WINDOWS_BOUNDS_TESTS`)
+`app/clack_bounds_windows_test.go`: `TestDisplaysWindows` (the runner's
+monitor as `GetSystemMetrics` and `SPI_GETWORKAREA` give it, primary, at
+the system DPI) and `TestBoundsWindows` (created at the bounds, which the
+`ConfigEvent` reports with the monitor; a move from another thread; none
+while minimized and back after `ActionRaise`; a later `Bounds` on a
+windowed and on a maximized window; created maximized, restoring to the
+bounds; created full screen; started hidden and maximized: no bounds, then
+shown maximized by `ActionRaise`, restoring to the bounds). On ci's macos
+job (`CLACK_MACOS_WINDOW_TESTS`) `app/clack_bounds_darwin_test.go`:
+`TestDisplaysMac` (`NSScreen.screens`, flipped, the primary at the
+origin) and `TestBoundsMac` (opened at the bounds in points with the
+screen it's on; `setFrameTopLeftPoint:`'s move reported; a later `Bounds`;
+the minimum; opened maximized: zoomed on the screen, `zoom:` back to the
+bounds; opened full screen, last, since the runner never leaves it).
+`internal/ui` `TestWindowBoundsWindow`, `TestWindowBoundsOffScreenWindow`
+and `TestWindowBoundsFullScreenWindow` (Windows) and `TestMacWindowBounds`,
+`TestMacWindowBoundsOffScreen` and `TestMacWindowBoundsFullScreen` (macOS)
+are Clack's window on the same jobs. Not in `UPSTREAM.patch`.
+
+## 26. app: an Invalidate always reaches the client
+
+`app/window.go` (`Window.Invalidate`, `Window.nextEvent`,
+`Window.handOutWakeup`, the `invalidateMissed` field). A fix: the client
+gets an event after every `Invalidate`, as `Window.Event`'s documentation
+says.
+
+`Invalidate` asks the driver only while `mayInvalidate` is set, and
+`nextEvent` sets it again once the client has had every event. An
+`Invalidate` in between (the driver still delivering the wake-up an
+earlier one asked for) did nothing: on a window that draws, the frame the
+first one scheduled covers it; a hidden (§13) or minimized window draws
+none, and when the client had already done its work for that wake-up the
+second `Invalidate` was lost until the next event of any kind. Clack runs
+its posted work on those wake-ups (`internal/ui` `drainIdle`), and a
+notification's taskbar flash, posted from `notificationShown`'s goroutine
+while the notification's own wake-up was still being handled, waited
+there: windowFlashBehavior "always" minimizes on close, and the flash
+came at the next unrelated event, or never.
+
+Now an `Invalidate` that finds `mayInvalidate` unset sets
+`invalidateMissed`; handing the client a `FrameEvent` or a wake-up clears
+it (that event covers every `Invalidate` before it), and `nextEvent`,
+where it would have set `mayInvalidate`, gives a wake-up instead while it
+is set. No frame is scheduled for it: a window that draws already has the
+first one's. A destroyed window (no driver) takes none.
+
+Found by `internal/ui` `TestTaskbarWindow` on ci's windows-shell job
+(2026-11-14: the first attempt of four runs failed "always: no
+HSHELL_FLASH … after a notification", and the log has no
+`flashMainWindowFrame` line). Tests: `app/clack_wakeup_test.go`
+`TestInvalidateWhileHandlingAWakeup` (every platform, on ci's linux-gio
+job: the second `Invalidate` while the first wake-up is out gets its own,
+one made before the wake-up went out doesn't, nor does a destroyed
+window) and `app/clack_hide_windows_test.go`
+`TestInvalidateWhileHandlingWakesHidden` (windows-shell: a hidden and a
+minimized window, an `Invalidate` from another goroutine while the app
+handles a wake-up, which waits for it, then another wake-up). Not in
+`UPSTREAM.patch`.
+
+## 27. app: the Windows loop never waits while a frame is due
+
+`app/os_windows.go` (`window.runLoop`). A fix.
+
+While animating, the loop drew when `PeekMessage(PM_NOREMOVE)` found the
+queue empty and otherwise called `GetMessage`, expecting it to return the
+message the peek had seen. Right after a pointer up on a caption button
+that §22 handles itself (the press and release never reach
+`DefWindowProc`), the peek reported a message `GetMessage` never
+returned: the window thread waited in `GetMessage` with a frame due
+(`animating` set, the next frame now) and drew nothing until the next
+unrelated input. In Clack that froze the window after a click on its
+caption buttons until the pointer moved again. While animating the loop
+now takes the message with `PeekMessage(PM_REMOVE)` (dispatching it, or
+ending at `WM_QUIT`) and draws when there is none; it calls `GetMessage`
+only when no frame is due.
+
+Found by `app/clack_titlebar_windows_test.go`
+`TestHiddenTitleBarButtonsInput` on ci's windows-applog job (2026-11-14,
+first attempts: close never hovered, maximize's click with the Snap
+Layouts flyout open never arriving and no frames after it, a minimize
+click seconds late), reproduced 3 times in 60 rounds by flake-check's
+`flake-fix-gio-sequence` (the OS file drops, typed text and title bar
+steps in ci's order) with the test's stall dump: the window thread in
+`runLoop`'s `GetMessage`, `animating` true, the next frame due, `WM_NULL`
+answered at once, after the trace's `WM_NCPOINTERDOWN`/`WM_NCPOINTERUP`.
+Not in `UPSTREAM.patch`.

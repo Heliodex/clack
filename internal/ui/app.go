@@ -128,6 +128,11 @@ type Options struct {
 	// checker, or Hunspell dictionaries from Slack's dictionary CDN.
 	// Off in tests and the demo, which never fetch anything.
 	Spellcheck bool
+	// InvokedOnStartup: Launch on Login started Clack (cmd/clack
+	// --startup, Slack's environment.invokedOnStartup). With Launch
+	// Control's Keep in Background the window starts hidden in the
+	// notification area (tray.go).
+	InvokedOnStartup bool
 }
 
 // SetLogin shows the sign-in screen, calling login on submit. On the
@@ -156,6 +161,7 @@ type App struct {
 
 	caption captionState // Windows: the window's HWND and DWM attributes (caption_windows.go)
 	wco     wcoBar       // Windows: the caption buttons over the top nav (titlebar.go)
+	macNav  bool         // macOS: no title bar, the top nav is the drag area (titlebar_darwin.go; tests)
 
 	router          router
 	clicks          clickables
@@ -255,8 +261,16 @@ type App struct {
 	switchTo         Route
 	winLive          atomic.Pointer[app.Window] // a.win once Run made it, for other goroutines
 	tray             atomic.Pointer[trayRef]    // the notification-area icon (SetTray, runfromtray.go)
+	trayLast         trayIconState              // the tray icon's state and tooltip as last set (tray.go)
+	trayMenuLast     trayMenuKey                // what the tray menu was last made from
+	launch           launchCache                // Launch app on login as last read or set
+	jump             jumpKey                    // what the jump list was last made from
+	resetPending     bool                       // a reset-window waits for the window
 	quitting         atomic.Bool                // Quit: the next close isn't runFromTray's (Slack's app.isQuitting)
 	winMode          app.WindowMode             // the last ConfigEvent's (runFromTray leaves full screen first)
+	winPlace         bool                       // Gio places the window here (Windows, macOS): mainWindowSettings keeps its bounds (winbounds.go)
+	winSaveDue       bool                       // mainWindowSettings changed since ui.json was last written
+	winOpened        image.Rectangle            // where mainWindowPlace opened the window (logs, tests)
 	hideHook         func() bool                // tests: replaces Window.Hide (runfromtray.go)
 	inval            chan struct{}              // redraw requests for invalidator (cap 1: they coalesce)
 	update           updateState                // "Update available" banner
@@ -431,8 +445,18 @@ func (a *App) Run() error {
 	a.win = new(app.Window)
 	nativemenu.SetRunner(a.win.Run) // TrackPopupMenuEx runs on the window's thread
 	a.win.Option(mainWindowOptions()...)
-	a.wcoEnable() // Windows: the top nav draws the caption buttons
+	// where it was: Slack's mainWindowSettings (winbounds.go)
+	a.win.Option(a.mainWindowPlace()...)
+	if a.startHidden() { // Keep in Background after a login launch (tray.go)
+		log.Print("ui: launched on login: the window stays in the notification area (Keep in Background)")
+		a.win.Option(app.StartHidden(true))
+	}
+	a.wcoEnable()            // Windows: the top nav draws the caption buttons
+	a.macNav = macTitlebarOn // macOS: the top nav is the drag area under the traffic lights
 	a.winLive.Store(a.win)
+	if startMacWindow != nil {
+		startMacWindow(a) // macOS: the Dock icon and the app's activation show a hidden window (window_darwin.go)
+	}
 	a.rv.inRun = true // the real window: covered until revealed (reveal.go)
 	applog.Mark("window", "")
 	go a.updateLoop(a.updateSchedule(), realUpdateClock())
@@ -472,11 +496,12 @@ func (a *App) Run() error {
 		if onEvent != nil {
 			onEvent(ev)
 		}
-		if menuViewEvent != nil {
-			menuViewEvent(ev)
+		if macViewEvent != nil {
+			macViewEvent(ev) // macOS: which NSView is the main window's (window_darwin.go)
 		}
 		a.syncCaption(ev)        // Windows: the native caption follows the window (caption_windows.go)
 		a.syncTaskbar()          // Windows: the taskbar overlay on a new window (dock.go)
+		a.syncTray()             // Windows: the tray menu, the jump list (tray.go)
 		nativemenu.NoteEvent(ev) // the window's HWND / NSView for native context menus
 		switch e := ev.(type) {
 		case app.DestroyEvent:
@@ -491,6 +516,9 @@ func (a *App) Run() error {
 				case <-time.After(5 * time.Second):
 				}
 			}
+			if a.winSaveDue { // a move or resize savePrefsSoon hasn't written yet
+				a.savePrefs()
+			}
 			a.flushPrefs() // the window is gone: nothing waits on this
 			return e.Err
 		case *app.ClosingEvent:
@@ -499,20 +527,29 @@ func (a *App) Run() error {
 			if a.closeToTray() {
 				e.Abort()
 			}
+			a.drainIdle() // Gio counts every event as the wake-up (below)
 		case app.FileDropEvent: // files dragged from the OS (Gio patch 11, drop_overlay.go)
 			a.fileDrop(e)
+			a.drainIdle()
 		case app.ConfigEvent:
 			a.winMode = e.Config.Mode
+			a.noteWindowPlace(e.Config) // mainWindowSettings (winbounds.go)
 			if e.Config.Focused && !a.focused {
 				a.nudgeUpdates()       // back from sleep, often: is a check due?
 				a.loginWindowFocused() // a sign-in link copied in the browser (login.go)
 			}
 			a.focused = e.Config.Focused
+			a.drainIdle()
 		default:
 			// Gio's wake-up after an Invalidate, which also comes while
 			// the window draws no frames (hidden to the notification
 			// area, minimized): run what was posted, so messages,
-			// notifications and their sounds keep coming (runfromtray.go)
+			// notifications and their sounds keep coming (runfromtray.go).
+			// Gio hands out an Invalidate's wake-up as whichever event
+			// comes next ("every event counts as a wakeup"), so the
+			// ConfigEvent, ClosingEvent and FileDropEvent cases drain
+			// too: a hidden window's ConfigEvent took one, and the work
+			// posted with it waited for the next event of any kind.
 			a.drainIdle()
 		case app.FrameEvent:
 			t0 := time.Now()

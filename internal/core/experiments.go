@@ -45,6 +45,7 @@ func (a *App) setExperimentAssignments(as map[string]slack.ExperimentAssignment)
 	a.expLive = true
 	a.recomputeExperimentsLocked()
 	a.mu.Unlock()
+	a.followEmojiSet()
 	a.emit(Event{Type: "experiments"})
 	a.refreshTempMutes() // temp_mute decides what a temporary mute does
 }
@@ -73,6 +74,7 @@ func (a *App) installCachedExperiments() {
 	a.expServer = as
 	a.recomputeExperimentsLocked()
 	a.mu.Unlock()
+	a.followEmojiSet()
 	a.emit(Event{Type: "experiments"})
 	a.refreshTempMutes()
 }
@@ -199,6 +201,7 @@ func (a *App) SetExperimentGroups(groups map[string]*string) {
 	}
 	a.mu.Unlock()
 	if changed {
+		a.followEmojiSet()
 		a.emit(Event{Type: "experiments"})
 		a.recentsAfterExperiments()
 		a.refreshTempMutes()
@@ -285,7 +288,7 @@ var experimentReads = map[string][]string{
 	// the secondary views' below)
 	"activity_entry_layout_revisions_2": on, "activity_inbox_remove_persistent_detail_panel": on,
 	"activity_bot_item_type_reads": on, "activity_automations_only": on, "exclude_automations_filter": on,
-	"agent_status_in_activity": on,
+	"agent_status_in_activity": on, "agent_command_center": on,
 	// views
 	"activity_global_settings": on, "slackbot_unread_v2": on, "unified_files_3p_primary_custom_sections": on,
 	"lists_tabbing_navigation": on, "miles_davis_themes": on,
@@ -342,6 +345,8 @@ var experimentReads = map[string][]string{
 	// prefs, status, focus, notifications, emoji picker
 	"emoji_skin_tone_picker_improvement": on, "focus_mode_custom_duration": {"treatment"},
 	"defer_notification_3p_streaming": on,
+	// the standard emoji set everything reads (emoji_set.go)
+	ExpEmojiV17: on,
 	// desktop notifications (ui/notify.go, huddleui/invite.go): Slack's
 	// notification ids and groups, translated buttons, an invite's Decline
 	"desktop_notification_actions": on,

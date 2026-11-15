@@ -38,7 +38,7 @@ func epTestCustom() map[string]string {
 
 func epTestIndex(t testing.TB) *emojiIndex {
 	t.Helper()
-	std := epParseStd([]byte(epTestStd))
+	std := epParseStd([]byte(epTestStd), emoji.CategoriesFor(false))
 	if len(std.names) != 5 {
 		t.Fatalf("parsed %d standard emoji, want 5", len(std.names))
 	}
@@ -124,7 +124,7 @@ func TestEmojiURLs(t *testing.T) {
 	if x.url(party, 5) != "https://e.test/party.png" {
 		t.Errorf("custom url = %q", x.url(party, 5))
 	}
-	g := epBuild(epParseStd([]byte(epTestStd)), "google", nil)
+	g := epBuild(epParseStd([]byte(epTestStd), emoji.CategoriesFor(false)), "google", nil)
 	if id, _ := g.lookup("tada"); g.url(id, 1) != emoji.CDN+"google-medium/1f389.png" {
 		t.Errorf("google url = %q", g.url(id, 1))
 	}
@@ -286,7 +286,7 @@ func TestEmojiBigIndex(t *testing.T) {
 	if testing.Short() {
 		t.Skip("short")
 	}
-	x := epBuild(epParseStd([]byte(epTestStd)), "apple", epBigCustom(65000))
+	x := epBuild(epParseStd([]byte(epTestStd), emoji.CategoriesFor(false)), "apple", epBigCustom(65000))
 	var s epSearcher
 	s.setFrecency(map[string]float64{epBigName(21): 80, epBigName(11): 40}) // blob_parrot21, blob_blob11
 	ids, _ := s.search(x, "party", 0)
@@ -314,7 +314,7 @@ func TestEmojiBigIndex(t *testing.T) {
 }
 
 func BenchmarkEmojiSearch(b *testing.B) {
-	x := epBuild(epParseStd([]byte(epTestStd)), "apple", epBigCustom(70000))
+	x := epBuild(epParseStd([]byte(epTestStd), emoji.CategoriesFor(false)), "apple", epBigCustom(70000))
 	var s epSearcher
 	scores := map[string]float64{}
 	for i := 1; i < 4000; i += 10 {

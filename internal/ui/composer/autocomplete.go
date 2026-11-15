@@ -97,6 +97,10 @@ const (
 	// aborts the previous search (AbortController), no debounce.
 	acDebounce  = 0 * time.Millisecond
 	acSnapEvery = 5 * time.Second // snapshot refresh while typing
+	// acEmojiWait bounds how long a Tab or Enter on a ":" list waits for
+	// the index of the workspace's custom emoji when it is still building
+	// (popups.EnsureEmojiIndex; ~170 ms for Hack Club's 65,908)
+	acEmojiWait = time.Second
 )
 
 // Autocomplete state. Everything but the fields under mu belongs to the UI
@@ -141,10 +145,12 @@ type Autocomplete struct {
 	teamName string
 	pending  *acAccept
 
-	// item cache key: recompute when the trigger or the async data change
-	itemsFor acTrigger
-	itemsGen uint64
-	itemsOK  bool
+	// item cache key: recompute when the trigger, the async data or the
+	// ranking inputs (the frecency pref, the model) change
+	itemsFor  acTrigger
+	itemsGen  uint64
+	itemsRank acRankKey
+	itemsOK   bool
 
 	// local sources, refreshed from the snapshot
 	snapAt   time.Time
@@ -239,6 +245,9 @@ func (ac *Autocomplete) Key(name key.Name, mods key.Modifiers) bool {
 			// The popup state is from the last frame; the document may
 			// have moved on within this input batch. Sync first.
 			if d, caret := ac.Live(); d != nil {
+				if name == key.NameTab || name == key.NameReturn || name == key.NameEnter {
+					ac.awaitEmojiIndex(d, caret)
+				}
 				ac.Update(d, caret)
 			}
 		}
@@ -324,6 +333,7 @@ func (ac *Autocomplete) Update(d *Doc, caret int) {
 	}
 	if !ok {
 		ac.active = false
+		ac.warmEmojiIndex(d, caret)
 		return
 	}
 	if !ac.active || t.Query != ac.trig.Query || t.Kind != ac.trig.Kind {
@@ -334,7 +344,8 @@ func (ac *Autocomplete) Update(d *Doc, caret int) {
 	ac.mu.Lock()
 	gen := ac.gen
 	ac.mu.Unlock()
-	if ac.itemsOK && ac.itemsFor.Kind == t.Kind && ac.itemsFor.Query == t.Query && ac.itemsGen == gen {
+	rk := ac.rankKey(t)
+	if ac.itemsOK && ac.itemsFor.Kind == t.Kind && ac.itemsFor.Query == t.Query && ac.itemsGen == gen && ac.itemsRank == rk {
 		return
 	}
 	ac.refresh()
@@ -350,7 +361,7 @@ func (ac *Autocomplete) Update(d *Doc, caret int) {
 	ac.itemsVer++
 	ac.watchPresence()
 	ac.pluginRank(t, ac.items)
-	ac.itemsFor, ac.itemsGen, ac.itemsOK = t, gen, true
+	ac.itemsFor, ac.itemsGen, ac.itemsRank, ac.itemsOK = t, gen, rk, true
 	// async rows landed: keep the row the user picked selected
 	if selID != "" {
 		for i, it := range ac.items {
@@ -529,14 +540,80 @@ func (ac *Autocomplete) refresh() {
 	}
 }
 
-// rankCtxLocked is the ranking context with the current frecency (a
-// pick changes it at once).
+// rankCtxLocked is the ranking context with the current frecency and
+// model: a pick or a frecency reload changes the one, the
+// search.autocomplete.model answer the other, and Slack's Sorter reads
+// both on every search, not from a snapshot.
 func (ac *Autocomplete) rankCtxLocked() rankCtx {
 	r := ac.rk
 	if ac.h != nil && ac.h.Core() != nil {
-		r.frec = ac.h.Core().FrecencyCache()
+		a := ac.h.Core()
+		r.frec = a.FrecencyCache()
+		r.weights = a.AutocompleteModel()
 	}
 	return r
+}
+
+// acRankKey versions the ranking inputs that land after a list is shown:
+// the frecency pref (a reload from Slack, a pick), the model and, for
+// ":", the emoji index (popups.EmojiIndexGen: the workspace's custom
+// emoji are indexed off the UI goroutine).
+type acRankKey struct{ frec, model, emoji uint64 }
+
+// rankKey is the current acRankKey for t. An open list whose inputs
+// changed is ranked again on the next Update (each frame, and Key before
+// a Tab or Enter acts), as Slack's tiered search sorts its rows again
+// when more lands.
+func (ac *Autocomplete) rankKey(t acTrigger) acRankKey {
+	if ac.h == nil || ac.h.Core() == nil {
+		return acRankKey{}
+	}
+	a := ac.h.Core()
+	k := acRankKey{frec: a.FrecencyVersion(), model: a.AutocompleteModelVersion()}
+	if t.Kind == acEmoji {
+		k.emoji = popups.EmojiIndexGen()
+	}
+	return k
+}
+
+// The ":" list and the custom emoji index. Slack lists from the emoji
+// store, which holds the workspace's custom emoji all along, so a custom
+// alias's exact name (Karim's tu, "alias:thumbs-up", a custom image) is
+// first from the first keystroke. Clack indexes them off the UI
+// goroutine on first use and again after the index's idle drop
+// (popups.epIndexIdle), and ":tu" is the first query the list answers:
+// until the index lands its rows come from the standard set alone
+// (tulip first). So the index starts building as an emoji token starts,
+// an open list ranks again when it lands (rankKey), and a Tab or Enter
+// waits for it before taking a row.
+
+// warmEmojiIndex starts the custom emoji index when the word before the
+// caret is an emoji token still too short to list (":" or ":t"). The
+// list opens at ":tu", usually after it has landed.
+func (ac *Autocomplete) warmEmojiIndex(d *Doc, caret int) {
+	if !ac.coreEmoji() || d == nil || caret <= 0 || caret > d.Len() {
+		return
+	}
+	start := d.WordBefore(caret)
+	if start >= caret || caret-start > 2 || d.Runes[start] != ':' || d.Attrs[start].Style&Code != 0 {
+		return
+	}
+	popups.EnsureEmojiIndex(ac.h, 0)
+}
+
+// awaitEmojiIndex lets a Tab or Enter on a ":" token take a row ranked
+// with the workspace's custom emoji: while their index builds, it waits
+// for it (at most acEmojiWait), and the Update that follows ranks the
+// list again.
+func (ac *Autocomplete) awaitEmojiIndex(d *Doc, caret int) {
+	if !ac.coreEmoji() {
+		return
+	}
+	t, ok := detectTrigger(d, caret)
+	if !ok || t.Kind != acEmoji || (ac.hasDis && t == ac.dismissed) {
+		return
+	}
+	popups.EnsureEmojiIndex(ac.h, acEmojiWait)
 }
 
 // load starts the async loads trigger t needs.
@@ -773,16 +850,19 @@ var emojiShared struct {
 	sync.Mutex
 	idx  *emojiIndex
 	nCus int
+	v17  bool // the standard set it was built from (emoji.V17)
 }
 
 // sharedEmojiIndex returns the process-wide index, rebuilding it when the
-// custom emoji set changed size. Composers share it.
+// custom emoji set changed size or the standard set changed. Composers
+// share it.
 func sharedEmojiIndex(custom map[string]string) *emojiIndex {
 	emojiShared.Lock()
 	defer emojiShared.Unlock()
-	if emojiShared.idx == nil || emojiShared.nCus != len(custom) {
-		emojiShared.idx = buildEmojiIndex(emoji.StandardData(), custom)
+	if v := emoji.V17(); emojiShared.idx == nil || emojiShared.nCus != len(custom) || emojiShared.v17 != v {
+		emojiShared.idx = buildEmojiIndex(emoji.StandardDataFor(v), custom)
 		emojiShared.nCus = len(custom)
+		emojiShared.v17 = v
 	}
 	return emojiShared.idx
 }

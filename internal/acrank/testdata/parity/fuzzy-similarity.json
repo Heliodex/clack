@@ -1,0 +1,14 @@
+{
+  "dimension": "fuzzy-similarity",
+  "slack": {"kind": "slack-js", "source": "PositionAwareFuzzyMatcher (j8FV)", "build": "build not recorded", "captured": "2026-11-09 (commit 8d58a812)", "notes": "Compared to 1e-8."},
+  "cases": [
+    {"name": "kar vs karim", "in": {"q": "kar", "name": "karim"}, "slack": 0.898877105},
+    {"name": "kar vs akari", "in": {"q": "kar", "name": "akari"}, "slack": 0.466084425},
+    {"name": "karim vs karim", "in": {"q": "karim", "name": "karim"}, "slack": 1},
+    {"name": "k vs karim", "in": {"q": "k", "name": "karim"}, "slack": 0},
+    {"name": "gen vs general", "in": {"q": "gen", "name": "general"}, "slack": 0.872594591},
+    {"name": "sweat-sm vs sweat_smile", "in": {"q": "sweat-sm", "name": "sweat_smile"}, "slack": 0.920906099},
+    {"name": "ale vs alex", "in": {"q": "ale", "name": "alex"}, "slack": 0.928279122},
+    {"name": "ale vs alexis", "in": {"q": "ale", "name": "alexis"}, "slack": 0.882777292}
+  ]
+}

@@ -1,8 +1,6 @@
 package slackc
 
 import (
-	"encoding/json"
-	"strconv"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -267,57 +265,9 @@ type emojiSeg struct {
 	stem string
 }
 
-var (
-	emojiOnce   sync.Once
-	emojiIndex  map[string]string
-	emojiMaxLen int
-	emojiSplits = map[string][]emojiSeg{}
-)
-
-func loadEmojiIndex() {
-	var f struct {
-		Emoji []struct {
-			I string            `json:"i"`
-			U string            `json:"u"`
-			S map[string]string `json:"s"`
-		} `json:"emoji"`
-	}
-	_ = json.Unmarshal(emoji.StandardData(), &f)
-	emojiIndex = make(map[string]string, len(f.Emoji)*3)
-	add := func(hexSeq, stem string) {
-		var b strings.Builder
-		n := 0
-		for _, p := range strings.Split(hexSeq, "-") {
-			v, err := strconv.ParseUint(p, 16, 32)
-			if err != nil {
-				return
-			}
-			if v == 0xFE0F {
-				continue
-			}
-			b.WriteRune(rune(v))
-			n++
-		}
-		if n == 0 {
-			return
-		}
-		if _, ok := emojiIndex[b.String()]; !ok {
-			emojiIndex[b.String()] = stem
-		}
-		if n > emojiMaxLen {
-			emojiMaxLen = n
-		}
-	}
-	for _, e := range f.Emoji {
-		add(e.I, e.I)
-		if e.U != "" {
-			add(e.U, e.I)
-		}
-		for _, img := range e.S {
-			add(img, img)
-		}
-	}
-}
+// emojiSplits holds splitEmoji's answers per standard set ([0] 16.0, [1]
+// 17.0: emoji.V17); only the set in use's emoji are images (emoji.Native).
+var emojiSplits = [2]map[string][]emojiSeg{{}, {}}
 
 func mayStartEmoji(r rune) bool {
 	return r >= 0x203C || r == '#' || r == '*' || (r >= '0' && r <= '9') || r == 0xA9 || r == 0xAE
@@ -335,10 +285,14 @@ func splitEmoji(s string) []emojiSeg {
 	if !has {
 		return nil
 	}
-	if segs, ok := emojiSplits[s]; ok {
+	v17, si := emoji.V17(), 0
+	if v17 {
+		si = 1
+	}
+	if segs, ok := emojiSplits[si][s]; ok {
 		return segs
 	}
-	emojiOnce.Do(loadEmojiIndex)
+	emojiIndex, emojiMaxLen := emoji.NativeFor(v17)
 	rs := []rune(s)
 	var segs []emojiSeg
 	var txt strings.Builder
@@ -379,10 +333,10 @@ func splitEmoji(s string) []emojiSeg {
 	} else if txt.Len() > 0 {
 		segs = append(segs, emojiSeg{text: txt.String()})
 	}
-	if len(emojiSplits) > 4096 {
-		emojiSplits = map[string][]emojiSeg{}
+	if len(emojiSplits[si]) > 4096 {
+		emojiSplits[si] = map[string][]emojiSeg{}
 	}
-	emojiSplits[s] = segs
+	emojiSplits[si][s] = segs
 	return segs
 }
 

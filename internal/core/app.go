@@ -92,8 +92,17 @@ type App struct {
 	drafts     draftCache           // the viewer's server drafts (drafts.go), memory only
 	dnd        dndState             // the viewer's Do Not Disturb (dnd.go)
 	mega       megaphoneState       // megaphone spaces, global and per channel (megaphone.go)
+	ssugg      searchSuggState      // the window's last search's filter suggestions (search_suggest.go)
 	selected   string               // the open conversation (SetSelected, preview.go)
 	temp       map[string]int64     // temporary memberships: channel -> expiration_ts (preview.go)
+
+	// huddleChans is the huddle UI's huddleChannelIds (SetHuddleChannels,
+	// sidebar_rules.go); nil until the UI sets it
+	huddleChans func() map[string]bool
+	// slackbotView: Clack shows Slack AI's Slackbot tab or sidebar
+	// link (it has neither: false; tests set it), which hides Slackbot's
+	// DM from the sidebar (slackbotDMHidden)
+	slackbotView bool
 
 	// experiments.go: experiments.getByUser's records (nil until it
 	// answers) and the forced groups ("" reads as not assigned)
@@ -158,6 +167,7 @@ func New(c *slack.Client, s *store.Store) *App {
 	s.SetMembersOnline(a.membersOnline)
 	appsByStore.Store(s, a)
 	store.ExperimentGroup = experimentForStore
+	a.followEmojiSet() // the defaults' set until the account's groups are in
 	return a
 }
 
@@ -1450,13 +1460,15 @@ func (a *App) sections(convs []Conv) []Section {
 	temp := a.tempChannels(time.Now()) // temporary memberships (preview.go)
 	secOf := assignSections(ordered, starred, temp)
 	sel := a.selectedID()
-	// Slack's candidates: closed DMs leave every section (sidebar_rules.go),
-	// except the open one (currentlySelectedId, preview.go)
+	// Slack's candidates: closed DMs leave every section (sidebar_rules.go)
+	// unless they have a draft or a huddle on, except the open one
+	// (currentlySelectedId, preview.go)
+	keep := a.sidebarKeeps()
 	isDMKind := func(id string) bool {
 		c, ok := a.S.Conv(id)
 		return ok && (c.IsIM || c.IsMPIM)
 	}
-	visibleDM := func(id string) bool { return id == sel || !isDMKind(id) || a.dmCandidate(id) }
+	visibleDM := func(id string) bool { return id == sel || !isDMKind(id) || a.dmCandidate(id, keep) }
 	// a canvas's or list's conversation (sidebar_docs.go, lJBI): only with
 	// GH on and where a section, a star or a temporary join puts it, or
 	// while it is the open conversation
@@ -1559,9 +1571,7 @@ func (a *App) sections(convs []Conv) []Section {
 			if connectIdx < 0 {
 				connectIdx = len(out)
 			}
-			if sv.Name == "" {
-				sv.Name = "External connections"
-			}
+			sv.Name = "External connections" // a static name (p4Ef getChannelSectionNameIfStatic)
 		case "recent_apps":
 			// Apps sits where the user's section list puts it, not last.
 			appIdx = len(out)
@@ -1590,6 +1600,9 @@ func (a *App) sections(convs []Conv) []Section {
 	for _, c := range convs {
 		if assigned[c.ID] {
 			continue
+		}
+		if c.Kind == "im" && c.User == slackbotID && a.slackbotDMHidden() {
+			continue // lJBI: no default section for Slackbot's DM while its tab or link shows, open or not
 		}
 		if c.File { // lJBI: no default section for a file channel, unless it is open
 			if c.ID != sel {
@@ -1624,7 +1637,11 @@ func (a *App) sections(convs []Conv) []Section {
 			out[chIdx].Channels = append(out[chIdx].Channels, c.ID)
 		}
 	}
-	if connectIdx >= 0 && len(out[connectIdx].Channels) == 0 { // nothing external: no section
+	// External connections shows while any candidate is externally shared
+	// (lJBI's visibleChannelSections: showConnectSection &&
+	// hasSharedChannels), even when a custom section or Starred holds all
+	// of them and it has no rows of its own
+	if connectIdx >= 0 && !anySectionConv(out, a.extShared) {
 		out = append(out[:connectIdx], out[connectIdx+1:]...)
 		if appIdx > connectIdx {
 			appIdx--
@@ -1638,9 +1655,25 @@ func (a *App) sections(convs []Conv) []Section {
 	case len(apps) > 0:
 		out = append(out, Section{ID: "apps", Name: "Apps", Type: "apps", Channels: apps})
 	}
+	// Starred: with nothing starred among the candidates Slack shows it
+	// (empty) only where emptyStarredShown says so, and gives it m1KW's
+	// banner (starredBanner)
+	isStar := starredSet(ordered, starred)
+	hasStar := anySectionConv(out, func(id string) bool { return isStar[id] })
+	for i := 0; i < len(out); i++ {
+		if out[i].Type != "stars" {
+			continue
+		}
+		if !hasStar && !a.emptyStarredShown(ordered) {
+			out = append(out[:i], out[i+1:]...)
+			i--
+			continue
+		}
+		out[i].StarredBanner = a.starredBanner(ordered, isStar)
+	}
 	// users.channelSections stores membership only; Slack filters and sorts
 	// each section from prefs and experiments (sidebar_rules.go).
-	a.applySectionRules(out, names, time.Now())
+	a.applySectionRules(out, names, keep, time.Now())
 	return out
 }
 

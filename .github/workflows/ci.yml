@@ -92,6 +92,39 @@ jobs:
       - name: every test ran in some shard
         run: python3 .github/scripts/test-shard.py check "$RUNNER_TEMP"/shards/test-shard-*
 
+  # Report-only (docs/PARITY.md): tools/parity.py runs the Slack-parity
+  # tests (tools/parity_checks.json) against Slack's committed output and
+  # says per dimension whether Clack is the same as Slack, what no check
+  # covers, and every divergence; the report is the job summary and the
+  # parity-report artifact. It starts at once instead of waiting for the
+  # linux-test shards. continue-on-error: it never fails ci yet, and the
+  # runner exits 0 on divergences (--strict would gate).
+  parity:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gio deps
+        run: sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" update -qq && sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" install -y -qq $GIO_DEPS
+      - name: runner tests
+        run: python3 -I tools/parity_test.py
+      - name: parity
+        if: ${{ !cancelled() }}
+        run: python3 -I tools/parity.py --out "$RUNNER_TEMP/parity"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ !cancelled() }}
+        with:
+          name: parity-report
+          path: ${{ runner.temp }}/parity
+          if-no-files-found: ignore
+          retention-days: 30
+
   # Gio patches on the vendored gioui.org, Xvfb and Mesa's llvmpipe
   linux-gio:
     runs-on: ubuntu-latest
@@ -121,12 +154,20 @@ jobs:
       - name: Gio hover-only input (vendored gioui.org/io/input)
         if: ${{ !cancelled() }}
         run: go test -count=1 -v -run 'HoverOnly' gioui.org/io/input
+      # Gio patch 26: an Invalidate made while the client handles a wake-up
+      # gets a wake-up of its own (hidden and minimized windows draw no
+      # frame to cover it); the real windows are windows-shell's
+      - name: Gio wakes the client for every Invalidate (vendored gioui.org/app)
+        if: ${{ !cancelled() }}
+        run: go test -count=1 -v -run 'TestInvalidateWhileHandlingAWakeup' gioui.org/app
       # Gio patch 22: what each point of a window with a hidden title bar
       # is (the caption buttons, the top band, the caption, the client);
-      # the Windows codes on real windows are windows-applog's
+      # the Windows codes on real windows are windows-applog's. Patch 24:
+      # what a double-click on a macOS drag area does for each "Double-click
+      # a window's title bar to" setting; the real windows are macos's
       - name: Gio hidden title bar hit test (vendored gioui.org/app)
         if: ${{ !cancelled() }}
-        run: go test -count=1 -v -run 'TestCaptionHit|TestHiddenTitleBarOption' gioui.org/app
+        run: go test -count=1 -v -run 'TestCaptionHit|TestHiddenTitleBarOption|TestTitlebarDoubleClickAction' gioui.org/app
       # the X11 path on a real X server: python-xlib plays a file manager's
       # XDND source against a Gio window (enter, positions, drop, leave)
       - name: XDND file drops on Xvfb (Gio patch 11)
@@ -298,11 +339,14 @@ jobs:
       # GPU here: the geometry, not the pixels; threads-audit has those).
       - name: thread reply box gap (layout, fakeslack)
         if: ${{ !cancelled() }}
+        shell: bash # every go test counts (pwsh steps fail only on the last command)
         env:
           CGO_ENABLED: "0"
         run: |
-          go test -count=1 -v -run '^TestThreadComposerTopMargin$' ./internal/ui/composer
-          go test -count=1 -v -timeout 10m -run '^TestThreadsAuditReplyGap$' ./internal/ui
+          rc=0
+          go test -count=1 -v -run '^TestThreadComposerTopMargin$' ./internal/ui/composer || rc=1
+          go test -count=1 -v -timeout 10m -run '^TestThreadsAuditReplyGap$' ./internal/ui || rc=1
+          exit $rc
       # Slack's frameless window (gap 2, W34). Gio patch 22's HiddenTitleBar
       # on real windows: no caption over the client area, WM_NCHITTEST for
       # the caption buttons (HTMAXBUTTON: Snap Layouts), the caption and the
@@ -320,17 +364,44 @@ jobs:
           CLACK_WINDOWS_TITLEBAR_TESTS: "1"
           CLACK_TITLEBAR_SHOTS: ${{ runner.temp }}\titlebar-shots
         run: |
-          go test -count=1 -v -timeout 10m -run 'TestCaptionHit|TestHiddenTitleBar' gioui.org/app
-          go test -count=1 -v -timeout 15m -run '^(TestTitleBarWindow|TestMainWindowOptions|TestWcoGeometry|TestWcoThemeText)$' ./internal/ui
+          rc=0
+          go test -count=1 -v -timeout 10m -run 'TestCaptionHit|TestHiddenTitleBar' gioui.org/app || rc=1
+          go test -count=1 -v -timeout 15m -run '^(TestTitleBarWindow|TestMainWindowOptions|TestWcoGeometry|TestWcoThemeText)$' ./internal/ui || rc=1
+          exit $rc
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ !cancelled() }}
         with:
           name: titlebar-shots
           path: ${{ runner.temp }}/titlebar-shots
           if-no-files-found: ignore
+      # The window opens where it was (gap 9, W40). Gio patch 25 on real
+      # windows: Displays against GetSystemMetrics and SPI_GETWORKAREA, a
+      # window created at Bounds, its ConfigEvents' bounds through a move, a
+      # minimize and a restore, a later Bounds on a windowed and a
+      # maximized window, created maximized, full screen, and hidden then
+      # shown maximized. Then App.Run's own window (fakeslack), each launch
+      # with ui.json seeded: opened at the saved bounds, a move and a
+      # maximize written back, Quit; saved maximized off every display,
+      # opened maximized and restored onto the display; saved full screen.
+      - name: the window's place (Bounds and Displays, Slack's mainWindowSettings)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          CLACK_WINDOWS_BOUNDS_TESTS: "1"
+        run: |
+          rc=0
+          go test -count=1 -v -timeout 10m -run '^(TestDisplaysWindows|TestBoundsWindows)$' gioui.org/app || rc=1
+          go test -c -o "$RUNNER_TEMP/ui-bounds.test.exe" ./internal/ui || exit 1
+          cd internal/ui
+          for t in TestWindowBoundsWindow TestWindowBoundsOffScreenWindow TestWindowBoundsFullScreenWindow; do
+            "$RUNNER_TEMP/ui-bounds.test.exe" -test.v -test.count=1 -test.timeout 10m -test.run "^$t\$" || rc=1
+          done
+          exit $rc
 
   # Clack's slack:// registration and the single-instance hand-off, close to
-  # the tray, toasts, the taskbar
+  # the tray, the tray's states and menu, the jump list, Focus Assist,
+  # toasts, the taskbar
   windows-shell:
     runs-on: windows-latest
     steps:
@@ -469,16 +540,137 @@ jobs:
       # back), the RunFromTray balloon through Shell_NotifyIcon, and
       # App.Run's own window signed in to internal/fakeslack hiding on
       # SC_CLOSE / WM_CLOSE, running posted work while hidden, coming back
-      # on Raise and closing on Quit.
+      # on Raise and closing on Quit. Gio patch 26: an Invalidate made while
+      # the app handles a hidden or minimized window's wake-up gets its own.
       - name: close to the tray (Window.Hide, the tray balloon, runFromTray in App.Run, the caret blink time)
         if: ${{ !cancelled() }}
+        shell: bash # every go test counts (pwsh steps fail only on the last command)
         env:
           CGO_ENABLED: "0"
           CLACK_WINDOWS_TRAY_TESTS: "1"
         run: |
-          go test -count=1 -v -timeout 10m -run 'TestHideAndRaise|TestHideWithoutDriver|TestCaretBlinkFromOS|TestOptionKeepsHiddenAndMinimized' gioui.org/app
-          go test -count=1 -v -run 'TestNotifyIconDataSize|TestTrayBalloon|TestPutUTF16' ./internal/desktop
-          go test -count=1 -v -timeout 15m -run '^(TestCloseToTrayWindow|TestCloseToTray|TestRunFromTrayRow|TestDrainIdleRunsPosted)$' ./internal/ui
+          rc=0
+          go test -count=1 -v -timeout 10m -run 'TestHideAndRaise|TestHideWithoutDriver|TestCaretBlinkFromOS|TestOptionKeepsHiddenAndMinimized|TestInvalidateWhileHandling' gioui.org/app || rc=1
+          go test -count=1 -v -run 'TestNotifyIconDataSize|TestTrayBalloon|TestPutUTF16' ./internal/desktop || rc=1
+          go test -count=1 -v -timeout 15m -run '^(TestCloseToTrayWindow|TestCloseToTray|TestRunFromTrayRow|TestDrainIdleRunsPosted)$' ./internal/ui || rc=1
+          exit $rc
+
+      # Slack's notification-area icon, its menu and the taskbar's jump
+      # list (gap 8, W39: internal/desktop tray_windows.go,
+      # jumplist_windows.go, focusassist_windows.go; internal/ui tray.go):
+      # the tray's rest, unread and highlight .ico frames as HICONs
+      # (LoadImage's pick per SM_CXSMICON), its native menu read back, the
+      # icon on the runner's taskbar found by its tooltip through UI
+      # Automation, a click, the menu opened by its right button and an
+      # item invoked; the jump list Windows saves for a scratch app id;
+      # the Focus Assist read (WNF and IQuietHoursSettings); the Run
+      # value's --startup; Gio patch 23's StartHidden; App.Run's own window
+      # launched on login with Keep in Background, then its tray state,
+      # menu, reset-window and jump list. bash: every go test counts.
+      # Screenshots in toast-shots.
+      - name: the tray's states and menu, the jump list, Focus Assist, Keep in Background
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          CLACK_WINDOWS_TRAY_TESTS: "1"
+          CLACK_TOAST_SHOTS: ${{ runner.temp }}\toast-shots
+        run: |
+          rc=0
+          go test -count=1 -v -timeout 10m -run '^TestStartHidden$' gioui.org/app || rc=1
+          go test -count=1 -v -timeout 10m -run '^(TestTrayIconFromICO|TestTrayMenuItems|TestTrayShell|TestJumpList|TestFocusAssistRead|TestLaunchOnLoginRunValue|TestFitCenteredLikeSlack|TestFocusAssistOnLikeSlack|TestFocusAssistActiveCachesLikeSlack)$' ./internal/desktop || rc=1
+          go test -count=1 -v -timeout 15m -run '^(TestTrayWindow|TestTrayStateLikeSlack|TestTrayIconFollowsUnreads|TestTrayMenuLikeSlack|TestLaunchOnLoginTrayAndPrefs|TestJumpListLikeSlack|TestAppActions|TestResetWindow|TestStartHiddenLikeSlack|TestSoundPlaybackHoldsTheSound)$' ./internal/ui || rc=1
+          exit $rc
+      # The real exe: Clack.exe --startup (the Run value) with Keep in
+      # Background, the default, keeps its window hidden; the jump list's
+      # Move Clack to Current Display (a second launch with
+      # slack://app/?action=reset-window) hands over and the window comes
+      # out maximized; the jump list Windows saved for Clack.exe has the
+      # task; the exe carries the task's icon (icon group #2).
+      - name: Clack.exe --startup (Keep in Background) and the jump list's Move Clack to Current Display
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path build\Clack.exe)) {
+            go install github.com/tc-hib/go-winres@v0.3.3
+            & (Join-Path (go env GOPATH) 'bin\go-winres.exe') make --in packaging/windows/winres.json --out cmd/clack/rsrc --arch amd64 --file-version 0.0.0.0 --product-version 0.0.0-ci
+            $env:CGO_ENABLED = '0'
+            go build -trimpath -ldflags="-s -w -H windowsgui" -o build\Clack.exe .\cmd\clack
+            if ($LASTEXITCODE -ne 0) { throw 'go build' }
+          }
+          $exe = (Resolve-Path build\Clack.exe).Path
+          $res = Join-Path $env:RUNNER_TEMP 'clack-res'
+          & (Join-Path (go env GOPATH) 'bin\go-winres.exe') extract --dir $res $exe
+          if ($LASTEXITCODE -ne 0) { throw 'go-winres extract' }
+          $groups = (Get-Content (Join-Path $res 'winres.json') -Raw | ConvertFrom-Json).RT_GROUP_ICON
+          if (-not $groups.'#2') { throw "Clack.exe has no icon group #2 (the jump list task's screen.ico): $($groups | ConvertTo-Json -Compress)" }
+          Add-Type @'
+          using System; using System.Text; using System.Runtime.InteropServices;
+          public static class ClackWin {
+            public delegate bool EnumProc(IntPtr h, IntPtr l);
+            [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc f, IntPtr l);
+            [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+            [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+            [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+            [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr h);
+            public static IntPtr Find(uint want) {
+              IntPtr found = IntPtr.Zero;
+              EnumWindows((h, l) => { uint pid; GetWindowThreadProcessId(h, out pid); var c = new StringBuilder(64); GetClassName(h, c, 64);
+                if (pid == want && c.ToString() == "clack") { found = h; return false; } return true; }, IntPtr.Zero);
+              return found;
+            }
+          }
+          '@
+          $log = Join-Path $env:LOCALAPPDATA 'Clack\logs\clack.log'
+          $script:mark = if (Test-Path $log) { @(Get-Content $log).Count } else { 0 }
+          function Wait-Log([string]$text, [string]$what, [int]$secs = 90) {
+            for ($i = 0; $i -lt $secs * 4; $i++) {
+              if ((Test-Path $log) -and (@(Get-Content $log | Select-Object -Skip $script:mark) | Where-Object { $_.Contains($text) })) { return }
+              Start-Sleep -Milliseconds 250
+            }
+            if (Test-Path $log) { Get-Content $log | Select-Object -Skip $script:mark | Select-Object -Last 80 }
+            throw "no '$text' in the log after ${secs}s: $what"
+          }
+          $since = (Get-Date).AddSeconds(-2)
+          $p = Start-Process -PassThru -FilePath $exe -ArgumentList '--startup'
+          try {
+            Wait-Log 'ui: launched on login: the window stays in the notification area (Keep in Background)' 'the login launch'
+            $h = [IntPtr]::Zero
+            for ($i = 0; $i -lt 120 -and $h -eq [IntPtr]::Zero; $i++) { $h = [ClackWin]::Find([uint32]$p.Id); Start-Sleep -Milliseconds 250 }
+            if ($h -eq [IntPtr]::Zero) { throw 'no Clack window' }
+            Start-Sleep -Seconds 3
+            if ([ClackWin]::IsWindowVisible($h)) { throw 'Keep in Background: the window is visible' }
+            Write-Host 'the login launch kept its window hidden'
+            Start-Process -Wait -FilePath $exe -ArgumentList 'slack://app/?action=reset-window'
+            Wait-Log 'desktop: another launch handed over a slack:// link' 'the jump list task reaching the running Clack'
+            for ($i = 0; $i -lt 80 -and -not ([ClackWin]::IsWindowVisible($h) -and [ClackWin]::IsZoomed($h)); $i++) { Start-Sleep -Milliseconds 250 }
+            if (-not [ClackWin]::IsWindowVisible($h)) { throw 'reset-window: the window stayed hidden' }
+            if (-not [ClackWin]::IsZoomed($h)) { throw 'reset-window: the window is not maximized' }
+            Write-Host 'Move Clack to Current Display: shown and maximized'
+            $dir = Join-Path $env:APPDATA 'Microsoft\Windows\Recent\CustomDestinations'
+            $want = @('Move Clack to Current Display', 'slack://app/?action=reset-window', 'Tasks', $exe)
+            $ok = $false
+            for ($i = 0; $i -lt 60 -and -not $ok; $i++) {
+              foreach ($f in Get-ChildItem $dir -Filter '*.customDestinations-ms' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $since }) {
+                $b = [System.IO.File]::ReadAllBytes($f.FullName)
+                # UTF-16 strings sit at even or odd offsets: read it both ways
+                $texts = @([System.Text.Encoding]::Unicode.GetString($b), [System.Text.Encoding]::Unicode.GetString($b, 1, $b.Length - 1))
+                if (@($want | Where-Object { $w = $_; -not @($texts | Where-Object { $_.Contains($w) }) }).Count -eq 0) { $ok = $true; Write-Host "the jump list: $($f.Name)" }
+              }
+              if (-not $ok) { Start-Sleep -Milliseconds 500 }
+            }
+            if (-not $ok) {
+              $adv = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -ErrorAction SilentlyContinue
+              Write-Host "Start_TrackDocs: $($adv.Start_TrackDocs)"
+              Get-ChildItem $dir -ErrorAction SilentlyContinue | Format-Table Name, Length, LastWriteTime | Out-String | Write-Host
+              Get-Content $log | Select-String -SimpleMatch 'jump list', 'desktop:', 'ui: ' | Select-Object -Last 40 | ForEach-Object { $_.Line }
+              throw "no saved jump list with $($want -join ', ')"
+            }
+          } finally {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            $p.WaitForExit(15000) | Out-Null
+          }
 
       # Toasts (WinRT, internal/desktop/toast_windows.go). Windows drops a
       # toast from an app id it doesn't know without an error, so a scratch
@@ -560,14 +752,34 @@ jobs:
       # the taskbar go in toast-shots.
       - name: taskbar (the unread badge overlay, the frame flash, windowFlashBehavior's close and revive)
         if: ${{ !cancelled() }}
+        shell: bash # every go test counts (pwsh steps fail only on the last command)
         env:
           CGO_ENABLED: "0"
           CLACK_WINDOWS_TASKBAR_TESTS: "1"
           CLACK_TOAST_SHOTS: ${{ runner.temp }}\toast-shots
           BADGE_SHOTS_DIR: ${{ runner.temp }}\toast-shots
         run: |
-          go test -count=1 -v -timeout 10m -run 'TestTaskbar|TestSystemIdleTime|TestBadge|TestLanczos' ./internal/desktop
-          go test -count=1 -v -timeout 15m -run '^(TestTaskbarWindow|TestTaskbarOverlayFollowsCount|TestFlashOnNotification|TestCloseKeepsAppInTaskbar|TestWindowsAppearancePref|TestCloseToTray|TestTitleDockTaskbarAgreeLikeSlack)$' ./internal/ui
+          rc=0
+          go test -count=1 -v -timeout 10m -run 'TestTaskbar|TestSystemIdleTime|TestBadge|TestLanczos' ./internal/desktop || rc=1
+          go test -count=1 -v -timeout 15m -run '^(TestTaskbarWindow|TestTaskbarOverlayFollowsCount|TestFlashOnNotification|TestCloseKeepsAppInTaskbar|TestWindowsAppearancePref|TestCloseToTray|TestTitleDockTaskbarAgreeLikeSlack)$' ./internal/ui || rc=1
+          exit $rc
+      # Focus Assist's modes set through IQuietHoursSettings, each read back
+      # through the WNF state as Slack's windows-focus-assist reads it, and
+      # Clack as a priority app. It switches the runner's Do not disturb,
+      # which crashes the notification service on Server 2025 (restarted
+      # within seconds; a change made just before can be lost), so it runs
+      # last, in its own process, after every toast and taskbar step; it
+      # makes each change again until it reads back, skips if the service
+      # stays down, and puts the profile back. The cache and Slack's muting
+      # rule are TestFocusAssistActiveCachesLikeSlack's (the tray step).
+      - name: Focus Assist's modes (Do not disturb switched through IQuietHoursSettings, then put back)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          CLACK_WINDOWS_TRAY_TESTS: "1"
+          CLACK_WINDOWS_FOCUS_ASSIST_TESTS: "1"
+        run: go test -count=1 -v -timeout 5m -run '^TestFocusAssistModes$' ./internal/desktop
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ !cancelled() }}
         with:
@@ -604,13 +816,16 @@ jobs:
       # clicked over a long fakeslack channel in Clack's own window.
       - name: middle-click autoscroll (TestPanCursors, internal/ui/autoscroll, SendInput on Clack's window)
         if: ${{ !cancelled() }}
+        shell: bash # every go test counts (pwsh steps fail only on the last command)
         env:
           CGO_ENABLED: "0"
           CLACK_WINDOWS_AUTOSCROLL_TESTS: "1"
         run: |
-          go test -count=1 -v -run '^TestPanCursors$' gioui.org/app
-          go test -count=1 -v ./internal/ui/autoscroll
-          go test -count=1 -v -timeout 10m -run '^(TestAutoscrollWindow|TestAutoscrollInClack)$' ./internal/ui
+          rc=0
+          go test -count=1 -v -run '^TestPanCursors$' gioui.org/app || rc=1
+          go test -count=1 -v ./internal/ui/autoscroll || rc=1
+          go test -count=1 -v -timeout 10m -run '^(TestAutoscrollWindow|TestAutoscrollInClack)$' ./internal/ui || rc=1
+          exit $rc
 
 
   windows-idle:
@@ -647,7 +862,8 @@ jobs:
           go test -count=1 -v -run 'TestCodeRunsHaveOutlines|TestCodeSpanAfterEmoji|TestInlineCodeDraws' ./internal/ui/theme ./internal/ui/richview ./internal/ui/composer
           go test -count=1 -v -run 'TestEmoji' ./internal/ui/theme
           go test -count=1 -v -run 'TestOwnProfilePane|TestOtherProfilePane' ./internal/ui/popups
-          go test -count=1 -v -run 'TestSwipe|TestNav|TestNativeMenuBar|TestMacMenu|TestMenuState|TestZoom|TestDiagnosticsText|TestMissedFrameLogLine|TestTitleDockTaskbarAgreeLikeSlack' ./internal/ui
+          go test -count=1 -v -run 'TestSwipe|TestNav|TestNativeMenuBar|TestMacMenu|TestMenuState|TestZoom|TestDiagnosticsText|TestMissedFrameLogLine|TestTitleDockTaskbarAgreeLikeSlack|TestMacOptions|TestMacActivation|TestMacNotifier|TestMainWindowOptions|TestCloseHidesWithoutTray|TestMacNavCaption' ./internal/ui
+          go test -count=1 -v -run 'TestUserNotification' ./internal/desktop
           go test -count=1 -v ./internal/applog
           go test -count=1 -v ./internal/ui/menubar
           go test -count=1 -v ./internal/ui/screenlock ./internal/ui/globalkey
@@ -665,6 +881,112 @@ jobs:
           go test -count=1 -v -run 'TestNoExecOnUIPaths|TestOSPrefersDarkOffUI|TestOSSchemeFollow|TestWatchdogReport|TestTakeShaperDoesNotWait|TestAccountTheme|TestAppearancePageDraws|TestFormatWithMarkupPref' ./internal/ui
           go test -count=1 -timeout 20m -v -run 'TestStartupStatesNeverBlock|TestStartupWithHangingTools|TestEveryExecSetsWaitDelay' ./internal/ui
           go test -count=1 -v -run 'Paste|TestAttRunHangingChild' ./internal/ui/composer
+      # docs/GAPS-2026-11-14.md gap 1 (W33). usernotifyprobe's tests run
+      # from Clack.app bundles built the way release.yml builds one, each with
+      # its own bundle id so each starts undecided. TestUserNotifyProbe logs
+      # what UNUserNotificationCenter answers each kind of bundle (the PROBE
+      # lines, and usernoted's log after them): reports, not checks.
+      # TestShowUserNotificationInBundle checks internal/desktop's notifier
+      # from the release's ad-hoc signed bundle and must pass.
+      - name: notifications from ad-hoc signed bundles (UNUserNotificationCenter)
+        if: ${{ !cancelled() }}
+        run: |
+          set -u +e
+          go test -c -o build/unprobe.test ./internal/desktop/usernotifyprobe || exit 1
+          go test -c -o build/unprobe-rebuilt.test -ldflags "-X github.com/some-du6e/clack/internal/desktop/usernotifyprobe.build=2" ./internal/desktop/usernotifyprobe || exit 1
+          sw_vers
+          echo "user $(id -un) ($(id -u)); console owner $(stat -f %Su /dev/console)"
+          # bundle DIR ID SIGN [BINARY]: a Clack.app as release.yml makes one,
+          # the probe's test binary as its executable. SIGN adhoc is the
+          # release's codesign --sign - over the bundle; linker leaves only the
+          # Go linker's signature on the binary (Info.plist not bound).
+          bundle() {
+            app=build/$1/Clack.app
+            mkdir -p $app/Contents/MacOS $app/Contents/Resources
+            cp ${4:-build/unprobe.test} $app/Contents/MacOS/clack
+            cp assets/icon/clack.icns $app/Contents/Resources/clack.icns
+            sed "s/@VERSION@/0.0.1/g" packaging/macos/Info.plist > $app/Contents/Info.plist
+            /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $2" $app/Contents/Info.plist
+            printf 'APPL????' > $app/Contents/PkgInfo
+            if [ "$3" = adhoc ]; then
+              codesign --force --deep --sign - --entitlements packaging/macos/Clack.entitlements $app
+            fi
+            codesign -dv --verbose=2 $app 2>&1 | grep -E '^(Identifier|Format|CodeDirectory|CDHash|Signature|TeamIdentifier|Info.plist|Sealed|Runtime)' | sed "s/^/  $1: /"
+          }
+          probe() { # DIR VARIANT STEPS
+            build/$1/Clack.app/Contents/MacOS/clack -test.v -test.timeout 4m -test.run '^TestUserNotifyProbe$' -probe=$2 -probe.steps=$3 -probe.wait=10s
+            echo "  exit $?"
+          }
+          echo "== show: internal/desktop's notifier from the release's bundle"
+          bundle show io.github.some-du6e.clack.probe-show adhoc
+          build/show/Clack.app/Contents/MacOS/clack -test.v -test.timeout 4m -test.run '^TestShowUserNotificationInBundle$' -probe.show
+          shown=$?
+          echo "== bare: the test binary outside any bundle"
+          build/unprobe.test -test.v -test.timeout 4m -test.run '^TestUserNotifyProbe$' -probe=bare -probe.steps=provisional
+          echo "== adhoc-prompt: Clack's bundle id, signed as the release is, run from Contents/MacOS"
+          bundle adhoc io.github.some-du6e.clack adhoc
+          probe adhoc adhoc-prompt prompt,post
+          echo "== adhoc-provisional: the same with provisional authorization (no prompt)"
+          bundle prov io.github.some-du6e.clack.probe-provisional adhoc
+          probe prov adhoc-provisional provisional,post
+          echo "== adhoc-update: that bundle with a rebuilt binary in place (a new cdhash, as an update has)"
+          bundle prov io.github.some-du6e.clack.probe-provisional adhoc build/unprobe-rebuilt.test
+          probe prov adhoc-update none
+          echo "== linker-provisional: no bundle signature"
+          bundle linker io.github.some-du6e.clack.probe-linker linker
+          probe linker linker-provisional provisional,post
+          echo "== adhoc-open: launched through LaunchServices (open), as Finder and the Dock launch it"
+          bundle open io.github.some-du6e.clack.probe-open adhoc
+          out=$(mktemp -d)
+          open -W -n --stdout "$out/open.out" --stderr "$out/open.err" build/open/Clack.app --args -test.v -test.timeout 4m -test.run '^TestUserNotifyProbe$' -probe=adhoc-open -probe.steps=prompt,post -probe.wait=10s
+          echo "  open exit $?"
+          cat "$out/open.out" "$out/open.err"
+          echo "== usernoted's log"
+          log show --last 10m --style compact --predicate 'process == "usernoted" OR subsystem BEGINSWITH "com.apple.UserNotifications"' | grep -i -E 'some-du6e|clack|unprobe' | tail -200
+          exit $shown
+      # docs/GAPS-2026-11-14.md gaps 3 and 4 (W35). Gio patch 24 on real
+      # NSWindows: the hidden title bar (content under it, the traffic
+      # lights at {12, 12} through a title change, a resize and a key
+      # change), where AppKit sends a click in the title bar band, a
+      # double-click on a drag area per AppleActionOnDoubleClick, Hide and
+      # the shows after it, Hide in full screen. Then Clack's own window:
+      # the red button and ⌘W hide it, the Dock's reopen and the app's
+      # activation show it, ⌘Q quits it while hidden. TestMain runs app.Main
+      # on the main goroutine for these (CLACK_MACOS_WINDOW_TESTS).
+      - name: macOS window (Gio patch 24, W35)
+        if: ${{ !cancelled() }}
+        env:
+          CLACK_MACOS_WINDOW_TESTS: "1"
+        run: |
+          set +e
+          sw_vers
+          go test -count=1 -v -timeout 10m -run 'TestHiddenTitleBarMac|TestTitlebarDoubleClickMac|TestHideMac|TestMacCloseDestroys|TestHideLeavesFullscreenMac' gioui.org/app
+          gio=$?
+          go test -count=1 -v -timeout 10m -run '^TestMacWindowCloseHides$' ./internal/ui
+          ui=$?
+          exit $((gio | ui))
+      # docs/GAPS-2026-11-14.md gap 9 (W40). Gio patch 25 on real NSWindows:
+      # Displays against NSScreen, a window opened at Bounds (points from
+      # the primary screen's top left), its ConfigEvents' bounds through a
+      # move, a later Bounds and the minimum, opened maximized (zoomed on
+      # the screen, unzoomed to the frame) and full screen. Then App.Run's
+      # own window, each launch with ui.json seeded: opened at the saved
+      # bounds, a move and a zoom written back, Quit; saved maximized off
+      # every screen; saved full screen (last: the runner never leaves it).
+      - name: macOS window place (Gio patch 25, W40)
+        if: ${{ !cancelled() }}
+        env:
+          CLACK_MACOS_WINDOW_TESTS: "1"
+        run: |
+          set +e
+          rc=0
+          go test -count=1 -v -timeout 10m -run '^(TestDisplaysMac|TestBoundsMac)$' gioui.org/app || rc=1
+          go test -c -o "$RUNNER_TEMP/ui-bounds.test" ./internal/ui || exit 1
+          cd internal/ui
+          for t in TestMacWindowBounds TestMacWindowBoundsOffScreen TestMacWindowBoundsFullScreen; do
+            "$RUNNER_TEMP/ui-bounds.test" -test.v -test.count=1 -test.timeout 10m -test.run "^$t\$" || rc=1
+          done
+          exit $rc
       - name: build
         if: ${{ !cancelled() }}
         run: |

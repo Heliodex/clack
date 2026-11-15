@@ -37,6 +37,25 @@ channel and thread users.
   fetch upserts into the store, then the whole local set is matched and
   sorted again and replaces the rows. A loading row appears only when there
   are no local rows after 300 ms, and the search times out at 10 s.
+- **Ranking inputs that land later.** Slack's Sorter reads the frecency
+  pref and the model on every search. Clack reads both on every compute,
+  not from the 5 s snapshot. It also ranks an open list again when either
+  changes (`FrecencyVersion`, `AutocompleteModelVersion`), on the next
+  frame or on the Tab or Enter itself. Before this, a model or frecency
+  that arrived after the first keystroke stayed out of the rows until the
+  query changed.
+- **The custom emoji index.** Slack lists `:` from its emoji store, which
+  holds the workspace's custom emoji the whole time. Clack indexes them
+  (65,908 on Hack Club, ~170 ms) off the UI goroutine on first use and
+  again after the index's 5-minute idle drop (`popups.epIndexIdle`).
+  `:tu` is the first query the list answers (the token needs 2 letters),
+  so until that index landed its rows came from the standard set alone,
+  and nothing ranked them again when it landed. Karim's `:tu` then Tab
+  took tulip (2026-11-14). Now `:` or `:t` starts the index
+  (`popups.EnsureEmojiIndex`), an open list ranks again when an index
+  lands (`popups.EmojiIndexGen` in the rank key), and a Tab or Enter on
+  a `:` token waits for a build in flight (at most 1 s) before it takes
+  a row. The search box's `has:`/`hasmy:` emoji rows also rank again.
 - **Empty query.** `allowEmptyQuery` gives every candidate score 0. Desktop
   skips the server for an empty query.
 - **Local candidates.** `@` uses every member in the store
@@ -89,6 +108,42 @@ letter substrings score 2, but it is off for Hack Club.
   most 5 letters, 1 for 3 letters, 0 under 3. Score is
   `1 − len(query)/len(name) + breaks`. A table of blocked pairs is copied
   as is ("hi" never offers `shit`).
+- **Emoji keywords** (`matchKeywords`, on for the `:` list). When no name
+  matches, a keyword that the fuzzy matcher scores at all (3 jumps or
+  fewer) lets the emoji in. Its score stays Inf, so its features carry the
+  failed name scan's ratio and combo breaks. It shows its own name. The
+  keywords are Slack's English map (52eK `getEmojiKeywordsMap`, which
+  HCGG registers for the default locale), standard emoji only, in
+  `internal/emoji/keywords.json.gz`. "turnip" brings `root_vegetable` to
+  `:tu`, "like" brings `+1` to `:like`.
+- **Custom emoji and aliases.** `getConsolidatedEmoji` (Ak7A) adds the
+  custom emoji after the standard ones: a custom image is a row (id
+  `"E"+name`, no keywords), and a custom alias (emoji.list
+  `"alias:target"`, stored as `{isAlias, aliasOf}` by "upsert emoji from
+  flannel") is one more name of its target. Its exact name is then an
+  exact match (score 0, +400 with `emoji_exact_match_boost`), first, shown
+  as the alias. Clack's index does the same (`epBuild`: aliases on their
+  target, chains followed). In Karim's workspace `tu` is
+  `"alias:thumbs-up"`, and `thumbs-up` is a custom image (not `+1`). The
+  harness over the whole workspace (593 matches) lists `tu`
+  (thumbs-up), tuba, tube, tuff, tuna, tunk, stu, then tulip.
+  `emoji_ac_test.go` and `emoji_slack_test.go` pin Slack's rows for
+  synthetic custom sets.
+- **The standard set** (`emoji_v17`, client-boot 1PPX). Slack's ":" list,
+  like everything else that reads standard emoji, takes
+  getStandardEmojiData's table: `qU6j` with `emoji_v17` on, `IYuW`
+  without. Karim's account isn't in the experiment (2026-11-14), so the
+  eight Unicode 17 emoji (ballet_dancer, distorted_face, fight_cloud,
+  hairy_creature, landslide, orca, treasure_chest, trombone) never match,
+  and dancers and the wrestlers take no tone. Clack follows the group
+  (`emoji.V17`, set by core). Off, `:tu`'s row 25 with the fallback model
+  is person_in_tuxedo and `:orc` doesn't offer orca; on, hairy_creature
+  and orca take those places (the emoji-rank snapshot's `emoji_v17 on`
+  cases).
+- **List order.** The emoji are listed in `getConsolidatedEmoji` order
+  (Ak7A), which the keyword file also stores. Two Inf scores compare as
+  NaN in the sorter (`a.score − b.score`), and the sort treats NaN as a
+  tie. So keyword-only rows keep that order and get no name tie-break.
 - **Remote passthrough.** The experiment
   `autocomplete_flannel_fuzzy_match_passthrough` is `treatment` for Karim.
   A server result that fails the local match still shows at score 2, and
@@ -98,6 +153,17 @@ letter substrings score 2, but it is off for Hack Club.
 A node harness ran Slack's own +EXg, emoji scorer and j8FV
 code. `acrank_test.go` pins its values (12 matcher cases, 13 emoji cases, 8
 similarity cases). They agree to 9 decimals.
+
+A second harness (2026-11-14, build efbd526e8fb3) ran the whole `:`
+pipeline: matcher, sorter, frecency, model Sorter, features and
+offline-feature defaults, over every standard emoji with Karim's
+experiments. `emoji_slack_test.go` pins its top rows for `:tu`, `:thu`,
+`:like`, `:yes`, `:sh` and `:smi`, cold and with frecency. `:tu` never
+offers `+1`/`thumbsup`, however often it's used. A query under 3 letters
+may skip no letters, "thumbsup" has an "h" between the t and the u, and
+none of +1's keywords starts with "tu". Frecency only scores rows that
+matched. Slack's `:tu` list starts tulip, root_vegetable, turkey, turtle.
+`:thu` reaches it (via "thumbsup"), first once its uses count.
 
 ## Ordering
 
@@ -168,8 +234,9 @@ wrap, Esc closes.
 
 ## Known gaps
 
-- **Emoji keywords** (`matchKeywords`). Clack has no keyword table, so
-  ":happy" doesn't find `smile`.
+- **skin-tone-2…6.** Slack's standard set lists the five tone swatches as
+  emoji in both of its tables (`:skin` offers them); Clack's table has no
+  rows for them. `emoji_v17` doesn't gate them.
 - **The exact-name lift rules** (J3WV,
   `search_autocomplete_promote_exact_name_matches` treatment_3 or
   treatment_5). Not ported. I didn't read the experiment's value for Karim.

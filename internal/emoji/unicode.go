@@ -3,7 +3,6 @@ package emoji
 import (
 	"strconv"
 	"strings"
-	"sync"
 )
 
 // Unicode emoji to Slack names, for the composer: Slack's message input
@@ -11,11 +10,9 @@ import (
 // after the standard emoji (getEmojiNameFromUnicodeString), so a typed 👍
 // is sent as the "+1" emoji element, like a picked one.
 
-var (
-	uniOnce   sync.Once
-	uniIndex  map[string]uniEnt // code points without VS16 -> entry
-	uniMaxLen int
-)
+// Each set keeps its own index (set.uni: code points without VS16 ->
+// entry): with emoji_v17 off a typed Unicode 17 emoji stays text, as
+// Slack's input finds no name for it.
 
 type uniEnt struct {
 	name string
@@ -26,9 +23,9 @@ type uniEnt struct {
 
 var skinTones = map[string]string{"1F3FB": "2", "1F3FC": "3", "1F3FD": "4", "1F3FE": "5", "1F3FF": "6"}
 
-func loadUnicode() {
-	once.Do(load)
-	uniIndex = make(map[string]uniEnt, len(byName)*2)
+func (s *set) loadUnicode() {
+	uniIndex := make(map[string]uniEnt, len(s.byName)*2)
+	uniMaxLen := 0
 	add := func(hexSeq, name string) {
 		var b strings.Builder
 		n, vs := 0, false
@@ -56,7 +53,7 @@ func loadUnicode() {
 		uniIndex[k] = uniEnt{name: name, vs: vs}
 		uniMaxLen = max(uniMaxLen, n)
 	}
-	for _, e := range allStd {
+	for _, e := range s.list {
 		if len(e.Names) == 0 {
 			continue
 		}
@@ -71,6 +68,7 @@ func loadUnicode() {
 			}
 		}
 	}
+	s.uni, s.uniMax = uniIndex, uniMaxLen
 }
 
 // MatchUnicode finds the standard emoji whose sequence starts at rs[i]
@@ -81,15 +79,16 @@ func MatchUnicode(rs []rune, i int) (name string, end int, ok bool) {
 	if i < 0 || i >= len(rs) || !maybeEmoji(rs[i]) {
 		return "", 0, false
 	}
-	uniOnce.Do(loadUnicode)
+	s := cur()
+	s.uniOnce.Do(s.loadUnicode)
 	var kb [16]rune
 	key := kb[:0]
-	for j := i; j < len(rs) && len(key) < uniMaxLen; j++ {
+	for j := i; j < len(rs) && len(key) < s.uniMax; j++ {
 		if rs[j] == 0xFE0F {
 			continue
 		}
 		key = append(key, rs[j])
-		e, hit := uniIndex[string(key)]
+		e, hit := s.uni[string(key)]
 		if !hit {
 			continue
 		}
