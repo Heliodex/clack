@@ -119,8 +119,10 @@ func sugLocalMatch(it *fileItem, words []string) bool {
 	return true
 }
 
+// isMediaFile is the searcher's Photos and videos filter (JG8Q:
+// fileIsImage || fileIsPlayableVideo); an image without thumbs is a file.
 func isMediaFile(it *fileItem) bool {
-	return strings.HasPrefix(it.Mime, "image/") || strings.HasPrefix(it.Mime, "video/") || it.isImage()
+	return it.isImage() || strings.HasPrefix(it.Mime, "video/")
 }
 
 // sugKeep is searcherOptions' filter for the Attachment type.

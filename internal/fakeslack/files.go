@@ -216,6 +216,17 @@ func (s *Server) FilesReplies(ts string) []slack.Message {
 	return nil
 }
 
+// FilesCaseFiles are the files of the top-level #files-gallery case name
+// (nil when there's none).
+func (s *Server) FilesCaseFiles(name string) []slack.File {
+	for _, f := range s.filesFixtures() {
+		if f.name == name {
+			return append([]slack.File(nil), f.files...)
+		}
+	}
+	return nil
+}
+
 // FilesReplyTS is the ts of the j-th reply under #files-gallery case name.
 func (s *Server) FilesReplyTS(name string, j int) string {
 	for i, f := range s.filesFixtures() {

@@ -36,7 +36,9 @@ type File struct {
 	Channels         []string // channels, groups and DMs it is shared in
 	Mode             string   // hosted | external | quip | list | tombstone | …
 	IsCanvas, IsList bool
-	IsImage          bool
+	// IsImage is Slack's fileIsImage (slack.FileIsImage): image/* with
+	// thumbs, so an image Slack made no thumbs for is a plain file.
+	IsImage bool
 	// LastRead is when the viewer last opened it (last_read: milliseconds
 	// or seconds, 0 never), for the collections' Last viewed sort.
 	LastRead int64
@@ -273,12 +275,16 @@ type browseFileRaw struct {
 	Mode       string          `json:"mode"`
 	IsDeleted  bool            `json:"is_deleted"`
 	FileAccess string          `json:"file_access"`
+	// fileIsImage's other thumbs and its Salesforce case (slack.FileIsImage)
+	Thumb360GIF      string `json:"thumb_360_gif"`
+	Thumb800         string `json:"thumb_800"`
+	IsSalesforceFile bool   `json:"is_salesforce_file"`
 }
 
 func (r *browseFileRaw) file() File {
 	f := File{ID: r.ID, Name: stripHighlight.Replace(r.Name), Title: stripHighlight.Replace(r.Title),
 		Filetype: r.Filetype, PrettyType: r.PrettyType, Mime: r.Mimetype, User: r.User,
-		Thumb: firstNonEmpty(r.Thumb360, r.ThumbPDF, r.ThumbVideo), URL: r.URLPrivate, Permalink: r.Permalink,
+		Thumb: firstNonEmpty(r.Thumb360, r.Thumb360GIF, r.ThumbPDF, r.ThumbVideo), URL: r.URLPrivate, Permalink: r.Permalink,
 		ThumbW: r.Thumb360W, ThumbH: r.Thumb360H, Size: r.Size, Created: r.Created, Modified: r.Updated, Mode: r.Mode,
 		Timestamp: r.Timestamp}
 	if f.Created == 0 {
@@ -290,7 +296,11 @@ func (r *browseFileRaw) file() File {
 	f.Channels = append(append(append(f.Channels, r.Channels...), r.Groups...), r.IMs...)
 	f.IsCanvas = r.Filetype == "quip" || r.Filetype == "canvas" || r.Mode == "quip" || strings.EqualFold(r.PrettyType, "canvas")
 	f.IsList = !f.IsCanvas && (r.Filetype == "list" || r.Mode == "list" || strings.EqualFold(r.PrettyType, "list"))
-	f.IsImage = strings.HasPrefix(r.Mimetype, "image/")
+	// fileIsImage: an image/* file Slack made no thumbs for (a very tall
+	// screenshot) is a plain file here, as in Slack's Files browser and
+	// channel Files tab (getMainFileAction "download", not the viewer)
+	f.IsImage = slack.FileIsImage(&slack.File{Mimetype: r.Mimetype, Filetype: r.Filetype, Thumb360: r.Thumb360,
+		Thumb360GIF: r.Thumb360GIF, Thumb800: r.Thumb800, IsSalesforceFile: r.IsSalesforceFile})
 	var lr json.Number
 	if len(r.LastRead) > 0 && json.Unmarshal(r.LastRead, &lr) == nil {
 		f.LastRead, _ = lr.Int64()

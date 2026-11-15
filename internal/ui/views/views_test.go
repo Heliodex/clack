@@ -82,8 +82,10 @@ func TestRoomFromEvent(t *testing.T) {
 func TestFileKinds(t *testing.T) {
 	canvas := fileItem{core.File{Filetype: "quip", PrettyType: "Canvas"}}
 	list := fileItem{core.File{Filetype: "list"}}
-	img := fileItem{core.File{Mime: "image/png"}}
-	if !canvas.isCanvas() || canvas.isList() || !list.isList() || !img.isImage() {
+	img := fileItem{core.File{Mime: "image/png", IsImage: true}}
+	// fileIsImage (core.File.IsImage): an image/* file without thumbs isn't
+	unthumbed := fileItem{core.File{Mime: "image/png", Filetype: "png"}}
+	if !canvas.isCanvas() || canvas.isList() || !list.isList() || !img.isImage() || unthumbed.isImage() {
 		t.Fatal("file kind predicates")
 	}
 	if fileKindLabel(&canvas) != "Canvas" || fileKindLabel(&list) != "List" {
