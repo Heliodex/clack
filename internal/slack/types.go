@@ -21,6 +21,11 @@ type Message struct {
 	LatestReply    string          `json:"latest_reply,omitempty"`
 	Subscribed     bool            `json:"subscribed,omitempty"`
 	LastRead       string          `json:"last_read,omitempty"` // a followed thread's root (conversations.replies): the viewer's last read reply
+	// SubscribedSet: the copy had a "subscribed" field of its own (history
+	// and replies roots do; the socket's message_changed doesn't), which
+	// is what Slack's slurpThreadSubscriptions takes a thread's
+	// subscription from (store/thread_subs.go). Decoding sets it.
+	SubscribedSet  bool            `json:"-"`
 	Edited         *Edited         `json:"edited,omitempty"`
 	Reactions      []Reaction      `json:"reactions,omitempty"`
 	Files          []File          `json:"files,omitempty"`
@@ -597,12 +602,14 @@ type Counts struct {
 
 // UnmarshalJSON decodes a message and keeps the raw attachments JSON (for
 // plugins that need fields the typed Attachment drops). Malformed
-// attachments no longer fail the whole message.
+// attachments no longer fail the whole message. SubscribedSet records
+// whether "subscribed" was there at all.
 func (m *Message) UnmarshalJSON(b []byte) error {
 	type plain Message
 	aux := struct {
 		*plain
 		RawAtt json.RawMessage `json:"attachments,omitempty"`
+		RawSub json.RawMessage `json:"subscribed,omitempty"`
 	}{plain: (*plain)(m)}
 	if err := json.Unmarshal(b, &aux); err != nil {
 		return err
@@ -612,6 +619,10 @@ func (m *Message) UnmarshalJSON(b []byte) error {
 	if len(aux.RawAtt) > 0 && string(aux.RawAtt) != "null" {
 		m.RawAttachments = append(json.RawMessage(nil), aux.RawAtt...)
 		_ = json.Unmarshal(aux.RawAtt, &m.Attachments)
+	}
+	m.Subscribed, m.SubscribedSet = false, false
+	if len(aux.RawSub) > 0 && string(aux.RawSub) != "null" {
+		m.SubscribedSet = json.Unmarshal(aux.RawSub, &m.Subscribed) == nil
 	}
 	return nil
 }

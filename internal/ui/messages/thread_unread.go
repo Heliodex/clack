@@ -88,13 +88,22 @@ func (s *listState) threadSub() (subscribed bool, lastRead string) {
 	return true, r.ThreadLastRead
 }
 
-// maxMarkable is maxRealTs over the thread's timestamps: the newest
-// message that isn't a temp (pending) one.
+// maxMarkable is maxRealTs (8GqV) over the thread's timestamps: the
+// newest message that isRealMsg, neither a temp (pending) one nor an
+// ephemeral (is_ephemeral: an app's "Only visible to you" reply, such as
+// Slack Extra's "please don't reply to the anchor", which no
+// subscriptions.thread.mark may name).
 func (s *listState) maxMarkable() string {
+	var ix *core.Interactive
+	if s.hb != nil && s.hb.app != nil {
+		ix = s.hb.app.Interactive()
+	}
 	for i := len(s.snap.msgs) - 1; i >= 0; i-- {
-		if m := &s.snap.msgs[i].m; !m.Pending && !m.Failed {
-			return m.TS
+		m := &s.snap.msgs[i].m
+		if m.Pending || m.Failed || m.Ephemeral || (ix != nil && ix.Ephemeral(s.ch, m.TS)) {
+			continue
 		}
+		return m.TS
 	}
 	return ""
 }

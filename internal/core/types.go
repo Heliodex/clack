@@ -86,6 +86,10 @@ type Message struct {
 	// DocumentComment is a canvas comment root's document_comment (nil
 	// for other messages; canvas_comments.go).
 	DocumentComment *slack.MessageDocumentComment
+	// Ephemeral is is_ephemeral: an "Only visible to you" message (an
+	// app's chat.postEphemeral, Slackbot's local ones), never in history
+	// and never a thread's read point (Slack's isRealMsg, 8GqV).
+	Ephemeral bool
 }
 
 // SubtypeSlackbotResponse is the subtype of Slackbot's answers to the

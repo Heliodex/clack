@@ -755,12 +755,13 @@ func (a *App) onThreadSubscription(raw json.RawMessage, on bool) {
 		return
 	}
 	// threadSubscribed / threadUnsubscribed: {subscribed, lastRead}
-	if m, ok := a.S.Mutate(ch, ts, func(m *slack.Message) {
-		m.Subscribed = on
+	a.S.SetThreadSub(ch, ts, func(s *store.ThreadSub) {
+		s.Subscribed = on
 		if lr := e.Subscription.LastRead; lr != "" {
-			m.LastRead = lr
+			s.LastRead = lr
 		}
-	}); ok {
+	})
+	if m, ok := a.S.Find(ch, ts); ok {
 		a.emitUpdate(ch, &m)
 	}
 	a.emit(Event{Type: "thread_subscription", Channel: ch, ThreadTS: ts, TS: ts, Name: map[bool]string{true: "follow", false: "unfollow"}[on], Raw: raw})
@@ -780,13 +781,15 @@ func (a *App) onThreadMarked(raw json.RawMessage) {
 	a.setThreadLastRead(e.Subscription.Channel, e.Subscription.ThreadTS, e.Subscription.LastRead)
 }
 
-// setThreadLastRead records a thread's last read reply on its cached root
-// (Slack's thread subscription lastRead) and tells the views.
+// setThreadLastRead records a thread's last read reply (Slack's
+// setSubscription {lastRead}: the subscription, which the cached root
+// copies take too) and tells the views.
 func (a *App) setThreadLastRead(ch, threadTS, lastRead string) {
 	if ch == "" || threadTS == "" || lastRead == "" {
 		return
 	}
-	if m, ok := a.S.Mutate(ch, threadTS, func(m *slack.Message) { m.LastRead = lastRead }); ok {
+	a.S.SetThreadSub(ch, threadTS, func(s *store.ThreadSub) { s.LastRead = lastRead })
+	if m, ok := a.S.Find(ch, threadTS); ok {
 		a.emitUpdate(ch, &m)
 	}
 }

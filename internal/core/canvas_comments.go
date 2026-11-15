@@ -149,6 +149,7 @@ func (a *App) CanvasComments(ctx context.Context, fileID, filter, cursor string)
 			NextCursor string `json:"next_cursor"`
 		} `json:"response_metadata"`
 	}
+	subs := a.S.SubSeq()
 	if err := a.C.Call(ctx, "conversations.history", p, &r); err != nil {
 		var se *slack.Error
 		if errors.As(err, &se) && se.Code == "channel_not_found" { // (0,O.uI)(e,"channel_not_found"): no threads
@@ -156,6 +157,7 @@ func (a *App) CanvasComments(ctx context.Context, fileID, filter, cursor string)
 		}
 		return CanvasCommentsPage{}, err
 	}
+	a.S.SyncSubs(ch, subs, r.Messages) // the comment threads' subscriptions (store/thread_subs.go)
 	out := CanvasCommentsPage{Replies: map[string][]Message{}, Cursor: r.Meta.NextCursor, HasMore: r.HasMore}
 	seen := map[string]bool{}
 	for i := range r.Messages {

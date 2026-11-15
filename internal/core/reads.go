@@ -80,13 +80,14 @@ func (a *App) History(ctx context.Context, ch, before string) (Page, error) {
 		}
 	} else {
 		source = "older"
-		pins := a.S.PinSeq()
+		pins, subs := a.S.PinSeq(), a.S.SubSeq()
 		p, err := a.C.History(ctx, ch, slack.HistoryOpts{Latest: before, Limit: 100})
 		if err != nil {
 			return Page{}, err
 		}
 		a.S.PrependOlder(ch, p.Messages, p.HasMore)
 		a.S.SyncPins(ch, pins, p.Messages) // a pin event newer than the answer (store/pins.go)
+		a.S.SyncSubs(ch, subs, p.Messages) // the roots' thread subscriptions (store/thread_subs.go)
 		msgs, hasMore = p.Messages, p.HasMore
 		store.SortAsc(msgs)
 	}
@@ -135,7 +136,7 @@ func (a *App) RefreshReplies(ctx context.Context, ch, ts string) ([]Message, err
 
 func (a *App) fetchThread(ctx context.Context, ch, ts string) error {
 	return a.once("r:"+ch+"/"+ts, func() error {
-		pins, live := a.S.PinSeq(), a.S.LiveSeq()
+		pins, live, subs := a.S.PinSeq(), a.S.LiveSeq(), a.S.SubSeq()
 		var all []slack.Message
 		cursor := ""
 		for {
@@ -150,6 +151,9 @@ func (a *App) fetchThread(ctx context.Context, ch, ts string) error {
 			cursor = next
 		}
 		// the replies' people are asked for as rows draw them (lazy_users.go)
+		// the root's thread subscription, as the answer has it unless an
+		// event moved it meanwhile (store/thread_subs.go)
+		a.S.SyncSubs(ch, subs, all)
 		// a reply changed, deleted or posted while the request was out
 		// keeps the socket's copy (store/live.go)
 		a.S.SetThreadSince(ch, ts, all, live)

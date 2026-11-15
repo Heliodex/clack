@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/some-du6e/clack/internal/slack"
+	"github.com/some-du6e/clack/internal/store"
 )
 
 // The message menu's server calls and the data its rows read: Slack's
@@ -19,11 +20,21 @@ import (
 // read: false} (lMb8), which writes "Updates the last_read for a thread"
 // (v4te) through markThread (rmwl): subscriptions.thread.mark {channel,
 // thread_ts, ts: the reply as clicked, read: 0}. Locally Slack moves the
-// thread's read point just before it; the counts follow from the server.
+// thread's read point just before it first (setSubscription {lastRead:
+// moveTimestampBackInTime(ts)}) and puts it back when the mark fails; the
+// counts follow from the server.
 func (a *App) MarkThreadUnread(ctx context.Context, ch, threadTS, ts string) error {
+	var prev store.ThreadSub
+	known := false
+	if m, ok := a.S.Find(ch, threadTS); ok {
+		prev, known = a.S.ThreadSubOf(ch, &m), true
+		a.setThreadLastRead(ch, threadTS, tsBefore(nil, ts))
+	}
 	err := a.C.Call(ctx, "subscriptions.thread.mark", url.Values{"channel": {ch}, "thread_ts": {threadTS}, "ts": {ts}, "read": {"0"}}, nil)
 	if err == nil {
 		a.refreshCountsSoon()
+	} else if known && prev.LastRead != "" {
+		a.setThreadLastRead(ch, threadTS, prev.LastRead)
 	}
 	return err
 }

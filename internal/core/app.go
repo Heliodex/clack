@@ -851,7 +851,7 @@ func (a *App) fetchLatest(ctx context.Context, ch string) error {
 	// message cache budget: Slack resets a quiet conversation's history
 	// only an hour after it was last used (evict.go)
 	a.noteLoaded(ch)
-	pins := a.S.PinSeq()
+	pins, subs := a.S.PinSeq(), a.S.SubSeq()
 	p, err := a.C.History(ctx, ch, slack.HistoryOpts{Limit: 50})
 	if err != nil {
 		return err
@@ -859,6 +859,7 @@ func (a *App) fetchLatest(ctx context.Context, ch string) error {
 	// its people are asked for as rows draw them (lazy_users.go)
 	a.S.SetLatest(ch, p.Messages, p.HasMore)
 	a.S.SyncPins(ch, pins, p.Messages) // a pin event newer than the answer (store/pins.go)
+	a.S.SyncSubs(ch, subs, p.Messages) // the roots' thread subscriptions (store/thread_subs.go)
 	for i := range p.Messages {
 		if needsFileInfo(&p.Messages[i]) {
 			go a.fillFiles(ch, p.Messages[i].TS)
@@ -1281,12 +1282,16 @@ func (a *App) message(ch string, m *slack.Message) Message {
 			Icon: firstNonEmpty(bp.Icons.Image72, bp.Icons.Image48, bp.Icons.Image36), Deleted: bp.Deleted}
 	}
 	v.Pending, v.Failed = a.pendingState(m)
+	v.Ephemeral = m.IsEphemeral
 	if m.PinnedInfo != nil {
 		// getMessagePinnedInfo (client-boot): the label's pinnedBy is pinned_info.pinned_by
 		v.PinnedBy = m.PinnedInfo.PinnedBy
 		v.Pinned = true
 	}
-	v.FollowingThread, v.ThreadLastRead, v.ReplyUsersN = m.Subscribed, m.LastRead, m.ReplyUsersN
+	// the thread's subscription, whichever copy of the root this is
+	// (store/thread_subs.go: Slack's threadSub before the root's own)
+	sub := a.S.ThreadSubOf(v.Channel, m)
+	v.FollowingThread, v.ThreadLastRead, v.ReplyUsersN = sub.Subscribed, sub.LastRead, m.ReplyUsersN
 	a.mu.Lock()
 	v.Saved = a.saved[v.Channel+"/"+m.TS]
 	a.mu.Unlock()

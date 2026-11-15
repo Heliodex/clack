@@ -11,6 +11,7 @@ import (
 	"gioui.org/layout"
 
 	"github.com/some-du6e/clack/internal/core"
+	"github.com/some-du6e/clack/internal/i18n"
 	"github.com/some-du6e/clack/internal/richtext"
 	"github.com/some-du6e/clack/internal/ui/openurl"
 	"github.com/some-du6e/clack/internal/ui/richclip"
@@ -174,13 +175,9 @@ func actMessageItems(h Host, m core.Message, o MessageMenuOpts) []MenuItem {
 	if channel {
 		pinLabel, unpinLabel = "Pin to channel", "Un-pin from channel"
 	}
-	pin := MenuItem{Label: pinLabel, Icon: "pin", Hint: nsMessage.T("P"), Keys: KeyPin, Do: func() {
-		actDo(h, "Message pinned", func(ctx context.Context, a *core.App) error { return a.Pin(ctx, ch, ts) })
-	}}.In(nsMessage)
+	pin := MenuItem{Label: pinLabel, Icon: "pin", Hint: nsMessage.T("P"), Keys: KeyPin, Do: func() { actPin(h, ch, ts, true) }}.In(nsMessage)
 	if m.Pinned {
-		pin = MenuItem{Label: unpinLabel, Icon: "pin", Hint: nsMessage.T("P"), Keys: KeyPin, Do: func() {
-			actDo(h, "Message unpinned", func(ctx context.Context, a *core.App) error { return a.Unpin(ctx, ch, ts) })
-		}}.In(nsMessage)
+		pin = MenuItem{Label: unpinLabel, Icon: "pin", Hint: nsMessage.T("P"), Keys: KeyPin, Do: func() { actPin(h, ch, ts, false) }}.In(nsMessage)
 	}
 	items = append(items,
 		MenuItem{Label: "Organize", Sub: []MenuItem{pin}}.In(nsMessage),
@@ -306,9 +303,10 @@ func actThreadSubscribed(h Host, ch, root string) bool {
 		return false
 	}
 	if r, ok := a.S.Find(ch, root); ok {
-		return r.Subscribed
+		return a.S.ThreadSubOf(ch, &r).Subscribed
 	}
-	return false
+	sub, _ := a.S.ThreadSub(ch, root)
+	return sub.Subscribed
 }
 
 // actKindOf guesses a conversation's kind from its id when core doesn't
@@ -511,6 +509,30 @@ func actDo(h Host, okMsg string, work func(ctx context.Context, a *core.App) err
 	}
 	do(h, okMsg, func(ctx context.Context) error { return work(ctx, a) })
 }
+
+// actPin is the Organize menu's pin item: pinMessage / unpinMessage
+// (core.Pin, core.Unpin), whose row in the Pins tab and the message's pin
+// change at once and go back on a failure. Slack toasts nothing else:
+// only a channel at its 100 pins gets PinErrorToast (fBOF, the pins I18n).
+func actPin(h Host, ch, ts string, on bool) {
+	a := h.Core()
+	if a == nil {
+		h.Toast("Not connected yet")
+		return
+	}
+	run(h, func(ctx context.Context) (struct{}, error) {
+		if on {
+			return struct{}{}, a.Pin(ctx, ch, ts)
+		}
+		return struct{}{}, a.Unpin(ctx, ch, ts)
+	}, func(_ struct{}, err error) {
+		if on && core.IsTooManyPins(err) {
+			h.Toast(i18n.Plain(nsPins.RT("<strong>You\u2019ve reached the max of 100 pins in a channel.</strong> Try removing a pin before adding a new one.")))
+		}
+	})
+}
+
+var nsPins = i18n.NS("pins")
 
 // actToast returns an action that toasts s (features core can't do yet).
 func actToast(h Host, s string) func() { return func() { h.Toast(s) } }
