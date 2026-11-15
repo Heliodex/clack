@@ -21,6 +21,8 @@ var sidebarExperiments = map[string]string{
 	// channel details' Agents & apps / Automations tabs and Settings'
 	// tab permissions (views/details.go, details_more.go)
 	"channel_details_agents_apps_tab": "on", "move_channel_tabs_settings": "on",
+	// the rosters' "…" menu and RemoveMemberDialog (core/exp_wave10.go)
+	"agent_channel_header": "on", "sc_remove_full_access_user": "on",
 	// focus mode and the Availability section (see core's defaultExperimentGroups)
 	"silent_sidebar": "on", "availability_prefs_section": "on",
 	// search and the switcher (2026-11-10). desktop_search_recents_read

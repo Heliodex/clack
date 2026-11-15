@@ -43,6 +43,12 @@ func init() {
 		// the sidebar's organize mode (ui/sidebar_organize.go: SYcU
 		// OrganizeModeMenu's Leave, ConfirmLeaveChannelsModal)
 		"bulk_leave_channels_from_sidebar": on,
+		// the channel details rosters' "…" menu and RemoveMemberDialog
+		// (core/exp_wave10.go, views/details_agents_menu.go,
+		// popups/remove_member.go)
+		"agent_channel_header":                              on,
+		"sc_remove_full_access_user":                        on,
+		"ncea_allow_channel_managers_to_lock_configuration": on,
 	} {
 		experimentReads[name] = groups
 	}

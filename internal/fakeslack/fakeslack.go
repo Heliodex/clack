@@ -362,9 +362,11 @@ type Server struct {
 	convMu sync.Mutex
 	// caInvites: conversations.invite into the ChannelAgents channels
 	caInvites map[string][]string
-	others    []slack.Conversation
-	Joins     []JoinCall
-	Leaves    []string // conversations.leave calls (LeaveCalls)
+	// caKicks: conversations.kick out of them (channel → user ids)
+	caKicks map[string][]string
+	others  []slack.Conversation
+	Joins   []JoinCall
+	Leaves  []string // conversations.leave calls (LeaveCalls)
 	// BulkLeaves are conversations.bulkLeave calls' channels (BulkLeaveCalls)
 	BulkLeaves [][]string
 	// listFilters: every edge users/list filter (UserListFilters).

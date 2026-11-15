@@ -42,9 +42,12 @@ const ExpRestrictTopicPurpose = "channel_topic_purpose_setting_restrict_to_chann
 // together, and About's "Send emails to this channel" grant
 // (showChannelEmailAddress, chdetails_email.go).
 // The tabs' check (useCanEditTabs, channel_managers.go) reads
-// MANAGE_CHANNEL_TABS and ASSIGN_CHANNEL_MANAGER from the same store.
+// MANAGE_CHANNEL_TABS and ASSIGN_CHANNEL_MANAGER from the same store, and
+// the roster's Remove from channel (canUserKickFromChannel,
+// exp_wave10.go) the kick grants.
 var chPermSet = []string{PermSetChannelTopic, PermSetChannelPurpose, PermCreateChannelEmailAddresses,
-	PermManageChannelTabs, PermAssignChannelManager}
+	PermManageChannelTabs, PermAssignChannelManager, PermRemoveFromChannel, PermRemoveFromPrivateChannel,
+	PermManagePublicChannels, PermManagePrivateChannels}
 
 const chPermMaxAge = time.Hour
 
