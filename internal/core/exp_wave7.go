@@ -5,7 +5,6 @@ package core
 // search results' density card.
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"net/url"
@@ -62,7 +61,7 @@ func (a *App) SearchCardExplore() bool {
 // keyed by item and message index. Only messages of more than three
 // blocks are looked at: compactCardBlocks keeps shorter ones whole.
 func searchHitBlocks(raw []byte) map[[2]int]int {
-	if !bytes.Contains(raw, hlStart[0]) && !bytes.Contains(raw, hlStart[1]) && !bytes.Contains(raw, hlStart[2]) {
+	if !hasHighlightStart(raw) {
 		return nil
 	}
 	var res struct {
@@ -92,17 +91,8 @@ func searchHitBlocks(raw []byte) map[[2]int]int {
 	return out
 }
 
-// hlStart is U+E000, raw or JSON-escaped.
-var hlStart = [][]byte{[]byte(""), []byte(``), []byte(``)}
-
-func hasHighlightStart(b []byte) bool {
-	for _, m := range hlStart {
-		if bytes.Contains(b, m) {
-			return true
-		}
-	}
-	return false
-}
+// hasHighlightStart reports a U+E000, raw or JSON-escaped (search.go).
+func hasHighlightStart(b []byte) bool { return hasHighlightMarker(b, true) }
 
 // SearchViewerReply is SearchRepliesAction's useFetchLatestReplyTimestamp
 // (boot-shared Wzwx) for a result whose requestor_replied is set: the

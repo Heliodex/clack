@@ -447,6 +447,24 @@ func TestSearchPopoverQuickMessages(t *testing.T) {
 			t.Errorf("on: a plain quick message row %+v", r.title)
 		}
 	}
+	// the fake's extracts carry Slack's highlight markers JSON-escaped
+	// (zephyr): the row draws the word highlighted, never
+	// the markers (α.85 drew them as tofu around the match)
+	for _, r := range p.rows {
+		if r.kind != srRMsg {
+			continue
+		}
+		hit := false
+		for _, s := range r.segs {
+			if strings.ContainsAny(s.Text, "�") {
+				t.Errorf("quick message segment %q holds a highlight marker", s.Text)
+			}
+			hit = hit || (s.Hit && strings.HasPrefix(strings.ToLower(s.Text), fakeslack.SearchWord))
+		}
+		if !hit {
+			t.Errorf("quick message %+v: %q not highlighted", r.segs, fakeslack.SearchWord)
+		}
+	}
 	if n := navRows(p); n > 5 {
 		t.Errorf("on, with quick messages: %d places, want at most 5", n)
 	}
