@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"image"
 	"net"
 	"os"
@@ -663,4 +664,105 @@ func TestUpdatePrefsShots(t *testing.T) {
 			r.save("updates-"+s.name+"-"+mode, r.frame(draw), r.sz.Y)
 		}
 	}
+}
+
+// pendingErr is cmd/clack's answer while a newer release's files are
+// still uploading.
+var pendingErr = fmt.Errorf("%w: update: the release's files are still uploading (v0.1.0-alpha.14 has no SHA256SUMS yet)", ErrUpdatePending)
+
+// A newer release still uploading isn't a clean answer (that waits an
+// hour) nor a failure: the check is due again in 5, 10, 20… minutes,
+// even right after a clean check, and a clean answer ends it.
+func TestUpdateSchedPending(t *testing.T) {
+	t0 := time.Date(2026, 11, 15, 3, 0, 0, 0, time.Local)
+	s := updateSched{}
+	s.record(t0, nil)
+	now := t0.Add(2 * time.Minute) // a Check now, minutes after the last check
+	for i, w := range []time.Duration{5 * time.Minute, 10 * time.Minute, 20 * time.Minute, 40 * time.Minute, time.Hour, time.Hour} {
+		s.record(now, pendingErr)
+		if s.due(now.Add(w - time.Second)) {
+			t.Errorf("pending %d: due before %v", i+1, w)
+		}
+		if !s.due(now.Add(w)) {
+			t.Errorf("pending %d: not due after %v", i+1, w)
+		}
+		now = now.Add(w)
+	}
+	if !s.Last.Equal(t0) || s.fails != 0 {
+		t.Errorf("pending counted as an answer or a failure: %+v", s)
+	}
+	s.record(now, nil)
+	if s.due(now.Add(10*time.Minute)) || s.pending != 0 || !s.soon.IsZero() {
+		t.Errorf("a clean answer didn't end the pending retries: %+v", s)
+	}
+}
+
+// The loop with a release whose files are still uploading: an automatic
+// check offers nothing, downloads nothing and says nothing, and checks
+// again five minutes later; a manual check says, gently, that it's on its
+// way; once the files are up it's found and downloaded.
+func TestUpdateLoopPending(t *testing.T) {
+	SetVersion("v0.1.0-alpha.12")
+	t.Cleanup(func() { SetVersion("") })
+	f := &fakeCheck{}
+	f.set(UpdateInfo{Tag: newerInfo.Tag, URL: newerInfo.URL}, false, pendingErr)
+	dl := &fakeUpdater{release: make(chan error, 1)}
+	a := checkApp(t, f, dl)
+	t0 := time.Date(2026, 11, 15, 3, 27, 0, 0, time.Local)
+	clk := startLoop(t, a, updateSched{}, t0)
+
+	clk.fire()
+	waitUpd(t, a, "the automatic check", func() bool { return f.calls.Load() == 1 })
+	a.drain()
+	c := &a.update.check
+	if a.update.phase != updNone || a.update.info.Tag != "" || dl.downloads.Load() != 0 {
+		t.Fatalf("pending offered: phase %d, tag %q, %d downloads", a.update.phase, a.update.info.Tag, dl.downloads.Load())
+	}
+	if c.err != "" || c.pending || a.updateBoxShown() != "" || a.prefs.UpdateFound != "" {
+		t.Errorf("an automatic pending check said something: err %q, pending %v, box %q, found %q", c.err, c.pending, a.updateBoxShown(), a.prefs.UpdateFound)
+	}
+	if st := a.updateStatusAt(t0); st.title != "Clack v0.1.0-alpha.12" || st.desc != "Not checked yet." {
+		t.Errorf("the row after an automatic pending check: %+v", st)
+	}
+	// again in five minutes, not an hour
+	clk.set(t0.Add(4 * time.Minute))
+	clk.fire()
+	if n := f.calls.Load(); n != 1 {
+		t.Fatalf("checked again after 4 minutes (%d)", n)
+	}
+	clk.set(t0.Add(5 * time.Minute))
+	clk.fire()
+	waitUpd(t, a, "the re-check", func() bool { return f.calls.Load() == 2 })
+
+	// the menu's Check for Updates…: a gentle box, not "Couldn’t update"
+	a.checkForUpdates(true)
+	waitUpd(t, a, "the manual check", func() bool { return f.calls.Load() == 3 && !c.checking })
+	if got := a.updateBoxShown(); got != "A new version is on the way" {
+		t.Errorf("manual pending: message box %q", got)
+	}
+	want := "Clack v0.1.0-alpha.14 is still being published. Try again in a minute."
+	if st := a.updateStatusAt(t0); st.title != "A new version is on the way" || st.desc != want || st.button != "Check for Updates" || !st.enabled {
+		t.Errorf("the row after a manual pending check: %+v", st)
+	}
+	if a.update.phase != updNone || dl.downloads.Load() != 0 {
+		t.Errorf("manual pending: phase %d, %d downloads", a.update.phase, dl.downloads.Load())
+	}
+	a.update.box.(dismisser).Dismiss()
+
+	// the files are up: the next due check finds it and downloads it
+	// (the manual check was the third pending answer: 20 minutes)
+	f.set(newerInfo, true, nil)
+	clk.set(t0.Add(5*time.Minute + 20*time.Minute - time.Second))
+	clk.fire()
+	if n := f.calls.Load(); n != 3 {
+		t.Fatalf("checked before the backoff ran out (%d)", n)
+	}
+	clk.set(t0.Add(5*time.Minute + 20*time.Minute))
+	clk.fire()
+	waitUpd(t, a, "the release once uploaded", func() bool { return a.update.phase == updDownloading && dl.downloads.Load() == 1 })
+	if a.update.info.Tag != newerInfo.Tag || c.pending {
+		t.Errorf("found: tag %q, pending %v", a.update.info.Tag, c.pending)
+	}
+	dl.release <- nil
+	waitUpd(t, a, "the download", func() bool { return a.update.phase == updReady })
 }

@@ -762,3 +762,141 @@ func TestApplyWaitsForExit(t *testing.T) {
 		t.Error("swapped although Clack didn't exit")
 	}
 }
+
+// A release is only ready for this install once its package and
+// SHA256SUMS are both uploaded: missing or still "open" is
+// ErrAssetsPending (soon after publishing), not an available update.
+func TestReadyAsset(t *testing.T) {
+	mac := Install{Kind: KindMacApp, GOOS: "darwin", GOARCH: "arm64"}
+	now := time.Date(2026, 11, 15, 3, 30, 0, 0, time.UTC)
+	const tag = "v0.1.0-alpha.82"
+	dmg := "Clack-0.1.0-alpha.82-macos-universal.dmg"
+	ready := release(tag, dmg, "SHA256SUMS")
+	for i := range ready.Assets {
+		ready.Assets[i].State = "uploaded"
+	}
+	ready.PublishedAt = now.Add(-time.Minute)
+	if a, err := mac.ReadyAsset(ready, now); err != nil || a.Name != dmg {
+		t.Fatalf("uploaded: %+v %v", a, err)
+	}
+	pending := func(what string, r Release) {
+		t.Helper()
+		if _, err := mac.ReadyAsset(r, now); !errors.Is(err, ErrAssetsPending) {
+			t.Errorf("%s: %v, want ErrAssetsPending", what, err)
+		}
+	}
+	tagOnly := Release{Tag: tag, PublishedAt: now.Add(-time.Minute)}
+	pending("no assets yet", tagOnly)
+	pending("no assets, no publish time", Release{Tag: tag})
+	open := ready
+	open.Assets = append([]Asset(nil), ready.Assets...)
+	open.Assets[0].State = "open"
+	pending("package still uploading", open)
+	noSums := ready
+	noSums.Assets = ready.Assets[:1]
+	pending("no SHA256SUMS yet", noSums)
+	sumsOpen := ready
+	sumsOpen.Assets = append([]Asset(nil), ready.Assets...)
+	sumsOpen.Assets[1].State = "open"
+	pending("SHA256SUMS still uploading", sumsOpen)
+	others := release(tag, "clack_0.1.0-alpha.82_amd64.deb", "SHA256SUMS")
+	others.PublishedAt = now.Add(-time.Minute)
+	pending("other platforms' packages only", others)
+	// no state (a test server's JSON): uploaded
+	if _, err := mac.ReadyAsset(release(tag, dmg, "SHA256SUMS"), now); err != nil {
+		t.Errorf("no state: %v", err)
+	}
+	// published long ago and still missing: missing for good, not pending
+	old := others
+	old.PublishedAt = now.Add(-2 * time.Hour)
+	if _, err := mac.ReadyAsset(old, now); !errors.Is(err, ErrNoAsset) {
+		t.Errorf("missing an hour later: %v", err)
+	}
+	old = noSums
+	old.PublishedAt = now.Add(-2 * time.Hour)
+	if _, err := mac.ReadyAsset(old, now); !errors.Is(err, ErrNoChecksum) {
+		t.Errorf("no SHA256SUMS an hour later: %v", err)
+	}
+	// an install no release has a package for: ErrNoAsset, never pending
+	if _, err := (Install{Kind: KindUnknown, GOOS: "darwin"}).ReadyAsset(tagOnly, now); !errors.Is(err, ErrNoAsset) {
+		t.Errorf("unknown install: %v", err)
+	}
+	// GitHub's JSON
+	var r Release
+	if err := json.Unmarshal([]byte(`{"tag_name":"`+tag+`","published_at":"2026-11-15T03:27:11Z","assets":[{"name":"`+dmg+`","state":"open","size":5},{"name":"SHA256SUMS","state":"uploaded"}]}`), &r); err != nil {
+		t.Fatal(err)
+	}
+	if r.Assets[0].Uploaded() || !r.Assets[1].Uploaded() || r.PublishedAt.IsZero() {
+		t.Errorf("parsed %+v", r)
+	}
+	pending("GitHub's open asset", r)
+}
+
+// A 404 for the package (or SHA256SUMS) gives up at once with
+// ErrAssetMissing, instead of five tries with a doubling wait.
+func TestDownloadMissingFailsFast(t *testing.T) {
+	noInstall(t)
+	f := newFakeReleases(t)
+	const name = "Clack-0.2.0-macos-universal.dmg"
+	u := f.updater(t)
+	u.Attempts, u.Backoff = 5, 10*time.Second // retrying would time the test out
+	f.files[name] = payload(1000)             // SHA256SUMS lists it…
+	r := f.release("v0.2.0", name)
+	r.Assets[0].URL = f.url("missing-" + name) // …but its URL 404s
+	start := time.Now()
+	_, err := u.Download(context.Background(), r, r.Assets[0])
+	if !errors.Is(err, ErrAssetMissing) {
+		t.Fatalf("404 package: %v", err)
+	}
+	if n := f.gets["missing-"+name]; n != 1 || time.Since(start) > 5*time.Second {
+		t.Errorf("404 package: %d requests in %v", n, time.Since(start))
+	}
+	// SHA256SUMS 404s: the same, before the package is asked for
+	r = f.release("v0.2.0", name)
+	r.Assets[1].URL = f.url("SHA256SUMS.missing")
+	gets := f.gets[name]
+	if _, err := u.Download(context.Background(), r, r.Assets[0]); !errors.Is(err, ErrAssetMissing) || f.gets[name] != gets {
+		t.Errorf("404 SHA256SUMS: %v, %d package requests", err, f.gets[name]-gets)
+	}
+}
+
+// The server's file isn't the size the release listed (re-uploaded, or
+// still growing): the partial isn't resumed into a mix of two files, and
+// the download stops rather than retrying against the same listing.
+func TestDownloadSizeChanged(t *testing.T) {
+	noInstall(t)
+	f := newFakeReleases(t)
+	const name = "Clack-0.2.0-x86_64.AppImage"
+	f.files[name] = payload(200_000)
+	u := f.updater(t)
+	u.Attempts, u.Backoff = 5, 10*time.Second
+	r := f.release("v0.2.0", name)
+	r.Assets[0].Size = 150_000 // the listing from before a re-upload
+	part := u.Path("v0.2.0", name) + ".part"
+	if err := os.MkdirAll(filepath.Dir(part), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(part, payload(1000), 0o600)
+	if _, err := u.Download(context.Background(), r, r.Assets[0]); !errors.Is(err, ErrAssetChanged) {
+		t.Fatalf("resume against another size: %v", err)
+	}
+	if n := f.gets[name]; n != 1 || len(f.ranges) != 1 || f.ranges[0] != "bytes=1000-" {
+		t.Errorf("%d requests, ranges %q", n, f.ranges)
+	}
+	if _, err := os.Stat(part); !os.IsNotExist(err) {
+		t.Errorf("the other file's partial kept: %v", err)
+	}
+	// from the start: the server's file is smaller than listed
+	r.Assets[0].Size = 300_000
+	if _, err := u.Download(context.Background(), r, r.Assets[0]); !errors.Is(err, ErrAssetChanged) {
+		t.Fatalf("shorter file: %v", err)
+	}
+	if n := f.gets[name]; n != 2 {
+		t.Errorf("%d requests for the shorter file (retried)", n-1)
+	}
+	// the listing catches up: it downloads
+	r.Assets[0].Size = 200_000
+	if _, err := u.Download(context.Background(), r, r.Assets[0]); err != nil {
+		t.Errorf("after the listing caught up: %v", err)
+	}
+}

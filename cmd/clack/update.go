@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/some-du6e/clack/internal/desktop"
 	"github.com/some-du6e/clack/internal/ui"
@@ -51,13 +52,28 @@ func updateVersion() string {
 }
 
 // check asks GitHub Releases whether a newer Clack is out (metadata only).
+// A newer release counts once this install's package and SHA256SUMS are
+// uploaded; until then it is ui.ErrUpdatePending, which the UI retries
+// in minutes without offering (or downloading) it.
 func (u *updates) check(ctx context.Context) (ui.UpdateInfo, bool, error) {
+	return u.checkAt(ctx, time.Now())
+}
+
+func (u *updates) checkAt(ctx context.Context, now time.Time) (ui.UpdateInfo, bool, error) {
 	cur := updateVersion()
 	r, err := desktop.LatestRelease(ctx, cur)
 	if err != nil {
 		return ui.UpdateInfo{}, false, err
 	}
-	return ui.UpdateInfo{Tag: r.Tag, URL: r.URL, Release: r}, desktop.Newer(r.Tag, cur), nil
+	info := ui.UpdateInfo{Tag: r.Tag, URL: r.URL, Release: r}
+	if !desktop.Newer(r.Tag, cur) {
+		return info, false, nil
+	}
+	if _, err := u.inst.ReadyAsset(r, now); errors.Is(err, desktop.ErrAssetsPending) {
+		return info, false, fmt.Errorf("%w: %v", ui.ErrUpdatePending, err)
+	}
+	// ready, or no package for this install at all (the release page)
+	return info, true, nil
 }
 
 // download fetches and verifies the package for this install, telling
