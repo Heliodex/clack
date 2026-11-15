@@ -177,12 +177,69 @@ func (in Install) PickAsset(r Release) (Asset, error) {
 	return Asset{}, fmt.Errorf("%w (%s, %s/%s, %s)", ErrNoAsset, in.Kind, in.GOOS, in.GOARCH, r.Tag)
 }
 
+// ErrAssetsPending: the release is out, but this install's package or
+// its SHA256SUMS isn't uploaded yet (release.yml publishes a draft only
+// once every file is up, but a rerun, a CDN lagging behind the API or a
+// hand-made release can show one early). Not a failure: check again in a
+// few minutes.
+var ErrAssetsPending = errors.New("update: the release's files are still uploading")
+
+// assetGrace is how long after publishing a release's missing package
+// counts as still on its way. Later, it's missing for good (a release
+// without this platform): the check offers it as before, and the
+// download says there's no package.
+const assetGrace = time.Hour
+
+// ReadyAsset returns the release's package for this install once it, and
+// the SHA256SUMS the download checks it against, are fully uploaded.
+// ErrAssetsPending while either is missing or still uploading (within
+// assetGrace of r.PublishedAt, at now); ErrNoAsset for an install no
+// release has a package for, or a package missing long after publishing.
+func (in Install) ReadyAsset(r Release, now time.Time) (Asset, error) {
+	if len(in.AssetNames(r.Tag)) == 0 {
+		return in.PickAsset(r) // ErrNoAsset: not something waiting fixes
+	}
+	recent := r.PublishedAt.IsZero() || now.Sub(r.PublishedAt) < assetGrace
+	a, err := in.PickAsset(r)
+	if err != nil {
+		if recent {
+			return Asset{}, fmt.Errorf("%w (%s has no %s yet)", ErrAssetsPending, r.Tag, in.AssetNames(r.Tag)[0])
+		}
+		return Asset{}, err
+	}
+	if !a.Uploaded() {
+		return Asset{}, fmt.Errorf("%w (%s is %s)", ErrAssetsPending, a.Name, a.State)
+	}
+	var sums *Asset
+	for i := range r.Assets {
+		if r.Assets[i].Name == "SHA256SUMS" {
+			sums = &r.Assets[i]
+		}
+	}
+	switch {
+	case sums == nil && recent:
+		return Asset{}, fmt.Errorf("%w (%s has no SHA256SUMS yet)", ErrAssetsPending, r.Tag)
+	case sums == nil:
+		return Asset{}, fmt.Errorf("%w (release %s has no SHA256SUMS)", ErrNoChecksum, r.Tag)
+	case !sums.Uploaded():
+		return Asset{}, fmt.Errorf("%w (SHA256SUMS is %s)", ErrAssetsPending, sums.State)
+	}
+	return a, nil
+}
+
 // Download errors.
 var (
 	ErrNoChecksum = errors.New("update: the release's SHA256SUMS has no entry for this package")
 	ErrChecksum   = errors.New("update: the download doesn't match the release's SHA256SUMS")
 	ErrTooLarge   = errors.New("update: the download is larger than allowed")
 	ErrHost       = errors.New("update: download host not allowed")
+	// ErrAssetMissing: GitHub answered 404/410 for a release file. Not
+	// retried: the next check sees whether the release still lists it.
+	ErrAssetMissing = errors.New("update: the release's file isn't on GitHub (yet)")
+	// ErrAssetChanged: the server's file isn't the size the release
+	// listed (re-uploaded, or still uploading). The partial download is
+	// dropped and not retried: the next check gets the new listing.
+	ErrAssetChanged = errors.New("update: the release's file changed while downloading")
 )
 
 // GitHubHosts are the only hosts a release download may come from:
@@ -452,8 +509,8 @@ func (u *Updater) download(ctx context.Context, r Release, a Asset) (string, str
 		}
 		var perm permanent
 		if errors.As(err, &perm) || errors.Is(err, ErrTooLarge) || errors.Is(err, ErrHost) || ctx.Err() != nil || i+1 >= attempts {
-			if errors.Is(err, ErrTooLarge) {
-				_ = os.Remove(part)
+			if errors.Is(err, ErrTooLarge) || errors.Is(err, ErrAssetChanged) {
+				_ = os.Remove(part) // not the file the release lists: don't resume it
 			}
 			return "", "", err
 		}
@@ -510,7 +567,10 @@ func (u *Updater) fetchSmall(ctx context.Context, raw string, max int64) ([]byte
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	switch {
+	case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone:
+		return nil, permanent{fmt.Errorf("%w (%s)", ErrAssetMissing, resp.Status)}
+	case resp.StatusCode != 200:
 		return nil, fmt.Errorf("%s", resp.Status)
 	}
 	b, err := io.ReadAll(io.LimitReader(resp.Body, max+1))
@@ -547,18 +607,31 @@ func (u *Updater) fetchTo(ctx context.Context, raw, part string, limit int64, ex
 	flags := os.O_WRONLY | os.O_CREATE
 	switch {
 	case resp.StatusCode == http.StatusPartialContent && offset > 0:
-		start, ok := contentRangeStart(resp.Header.Get("Content-Range"))
+		cr := resp.Header.Get("Content-Range")
+		start, ok := contentRangeStart(cr)
 		if !ok || start != offset {
 			_ = os.Truncate(part, 0)
-			return fmt.Errorf("update: server resumed at %q, wanted %d", resp.Header.Get("Content-Range"), offset)
+			return fmt.Errorf("update: server resumed at %q, wanted %d", cr, offset)
+		}
+		if n, ok := contentRangeTotal(cr); ok && exact && n != limit {
+			// the partial is of another upload of this file (or one
+			// still growing): appending to it would mix two files
+			_ = os.Truncate(part, 0)
+			return permanent{fmt.Errorf("%w (%d bytes, the release lists %d)", ErrAssetChanged, n, limit)}
 		}
 		flags |= os.O_APPEND
 	case resp.StatusCode == http.StatusOK:
 		flags |= os.O_TRUNC // no range support: from the start
 		offset = 0
+		if exact && resp.ContentLength > 0 && resp.ContentLength < limit {
+			// (more than limit is ErrTooLarge, below)
+			return permanent{fmt.Errorf("%w (%d bytes, the release lists %d)", ErrAssetChanged, resp.ContentLength, limit)}
+		}
 	case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
 		_ = os.Truncate(part, 0)
 		return errors.New("update: range not satisfiable; restarting")
+	case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone:
+		return permanent{fmt.Errorf("%w (%s)", ErrAssetMissing, resp.Status)}
 	case resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests:
 		return fmt.Errorf("update: %s", resp.Status)
 	default:
@@ -619,6 +692,17 @@ func contentRangeStart(h string) (int64, bool) {
 	}
 	n, err := strconv.ParseInt(rest[:i], 10, 64)
 	return n, err == nil
+}
+
+// contentRangeTotal is the complete length in a Content-Range ("bytes
+// 100-999/1000"); false when it's "*" or missing.
+func contentRangeTotal(h string) (int64, bool) {
+	i := strings.LastIndexByte(h, '/')
+	if i < 0 {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(h[i+1:], 10, 64)
+	return n, err == nil && n >= 0
 }
 
 // prune removes downloads of other releases.

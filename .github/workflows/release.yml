@@ -495,12 +495,31 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+        # Files go up to a draft, published only once every one is uploaded:
+        # the releases API (which Clack's update check reads) hides drafts, so
+        # no Clack sees a release with files missing or half uploaded, and a
+        # failed upload leaves a draft for a rerun, not a broken release. A
+        # rerun on a published release takes it back to a draft first, so
+        # --clobber's delete-then-upload isn't visible either.
         run: |
           set -eu
-          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          pre=""; if [ "$PRERELEASE" = true ]; then pre=--prerelease; fi
+          if draft=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft -q .isDraft 2>/dev/null); then
+            if [ "$draft" != true ]; then
+              gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --draft=true
+            fi
             gh release upload "$TAG" dist/* --clobber -R "$GITHUB_REPOSITORY"
           else
-            pre=""; if [ "$PRERELEASE" = true ]; then pre=--prerelease; fi
-            gh release create "$TAG" dist/* -R "$GITHUB_REPOSITORY" --verify-tag --title "Clack $TAG" --generate-notes $pre
+            gh release create "$TAG" dist/* -R "$GITHUB_REPOSITORY" --verify-tag --draft --title "Clack $TAG" --generate-notes $pre
           fi
-          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name'
+          # every file in dist uploaded (state "uploaded"), or no publish
+          (cd dist && ls) | sort > "$RUNNER_TEMP/want"
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[] | select(.state == "uploaded") | .name' | sort > "$RUNNER_TEMP/got"
+          cat "$RUNNER_TEMP/got"
+          missing=$(comm -23 "$RUNNER_TEMP/want" "$RUNNER_TEMP/got")
+          if [ -n "$missing" ]; then
+            echo "::error::not uploaded, so not publishing: $missing"
+            exit 1
+          fi
+          gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --draft=false $pre
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,url

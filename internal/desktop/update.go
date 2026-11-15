@@ -45,6 +45,8 @@ type Release struct {
 	Draft      bool    `json:"draft"`
 	Prerelease bool    `json:"prerelease"`
 	Assets     []Asset `json:"assets"`
+	// PublishedAt is when it went public (zero when GitHub didn't say).
+	PublishedAt time.Time `json:"published_at"`
 }
 
 // Asset is one file attached to a release.
@@ -52,7 +54,14 @@ type Asset struct {
 	Name string `json:"name"`
 	URL  string `json:"browser_download_url"`
 	Size int64  `json:"size"`
+	// State is GitHub's upload state: "uploaded" once every byte is
+	// there, "open" while an upload is still running. Empty when the
+	// server doesn't say (a test fixture), which counts as uploaded.
+	State string `json:"state"`
 }
+
+// Uploaded reports whether every byte of a is on GitHub.
+func (a Asset) Uploaded() bool { return a.State == "" || a.State == "uploaded" }
 
 // LatestRelease asks GitHub for the newest release: releases/latest for a
 // release build, the newest of the recent releases for a pre-release
