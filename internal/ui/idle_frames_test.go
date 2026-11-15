@@ -102,6 +102,24 @@ func TestIdleFrames(t *testing.T) {
 			e.until("history", 20*time.Second, func() bool { return e.loadedMessages(ch) > 0 })
 			e.focusComposer(ch, "")
 			e.idle(t, p, "sidebar with unreads", true)
+			e.shutdown()
+
+			// the rail's and the sidebar's views, with their fixtures
+			sz = fakeslack.Small
+			sz.Views = true
+			sz.DMsTab = true
+			sz.Unreads = true
+			sz.ThreadHeader = true
+			e = newIdleEnv(t, sz, motion.override)
+			measured.Store(e.a)
+			ch = fakeslack.ThreadPublicID
+			e.openChannel(ch)
+			e.until("history", 20*time.Second, func() bool { return e.loadedMessages(ch) > 0 })
+			for _, page := range []string{"threads", "later", "dms", "files", "huddles", "unreads", "drafts", "directories", "saved"} {
+				e.a.Navigate(page)
+				e.frame()
+				e.idle(t, p, page, false)
+			}
 		})
 	}
 }

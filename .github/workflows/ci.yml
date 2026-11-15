@@ -987,6 +987,26 @@ jobs:
             "$RUNNER_TEMP/ui-bounds.test" -test.v -test.count=1 -test.timeout 10m -test.run "^$t\$" || rc=1
           done
           exit $rc
+      # Idle on the real macOS window (TestMacIdleCPU): App.Run's window
+      # with Metal and the AppKit glue, signed in to the fake with realtime
+      # on, left alone on each surface and then hidden; each period's
+      # frames, who asked for them, its CPU and its CPU profile's top.
+      # Then TestIdleFrames headless, as linux-idle runs it.
+      - name: idle on the real window (TestMacIdleCPU) and idle frames (TestIdleFrames)
+        if: ${{ !cancelled() }}
+        run: |
+          set +e
+          rc=0
+          go test -c -o "$RUNNER_TEMP/ui-idle.test" ./internal/ui || exit 1
+          cd internal/ui
+          CLACK_MACOS_WINDOW_TESTS=1 CLACK_IDLE_CPUPROFILE="$RUNNER_TEMP/idlecpu" "$RUNNER_TEMP/ui-idle.test" -test.v -test.count=1 -test.timeout 15m -test.run '^TestMacIdleCPU$' || rc=1
+          for f in "$RUNNER_TEMP"/idlecpu-*.pprof; do
+            [ -s "$f" ] || continue
+            echo "== $(basename "$f")"
+            go tool pprof -top -nodecount=30 "$RUNNER_TEMP/ui-idle.test" "$f" 2>&1 | head -42
+          done
+          CLACK_IDLE_FRAMES=1 "$RUNNER_TEMP/ui-idle.test" -test.v -test.count=1 -test.timeout 25m -test.run '^TestIdleFrames$' || rc=1
+          exit $rc
       - name: build
         if: ${{ !cancelled() }}
         run: |
