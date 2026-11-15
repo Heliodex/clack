@@ -572,23 +572,27 @@ func TestMissingBarKeepsTheLineBox(t *testing.T) {
 // A preview reads its user mentions as it draws: the member's name, no
 // text for one the store can't name yet (BaseMissingMember's bar adds
 // none), never the "@U…" the doc was built with; once the member loads,
-// their name.
+// their name. An id that isn't member-shaped keeps the parsed text, as
+// MemberSlug draws "@id" for it (looksLikeMemberId).
 func TestPreviewMentionsReadWhenDrawn(t *testing.T) {
 	app, _, release := actNamesApp(t)
 	release()
+	app.S.PutUsers([]slack.User{{ID: "U0ALICE0001", Name: "alice", RealName: "Alice Example"}})
 	b := NewActivity(&slickHost{app: app, th: theme.New(false)})
 	doc := richtext.Doc{Blocks: []richtext.Block{{Kind: richtext.Paragraph, Spans: []richtext.Span{
 		{Kind: richtext.Text, Text: "ask "},
 		{Kind: richtext.User, Text: "@U0NOTLOADED", ID: "U0NOTLOADED"},
 		{Kind: richtext.Text, Text: " and "},
+		{Kind: richtext.User, Text: "@U0ALICE0001", ID: "U0ALICE0001"},
+		{Kind: richtext.Text, Text: " or "},
 		{Kind: richtext.User, Text: "@U1", ID: "U1"},
 	}}}}
 	m := &core.Message{Channel: "C1", TS: "1700000001.000100", Doc: doc}
-	if got, want := b.preview(m), "ask  and @Alice Example"; got != want {
+	if got, want := b.preview(m), "ask and @Alice Example or @U1"; got != want {
 		t.Errorf("preview %q, want %q", got, want)
 	}
 	app.S.PutUsers([]slack.User{{ID: "U0NOTLOADED", Name: "nia", RealName: "Nia Now"}})
-	if got, want := b.preview(m), "ask @Nia Now and @Alice Example"; got != want {
+	if got, want := b.preview(m), "ask @Nia Now and @Alice Example or @U1"; got != want {
 		t.Errorf("preview once the member loaded %q, want %q", got, want)
 	}
 }
