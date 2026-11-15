@@ -4,16 +4,22 @@ Clack's inspect tool is a developer shortcut for UI bug reports. It is not a Sla
 
 ## Turning it on
 
-The shortcut works only when one of these is set:
+Type the Konami code anywhere in the main window: ↑ ↑ ↓ ↓ ← → ← → B A. The tool is on at once, with no relaunch, and a toast says so. Clack keeps it on (`"inspect_tool": true` in `ui.json`). The code again turns it off.
 
-- the environment variable `CLACK_INSPECT=1`
-- `"inspect_tool": true` in `ui.json` in Clack's config folder (`~/.config/clack` on Linux), added by hand
+The keys still do what they always do wherever you type them: the arrows move the caret, B and A type, and in an empty composer ↑ opens your last message for editing (Esc leaves it as it was). Clack only watches them go by (Gio patch 28, `third_party/gioui.org/CLACK_PATCHES.md`).
 
-Then ⌘⌥⇧D on macOS (Ctrl+Alt+Shift+D on Linux and Windows) starts a session. The shortcut works over modals too, so dialogs can be inspected.
+Two other ways, both read at launch only:
+
+- the environment variable `CLACK_INSPECT=1`. A Clack opened from the Dock or Finder doesn't get a shell's variables, and a second launch hands over to the running Clack, so on macOS quit Clack (⌘Q; closing the window only hides it) and start `/Applications/Clack.app/Contents/MacOS/clack` from a shell that has it.
+- `"inspect_tool": true` in `ui.json` in Clack's config folder: `~/Library/Application Support/clack` on macOS, `~/.config/clack` on Linux, `%AppData%\clack` on Windows. Edit it with Clack quit: Clack writes `ui.json` from what it read at launch whenever a setting changes, the window moves or you switch conversations, so an edit made while it runs is lost.
+
+Then Hyper+D starts a session: ⌃⌥⇧⌘D on macOS, Ctrl+Alt+Shift+D on Linux and Windows (where Super may be held too). The shortcut works over modals too, so dialogs can be inspected.
+
+Until Gio patch 29 the shortcut, then ⌥⇧⌘D, did nothing on macOS. AppKit sends no command for a ⌘ press with ⌥ held (`interpretKeyEvents:` calls neither `doCommandBySelector:` nor `insertText:`), and Gio dropped every ⌘ press that came without one, so no key filter ever saw it; Hyper+D has ⌥ too. `TestMacInspectKeys` on ci's macos job posts the keys through AppKit as a keyboard makes them.
 
 ## A session
 
-A banner at the top says the session is on. The Slack component under the pointer gets a pink outline and a label with its name, root element and size. ↑ widens the outline to the enclosing component and ↓ comes back. Esc or the shortcut again ends the session.
+A banner at the top says the session is on. The Slack component under the pointer gets a pink outline and a label with its name, root element and size. ↑ widens the outline to the enclosing component and ↓ comes back. Esc or Hyper+D again ends the session.
 
 The window keeps working while the session runs, minus clicks and keys. Hover states still show (a message's toolbar, tooltips), lists scroll, and carets, focus rings and animations stay as they are. No button, editor or shortcut reacts. The tool alone reads the clicks and keys. Gio patch 21 (`Source.HoverOnly`, `third_party/gioui.org/CLACK_PATCHES.md`) makes that possible.
 

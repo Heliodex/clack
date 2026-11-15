@@ -167,7 +167,9 @@ type prefs struct {
 	// files_open.go).
 	OpenFiles map[string]openFilesPrefs `json:"open_files,omitempty"`
 	// InspectTool turns on the inspect tool's shortcut (inspect_wire.go),
-	// like CLACK_INSPECT=1: a developer setting with no UI, set by hand.
+	// like CLACK_INSPECT=1: a developer setting with no UI. The Konami
+	// code sets and clears it; by hand only with Clack quit, since Clack
+	// writes ui.json from what it read at launch.
 	InspectTool bool `json:"inspect_tool,omitempty"`
 	// MainWindow is Slack's mainWindowSettings: where the main window was
 	// (its frame in Gio patch 25's screen coordinates: physical pixels on

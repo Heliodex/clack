@@ -9,6 +9,7 @@ package ui
 // never reaches the pill: after the session it takes clicks again.
 
 import (
+	"encoding/json"
 	"image"
 	"image/color"
 	"image/draw"
@@ -20,14 +21,17 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"gioui.org/f32"
 	"gioui.org/io/key"
 	"gioui.org/op"
 
 	"github.com/some-du6e/clack/internal/fakeslack"
+	"github.com/some-du6e/clack/internal/imgcache"
 	"github.com/some-du6e/clack/internal/ui/inspect"
 	"github.com/some-du6e/clack/internal/ui/messages"
+	"github.com/some-du6e/clack/internal/ui/shortcut"
 )
 
 // inspectEnv is the client on the fake with the tool gated on and a
@@ -110,11 +114,51 @@ func (e *inspectEnv) pillCenter() f32.Point {
 	return f32.Pt(float32(r.Min.X+r.Dx()/2), float32(r.Min.Y+r.Dy()/2))
 }
 
+// typeAt types s into the focused field as Gio's Window.EditorInsert
+// does: the edit at the selection, then the caret after it.
+func (e *perfEnv) typeAt(s string) {
+	sel := e.r.EditorState().Selection.Range
+	pos := min(sel.Start, sel.End) + utf8.RuneCountInString(s)
+	e.r.Queue(key.EditEvent{Range: sel, Text: s}, key.SelectionEvent{Start: pos, End: pos})
+	e.frame()
+}
+
+// typeKonami types the Konami code as a keyboard does: each key's press
+// and release, and B and A also the text they type, a frame after each.
+func (e *perfEnv) typeKonami() {
+	for _, n := range konamiCode {
+		e.key(n, 0)
+		if n == "B" || n == "A" {
+			e.typeAt(strings.ToLower(string(n)))
+		}
+		e.frame()
+	}
+}
+
+// savedInspectTool is ui.json's inspect_tool in dir.
+func savedInspectTool(t *testing.T, dir string) bool {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(dir, "ui.json"))
+	if err != nil {
+		return false
+	}
+	var p prefs
+	if err := json.Unmarshal(b, &p); err != nil {
+		t.Fatalf("ui.json: %v", err)
+	}
+	return p.InspectTool
+}
+
+// hyperD presses the tool's shortcut.
+func (e *perfEnv) hyperD() {
+	f := inspectFilter()
+	e.key(f.Name, f.Required)
+}
+
 // startSession presses the shortcut and points at the pill.
 func (e *inspectEnv) startSession(t *testing.T) {
 	t.Helper()
-	n, m := parseCombo(inspectCombo)
-	e.key(n, m)
+	e.hyperD()
 	e.frame()
 	if !e.a.insp.Active() {
 		t.Fatal("the shortcut started no inspect session")
@@ -306,8 +350,7 @@ func TestInspectEscAndGate(t *testing.T) {
 		t.Error("Esc didn't end the session")
 	}
 	e.startSession(t)
-	n, m := parseCombo(inspectCombo)
-	e.key(n, m)
+	e.hyperD()
 	e.frame()
 	if e.a.insp.Active() {
 		t.Error("the shortcut again didn't end the session")
@@ -322,6 +365,183 @@ func TestInspectEscAndGate(t *testing.T) {
 	t.Setenv("CLACK_INSPECT", "")
 	if off, _ := ttApp(t, t.TempDir()); off.insp != nil {
 		t.Error("the tool exists with CLACK_INSPECT unset and no inspect_tool pref")
+	}
+}
+
+// The Konami code typed into the focused composer turns the tool on at
+// once, with no CLACK_INSPECT and no pref: the composer still gets every
+// key (its caret moves, B and A type), the tool only watches them (Gio
+// patch 28). It's kept in ui.json, which the next launch reads; Hyper+D
+// then starts a session and again ends it (on macOS the old ⌘⌥⇧D
+// doesn't; elsewhere it was Ctrl+Alt+Shift+D already); the code again
+// turns it off, in ui.json too.
+func TestInspectKonami(t *testing.T) {
+	t.Setenv("CLACK_INSPECT", "")
+	t.Setenv("YOLOSLACK_INSPECT", "")
+	fs, err := fakeslack.Start(fakeslack.Small)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { fs.Close() })
+	e := startEnv(t, fs, t.TempDir())
+	e.waitReady()
+	ch := fs.ChannelIDs()[0]
+	e.openChannel(ch)
+	e.until("the composer", 20*time.Second, func() bool {
+		cv := e.a.convos[ch+"/"]
+		return cv != nil && cv.comp != nil
+	})
+	if e.a.insp != nil {
+		t.Fatal("the tool exists before the code")
+	}
+	e.focusComposer(ch, "")
+	cb, ok := e.a.convos[ch+"/"].comp.(composerBox)
+	if !ok {
+		t.Fatalf("the composer is a %T", e.a.convos[ch+"/"].comp)
+	}
+	e.typeAt("hello")
+	e.key(key.NameLeftArrow, 0)
+	e.frame()
+	e.key(key.NameLeftArrow, 0)
+	e.frame()
+	if got := cb.DocText(); got != "hello" {
+		t.Fatalf("the composer has %q, want hello", got)
+	}
+	hyper := func() {
+		e.hyperD()
+		e.frame()
+	}
+	hyper()
+	if e.a.insp != nil {
+		t.Fatal("Hyper+D made the tool before the code")
+	}
+
+	// hel|lo: ↑ ↑ go to the start, ↓ ↓ to the end, ← → ← → stay there and
+	// B A type: helloba only if the composer got the arrows
+	e.typeKonami()
+	if e.a.insp == nil {
+		t.Fatal("the Konami code didn't turn the tool on")
+	}
+	if got := cb.DocText(); got != "helloba" {
+		t.Errorf("after the code the composer has %q, want helloba (its caret moves with the code's arrows)", got)
+	}
+	if !strings.HasPrefix(e.a.toast.text, "Inspect tool on") {
+		t.Errorf("toast %q", e.a.toast.text)
+	}
+	e.a.flushPrefs()
+	if !savedInspectTool(t, e.home) {
+		t.Error("ui.json has no inspect_tool after the code")
+	}
+	// the next launch (last: a second App takes over the package's
+	// hooks) reads this ui.json
+	next := t.TempDir()
+	if b, err := os.ReadFile(filepath.Join(e.home, "ui.json")); err != nil {
+		t.Fatal(err)
+	} else if err := os.WriteFile(filepath.Join(next, "ui.json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	hyper()
+	if !e.a.insp.Active() {
+		t.Fatal("Hyper+D started no session after the code")
+	}
+	hyper()
+	if e.a.insp.Active() {
+		t.Error("Hyper+D again didn't end the session")
+	}
+	if shortcut.Mac() {
+		e.key("D", key.ModCommand|key.ModAlt|key.ModShift) // the old shortcut
+		e.frame()
+		if e.a.insp.Active() {
+			t.Error("the old ⌘⌥⇧D started a session")
+		}
+	}
+
+	e.typeKonami()
+	if e.a.insp != nil {
+		t.Error("the code again left the tool on")
+	}
+	if !strings.HasPrefix(e.a.toast.text, "Inspect tool off") {
+		t.Errorf("toast %q", e.a.toast.text)
+	}
+	e.a.flushPrefs()
+	if savedInspectTool(t, e.home) {
+		t.Error("ui.json still has inspect_tool after the code again")
+	}
+	if a := New(Options{ConfigDir: next, NoRealtime: true}, imgcache.New(fs.Fetch, "", nil)); a.insp == nil {
+		t.Error("a launch with the ui.json the code wrote has no tool")
+	}
+}
+
+// The code's keys in order, whatever comes between runs of them: a third
+// ↑ keeps ↑ ↑, a modifier starts it over, Shift doesn't.
+func TestKonamiSequence(t *testing.T) {
+	press := func(k *konami, names ...key.Name) (done int) {
+		for _, n := range names {
+			if k.press(key.Event{Name: n, State: key.Press}) {
+				done++
+			}
+		}
+		return done
+	}
+	code := konamiCode[:]
+	up, down, left, right := key.NameUpArrow, key.NameDownArrow, key.NameLeftArrow, key.NameRightArrow
+	for _, c := range []struct {
+		name string
+		keys []key.Name
+		want int
+	}{
+		{"the code", code, 1},
+		{"twice", append(append([]key.Name{}, code...), code...), 2},
+		{"three ups first", append([]key.Name{up}, code...), 1},
+		{"noise first", append([]key.Name{"X", down, "B", up}, code...), 1},
+		{"one key short", code[:len(code)-1], 0},
+		{"a wrong key inside", []key.Name{up, up, down, down, left, right, "X", left, right, "B", "A"}, 0},
+		{"B A again", append(append([]key.Name{}, code...), "B", "A"), 1},
+		{"the arrows again then B A", []key.Name{up, up, down, down, left, right, up, up, down, down, left, right, left, right, "B", "A"}, 1},
+	} {
+		var k konami
+		if got := press(&k, c.keys...); got != c.want {
+			t.Errorf("%s: completed %d times, want %d", c.name, got, c.want)
+		}
+	}
+	var k konami
+	for _, n := range code[:len(code)-1] {
+		k.press(key.Event{Name: n, State: key.Press})
+	}
+	if k.press(key.Event{Name: "A", Modifiers: key.ModShortcut, State: key.Press}) {
+		t.Error("Mod+A completed the code")
+	}
+	k = konami{}
+	for _, n := range code[:len(code)-1] {
+		k.press(key.Event{Name: n, State: key.Press})
+	}
+	if !k.press(key.Event{Name: "A", Modifiers: key.ModShift, State: key.Press}) {
+		t.Error("a capital A didn't complete the code")
+	}
+}
+
+// Hyper+D is Mod+Alt+Ctrl+Shift+D: ⌃⌥⇧⌘D on macOS, Ctrl+Alt+Shift+D
+// elsewhere, where a Hyper key may hold Super as well.
+func TestInspectComboIsHyperD(t *testing.T) {
+	for _, c := range []struct {
+		goos, label string
+		mods        key.Modifiers
+	}{
+		{"darwin", "⌃⌥⇧⌘D", key.ModCommand | key.ModCtrl | key.ModAlt | key.ModShift},
+		{"linux", "Ctrl+Alt+Shift+D", key.ModCtrl | key.ModAlt | key.ModShift},
+		{"windows", "Ctrl+Alt+Shift+D", key.ModCtrl | key.ModAlt | key.ModShift},
+	} {
+		prev := shortcut.GOOS
+		shortcut.GOOS = c.goos
+		f, hint := inspectFilter(), inspectHint()
+		shortcut.GOOS = prev
+		if f.Name != "D" || f.Required != c.mods || f.Optional != key.ModSuper {
+			t.Errorf("%s: filter %+v, want D with %v (Super optional)", c.goos, f, c.mods)
+		}
+		if hint != c.label {
+			t.Errorf("%s: shown as %q, want %q", c.goos, hint, c.label)
+		}
 	}
 }
 

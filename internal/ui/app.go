@@ -312,6 +312,7 @@ type App struct {
 
 	insp    *inspect.Tool // the inspect tool, nil unless gated on (inspect_wire.go)
 	inspKey key.Filter    // its shortcut
+	konami  konami        // the code that turns it on and off
 }
 
 // New creates the app. Call Run on the UI goroutine (main).
@@ -335,7 +336,7 @@ func New(opts Options, images *imgcache.Cache) *App {
 	a.secondary.width = 0 // auto: Slack's default secondary width (secondaryWidth)
 	a.keys = a.defaultShortcuts()
 	a.loadPrefs()
-	a.initInspect()    // gated: CLACK_INSPECT=1 or ui.json's inspect_tool (inspect_wire.go)
+	a.initInspect()    // gated: CLACK_INSPECT=1, ui.json's inspect_tool or the Konami code (inspect_wire.go)
 	a.startDownloads() // downloads.go
 	a.loadSplitWidth()
 	composer.UpArrowShortcut = func() int { return a.prefs.ComposerUpArrow }

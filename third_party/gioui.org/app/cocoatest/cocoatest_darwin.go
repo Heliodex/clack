@@ -6,7 +6,7 @@ package cocoatest
 
 /*
 #cgo CFLAGS: -Werror -Wno-deprecated-declarations -fobjc-arc -x objective-c
-#cgo LDFLAGS: -framework AppKit
+#cgo LDFLAGS: -framework AppKit -framework Carbon
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -46,6 +46,10 @@ void cocoatest_toggle_full_screen(uintptr_t view);
 int cocoatest_screens(cocoatest_rect *frames, cocoatest_rect *visible, int limit);
 void cocoatest_set_top_left(uintptr_t view, CGFloat x, CGFloat y);
 void cocoatest_zoom(uintptr_t view);
+void cocoatest_post_key(uintptr_t view, int code, int mods, int direct, char *chars, char *ign, int n);
+void cocoatest_trace_keys(uintptr_t view);
+char *cocoatest_key_trace(void);
+void cocoatest_keyboard_layout(char *out, int n);
 */
 import "C"
 
@@ -209,6 +213,74 @@ func KeyEquivalent(key string, mods int) bool {
 	cs := C.CString(key)
 	defer C.free(unsafe.Pointer(cs))
 	return C.cocoatest_key_equivalent(cs, C.int(mods)) != 0
+}
+
+// Key codes (Carbon's kVK_ANSI_* and kVK_*: where the key is, not what it
+// types) for PostKey.
+const (
+	KeyA      = 0x00
+	KeyD      = 0x02
+	KeyB      = 0x0B
+	KeyEscape = 0x35
+	KeyLeft   = 0x7B
+	KeyRight  = 0x7C
+	KeyDown   = 0x7D
+	KeyUp     = 0x7E
+)
+
+// PostKey queues one press of the key at code (KeyA, …) with mods (Cmd,
+// Shift, Opt, Ctrl) held, as a keyboard makes it: a flagsChanged for
+// each modifier going down (⌃, ⌥, ⇧, then ⌘), the key's down and up, then
+// the modifiers going up. The key's characters are what the current
+// keyboard layout types for it (UCKeyTranslate, as the window server
+// fills them in: ⌥⇧D is "Î", ⌃D is U+0004), and its characters ignoring
+// modifiers what it types with Shift alone; the arrows are AppKit's
+// function-key characters, with the function and numeric-pad flags a
+// real arrow key sets. The run loop delivers the events through NSApp
+// sendEvent:: the key window's and the main menu's performKeyEquivalent:
+// first when ⌘ is down, then the key window's first responder. It
+// returns the key's characters and characters ignoring modifiers. Main
+// thread.
+func PostKey(view uintptr, code, mods int) (chars, ignoring string) {
+	return postKey(view, code, mods, false)
+}
+
+// SendKey is PostKey without NSApp: the events go straight to the view's
+// flagsChanged:, keyDown: and keyUp:, so no menu key equivalent can take
+// them. Main thread.
+func SendKey(view uintptr, code, mods int) (chars, ignoring string) {
+	return postKey(view, code, mods, true)
+}
+
+func postKey(view uintptr, code, mods int, direct bool) (string, string) {
+	var chars, ign [64]C.char
+	C.cocoatest_post_key(C.uintptr_t(view), C.int(code), C.int(mods), cint(direct), &chars[0], &ign[0], C.int(len(chars)))
+	return C.GoString(&chars[0]), C.GoString(&ign[0])
+}
+
+// KeyboardLayout is the current keyboard layout's input source id
+// ("com.apple.keylayout.US"), which PostKey types with. Main thread.
+func KeyboardLayout() string {
+	var b [256]C.char
+	C.cocoatest_keyboard_layout(&b[0], C.int(len(b)))
+	return C.GoString(&b[0])
+}
+
+// TraceKeys records what the view's class gets of the key events from
+// now on (keyDown:, keyUp:, flagsChanged:, and what its
+// interpretKeyEvents: makes of them: doCommandBySelector:, insertText:),
+// for KeyTrace. Once per view class. Main thread.
+func TraceKeys(view uintptr) { C.cocoatest_trace_keys(C.uintptr_t(view)) }
+
+// KeyTrace returns the calls TraceKeys recorded since the last KeyTrace,
+// one per line, and forgets them. Main thread.
+func KeyTrace() string {
+	s := C.cocoatest_key_trace()
+	if s == nil {
+		return ""
+	}
+	defer C.free(unsafe.Pointer(s))
+	return C.GoString(s)
 }
 
 // Screen is a screen's frame and visible frame (its work area), in

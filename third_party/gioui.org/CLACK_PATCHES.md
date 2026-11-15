@@ -26,8 +26,9 @@ It should show only `gpu/gpu.go`, `widget/index.go`, `widget/editor.go`,
 `io/input/clack_hover.go`, `io/input/clack_hover_test.go`,
 `font/opentype/opentype.go`, `io/input/pointer.go`, `io/input/key.go`,
 `io/input/clack_release_test.go`, `gpu/clack_release_test.go`,
-`text/clack_release_test.go` and these two files (`CLACK_PATCHES.md`,
-`UPSTREAM.patch`).
+`text/clack_release_test.go`, `io/input/clack_keylog.go`,
+`io/input/clack_keylog_test.go`, `app/clack_keys_darwin_test.go` and
+these two files (`CLACK_PATCHES.md`, `UPSTREAM.patch`).
 
 ## 1. gpu: drop opacity layers covered by a full-window opaque paint
 
@@ -1084,8 +1085,12 @@ the view and the window are still alive) and `TestHideLeavesFullscreenMac`
 (skipped on the runner: it enters full screen, but no `toggleFullScreen:`,
 AppKit's own from the main queue included, ever takes the window out
 again, so the full-screen hide is untested there). `internal/ui`
-`TestMacWindowCloseHides` is Clack's window on the same job. Not in
-`UPSTREAM.patch`.
+`TestMacWindowCloseHides` is Clack's window on the same job.
+`cocoatest.PostKey` posts a key press as a keyboard makes one (each
+modifier's `flagsChanged`, then the key's down and up with the characters
+the current layout types, `UCKeyTranslate`) for `NSApp` to deliver, and
+`TraceKeys` records what the view's key methods get (`internal/ui`
+`TestMacInspectKeys`). Not in `UPSTREAM.patch`.
 
 ## 25. app: Bounds, Displays, and where a window is (Windows, macOS)
 
@@ -1289,3 +1294,70 @@ steps in ci's order) with the test's stall dump: the window thread in
 `runLoop`'s `GetMessage`, `animating` true, the next frame due, `WM_NULL`
 answered at once, after the trace's `WM_NCPOINTERDOWN`/`WM_NCPOINTERUP`.
 Not in `UPSTREAM.patch`.
+
+## 28. io/input: the key presses a router was given, whoever took them
+
+`io/input/clack_keylog.go` (new: `Source.KeyPresses`, `Router.KeyLogged`),
+`io/input/router.go` (`Queue` keeps each press; `Frame` and `execute`
+queue replayed events through `requeue`) and `app/window.go`
+(`processEvent` draws a frame for a kept press no filter matched). An
+addition: a router no Source calls `KeyPresses` on behaves as before.
+
+Gio gives a key event to one `Event` call, the first whose filters
+match. Clack's inspect tool turns on with the Konami code, ↑ ↑ ↓ ↓ ← → ← →
+B A typed in the main window, and that happens with the composer focused
+more often than not: the composer takes the arrows (its caret moves; ↑ in
+an empty one edits your last message) and the letters. A filter read
+before the composer's would take the keys from it; one read after never
+sees them.
+
+`Source.KeyPresses` returns the key presses (not the modifier keys' own)
+the router was given since the last call or the last frame, whatever
+took them, and forgets them: the last 32 at most. The router keeps
+presses only while a Source calls it every frame. A press the router
+queues again for a state replay (a command executed with events pending;
+deferred events at the next frame) isn't kept twice. Each kept press asks
+the window for a frame (`Router.KeyLogged`, read by
+`Window.processEvent`) but doesn't count as handled: Gio still moves the
+focus for an unhandled Tab, and macOS still gets an unhandled key's
+`doCommandBySelector:`.
+
+Tests: `io/input/clack_keylog_test.go` (`TestKeyPressesSeesTakenKeys`: a
+focused editor's ↑ and an unmatched B once each, no Shift;
+`TestKeyPressesUnmatchedStaysUnhandled`; `TestKeyPressesOnlyWhileRead`;
+`TestKeyPressesReplayedOnce`: the immediate replay and the deferred one;
+`TestKeyPressesSourcesAndBound`) on ci's linux-gio job, `internal/ui`
+`TestInspectKonami` (the code typed into the composer, which still gets
+every key) and, through AppKit, `TestMacInspectKeys` on the macos job.
+Not in `UPSTREAM.patch`.
+
+## 29. app: ⌘ presses AppKit's text system sends no command for (macOS)
+
+`app/os_macos.go` (`gio_onKeys`, `cmdKeys.pending`). A fix.
+
+A key press on macOS goes through `interpretKeyEvents:`, and Gio
+delivered a press with ⌘ only from the `doCommandBySelector:` it expected
+that call to make (`gio_onCommandBySelector`); `gio_onKeys` returned
+without it. AppKit makes one for ⌘ alone or with ⇧ (`noop:` for ⌘B and
+⇧⌘D, the key binding's `moveToBeginningOfDocument:` for ⌘↑), but none
+once ⌥ is held too: on macos-latest (com.apple.keylayout.US) ⌥⌘B's,
+⌥⇧⌘D's and ⌃⌥⇧⌘D's `keyDown:` reach the view, and `interpretKeyEvents:`
+calls neither `doCommandBySelector:` nor `insertText:`. So no filter ever
+saw a ⌥⌘ press. Karim found it with Clack's inspect tool, whose shortcut
+was ⌥⇧⌘D: it did nothing (2026-11-14).
+
+`gio_onKeys` now marks the press pending before `interpretKeyEvents:`,
+and `gio_onCommandBySelector`, which clears `cmdKeys`, unmarks it. A
+press with ⌘ still pending afterwards is delivered by `gio_onKeys`, once.
+A command key without ⌘ (an arrow, Return, Tab) that gets no command
+still isn't delivered: an input method took it.
+
+Found by `internal/ui` `TestMacInspectKeys` on ci's macos job (run
+43661396830: `cocoatest.TraceKeys` logged ⌥⇧⌘D's and ⌃⌥⇧⌘D's `keyDown:`
+with nothing after them, and no session started, posted through `NSApp`
+or straight to the view). Tests: `app/clack_keys_darwin_test.go`
+`TestMacCommandKeys` (macos job, `CLACK_MACOS_WINDOW_TESTS`: ⌘B, ⇧⌘D,
+⌥⇧⌘D, ⌃⌥⇧⌘D, ⌥⌘B, ⌘↑, ↑, ⌥⇧D and A posted through `NSApp` reach a filter
+once each; the log says which came through `doCommandBySelector:`, run
+43663715941 the list above) and `internal/ui` `TestMacInspectKeys`. Not
+in `UPSTREAM.patch`.
