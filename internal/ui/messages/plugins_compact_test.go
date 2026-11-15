@@ -103,6 +103,11 @@ func TestPluginCompactWhoReacted(t *testing.T) {
 	TestPluginWhoReacted(t)
 }
 
+func TestPluginCompactThreadSenderSiblings(t *testing.T) {
+	setDense(t, true)
+	TestPluginThreadSenderSiblings(t)
+}
+
 func TestPluginCompactUserPronouns(t *testing.T) {
 	setDense(t, true)
 	TestPluginUserPronouns(t)

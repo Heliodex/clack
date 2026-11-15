@@ -1626,11 +1626,29 @@ func (r *row) layoutPreamble(gtx layout.Context, p slackc.Props) layout.Dimensio
 }
 
 // layoutThreadSender is ThreadSenderAndTimestampGeneric (thread pane).
+// Slack's (client-boot-shared 7aPN) renders inline content in a
+// fragment: MessageSender, "\xa0\xa0", MeetingChannelRootTimeBadge, the
+// Timestamp unless omitTimestamp, then a <br> unless omitLinebreak. The
+// <br> is what ends the line, so the native takes the whole line only
+// with it. Under omitLinebreak (UserPronouns renders <Original
+// omitLinebreak/> and puts its pronouns after it), the native is as wide
+// as what it drew, and the plugin's siblings carry on along the same line.
+// The full-width box wrapped them onto a line of their own under the name.
 func (r *row) layoutThreadSender(gtx layout.Context, p slackc.Props) layout.Dimensions {
 	if p.Has("visible") && !p.Bool("visible") {
 		return layout.Dimensions{}
 	}
-	return r.nameLine(gtx, !p.Bool("omitTimestamp"))
+	withTS := !p.Bool("omitTimestamp")
+	if !p.Bool("omitLinebreak") {
+		return r.nameLine(gtx, withTS)
+	}
+	gap := dp(gtx, mt.tsGap)
+	d, end := r.nameLineEnd(gtx, withTS, gap)
+	if !withTS && end > 0 {
+		end += gap // the two no-break spaces come before the (omitted) time
+	}
+	d.Size.X = min(end, gtx.Constraints.Max.X)
+	return d
 }
 
 // nameLine draws "Name [APP] [status] 3:04 PM", baselines aligned.
@@ -1640,6 +1658,13 @@ func (r *row) nameLine(gtx layout.Context, withTS bool) layout.Dimensions {
 
 // nameLineGap is nameLine with gap px between the sender and the time.
 func (r *row) nameLineGap(gtx layout.Context, withTS bool, gap int) layout.Dimensions {
+	d, _ := r.nameLineEnd(gtx, withTS, gap)
+	return d
+}
+
+// nameLineEnd is nameLineGap, and the x where what it drew ends (the
+// time's right edge, or the sender's without one).
+func (r *row) nameLineEnd(gtx layout.Context, withTS bool, gap int) (layout.Dimensions, int) {
 	w := gtx.Constraints.Max.X
 	lh := dp(gtx, mt.nameLine)
 	g := gtx
@@ -1649,6 +1674,7 @@ func (r *row) nameLineGap(gtx layout.Context, withTS bool, gap int) layout.Dimen
 	if nd.Size.Y == 0 {
 		baseline = lh - dp(gtx, 5)
 	}
+	end := nd.Size.X
 	if withTS {
 		// Align baselines.
 		m := op.Record(gtx.Ops)
@@ -1657,11 +1683,14 @@ func (r *row) nameLineGap(gtx layout.Context, withTS bool, gap int) layout.Dimen
 		t := op.Offset(image.Pt(nd.Size.X+gap, baseline-(d.Size.Y-d.Baseline))).Push(gtx.Ops)
 		call.Add(gtx.Ops)
 		t.Pop()
+		if d.Size.X > 0 {
+			end = nd.Size.X + gap + d.Size.X
+		}
 	}
 	if !withTS && r.rc.dense {
 		w = nd.Size.X // inline before the text: its own width
 	}
-	return layout.Dimensions{Size: image.Pt(w, lh), Baseline: lh - baseline}
+	return layout.Dimensions{Size: image.Pt(w, lh), Baseline: lh - baseline}, end
 }
 
 // layoutSender is MessageSender around BaseMessageSender.
