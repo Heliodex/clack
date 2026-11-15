@@ -9,7 +9,8 @@ import (
 // Redact is what every line written to the log file goes through:
 // slack.Redact (xox* tokens, the d, d-s and lc cookies, token=,
 // enterprise_token=, magic_tokens= and tokens= values, magic-login link
-// tokens), then the rules below for what the file keeps longer than
+// tokens, the Slack CLI's "/slackauthticket <ticket>" and its ticket= and
+// challenge=), then the rules below for what the file keeps longer than
 // stderr does:
 //
 //   - URL-encoded tokens: xoxc%2D…

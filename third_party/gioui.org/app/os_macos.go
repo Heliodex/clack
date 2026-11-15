@@ -469,6 +469,9 @@ type window struct {
 type cmdKeys struct {
 	eventStr  string
 	eventMods key.Modifiers
+	// pending (Clack patch 29): set before interpretKeyEvents:,
+	// cleared by the doCommandBySelector: that delivers the press.
+	pending bool
 }
 
 // launched is closed when applicationDidFinishLaunching is called.
@@ -832,12 +835,23 @@ func gio_onKeys(h C.uintptr_t, event C.CFTypeRef, cstr C.CFTypeRef, ti C.double,
 	}
 	str := nsstringToString(cstr)
 	kmods := convertMods(mods)
+	cmd := kmods.Contain(key.ModCommand)
 	ks := key.Release
+	commanded := false
 	if keyDown {
 		ks = key.Press
 		w.cmdKeys.eventStr = str
 		w.cmdKeys.eventMods = kmods
+		w.cmdKeys.pending = true
 		C.interpretKeyEvents(w.view, event)
+		// Clack patch 29 (CLACK_PATCHES.md): AppKit's text system sends no
+		// command for a ⌘ press with ⌥ held (⌥⌘B, ⌥⇧⌘D, ⌃⌥⇧⌘D: neither
+		// doCommandBySelector: nor insertText:), and Gio lost those. Such
+		// a press is delivered below instead.
+		commanded = !w.cmdKeys.pending
+		if cmd && !commanded {
+			w.cmdKeys = cmdKeys{}
+		}
 	}
 	for _, k := range str {
 		if n, ok := convertKey(k); ok {
@@ -848,8 +862,9 @@ func gio_onKeys(h C.uintptr_t, event C.CFTypeRef, cstr C.CFTypeRef, ti C.double,
 			}
 			if keyDown {
 				w.keysDown[ke.Name] = struct{}{}
-				if _, isCmd := convertCommandKey(k); isCmd || kmods.Contain(key.ModCommand) {
-					// doCommandBySelector already processed the event.
+				// doCommandBySelector already processed the event; a command
+				// key without ⌘ that got none went to an input method.
+				if _, isCmd := convertCommandKey(k); isCmd && !cmd || cmd && commanded {
 					return
 				}
 			} else {

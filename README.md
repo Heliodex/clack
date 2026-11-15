@@ -183,6 +183,10 @@ Clack never calls Slack's sign-out or token-revoke methods. "Sign out on this de
 
 Treat `creds.json` like a password: it is a full session for your account. See [docs/SECURITY.md](docs/SECURITY.md) for how Clack protects it, what plugins can see, and how Clack follows the Hack Club scraping policy.
 
+### `/slackauthticket` is the Slack CLI's
+
+`/slackauthticket <ticket>` doesn't sign Clack in. It's how the Slack CLI signs in. `slack login` prints the line, and you send it from any conversation's composer, in Clack just as in Slack. Slack opens a modal: click **Confirm**, then type the challenge code it shows into the terminal. Ctrl+K only searches for the line, in Slack too. Treat the ticket like a password until it's used. Clack keeps it out of its logs ([docs/SLACKAUTHTICKET.md](docs/SLACKAUTHTICKET.md)).
+
 ## Run
 
 ```sh

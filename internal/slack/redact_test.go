@@ -73,6 +73,45 @@ func TestRedact(t *testing.T) {
 	}
 }
 
+// The Slack CLI's sign-in ticket (docs/SLACKAUTHTICKET.md) is a
+// credential: the "/slackauthticket <ticket>" line `slack login` prints
+// for the composer, and the ticket= and challenge= the CLI redeems it
+// with, never reach a log line or an error.
+func TestRedactAuthTicket(t *testing.T) {
+	const tk = "MDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAw" // base64 of a made-up UUID
+	for _, s := range []string{
+		"/slackauthticket " + tk,
+		"composer: /slackauthticket  " + tk + "\n",
+		"/SlackAuthTicket\t" + tk + "==",
+		"／slackauthticket " + tk, // the full-width slash
+		`{"ops":[{"insert":"/slackauthticket ` + tk + `\n"}]}`,
+		"{Channel:C1 Command:/slackauthticket Text:" + tk + "}",
+		"apps.hosted.exchangeAuthTicket ticket=" + tk + "&challenge=JDt1IK7X&slack_cli_version=v3.9.0",
+	} {
+		r := Redact(s)
+		if strings.Contains(r, "MDAwMDAw") || strings.Contains(r, "JDt1IK7X") {
+			t.Errorf("Redact(%q) = %q", s, r)
+		}
+		var buf bytes.Buffer
+		log.New(RedactWriter(&buf), "", 0).Print(s)
+		if strings.Contains(buf.String(), "MDAwMDAw") {
+			t.Errorf("RedactWriter wrote %q", buf.String())
+		}
+	}
+	if got := Redact("ran /slackauthticket " + tk + " in #general"); got != "ran /slackauthticket REDACTED in #general" {
+		t.Errorf("command form: %q", got)
+	}
+	if got := Redact("ticket=" + tk + "&slack_cli_version=v3.9.0"); got != "ticket=REDACTED&slack_cli_version=v3.9.0" {
+		t.Errorf("form: %q", got)
+	}
+	// not secrets: the bare command, other commands, other words
+	for _, s := range []string{"/slackauthticket", "ran /slackauthticket.", "/ticket anchor", "/slackdevtools", "tickets: 3", "auth_ticket_id 7"} {
+		if got := Redact(s); got != s {
+			t.Errorf("Redact(%q) = %q", s, got)
+		}
+	}
+}
+
 func TestDialErrorRedacted(t *testing.T) {
 	// A refused connection to a URL carrying the token: the error text must not.
 	c := New(Creds{Token: tTok, Cookie: tCookie, TeamURL: "http://127.0.0.1:1/"})
