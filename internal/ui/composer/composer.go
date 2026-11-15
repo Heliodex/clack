@@ -730,6 +730,7 @@ func (c *Composer) chromeState(gtx layout.Context) chromeState {
 		quietBot, _ = ca.SuppressBotTyping(c.ch, c.ts)
 	}
 	if uipref.Get().ShowTyping { // Messages & media > "Display information about who is currently typing"
+		typingHub(c.h.Core()).shown(c.ch, c.ts, gtx.Now)
 		st.TypingIDs, st.TypingNames = typingHub(c.h.Core()).typers(c.ch, c.ts, c.api.self().ID)
 		if quietBot != "" {
 			st.TypingIDs, st.TypingNames = dropTyper(st.TypingIDs, st.TypingNames, quietBot)

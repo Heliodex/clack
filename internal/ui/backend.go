@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/some-du6e/clack/internal/applog"
@@ -33,6 +34,10 @@ type backend struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 	unsub   func()
+	// people: the viewer and the partners and members of the model's
+	// DMs, app DMs and group DMs (apply), the people handle's presence
+	// and profile changes can show; the event goroutine reads it (wants)
+	people atomic.Pointer[map[string]bool]
 
 	selfID string
 	domain string
@@ -123,6 +128,9 @@ func (b *backend) start(a *App) {
 	b.unsub = unsub
 	go func() {
 		for ev := range ch {
+			if !b.wants(ev) {
+				continue
+			}
 			ev := ev
 			a.Post(func() { b.handle(a, ev) })
 		}
@@ -387,6 +395,7 @@ func (b *backend) apply(a *App, s core.Snapshot) {
 		convs[c.ID] = ci
 	}
 	m.Convs = convs
+	b.notePeople()
 	m.FilterNames = s.FilterNames
 	m.Sections = m.Sections[:0]
 	for _, sec := range s.Sections {
@@ -607,15 +616,17 @@ func (b *backend) handle(a *App, ev core.Event) {
 		if ev.User != nil {
 			if ev.User.ID == b.selfID {
 				m.SelfName, m.SelfAvatar = ev.User.Name, ev.User.Avatar
+				changed = true
 			}
 			for _, c := range m.Convs {
-				if c.Kind == "im" || c.Kind == "app" {
-					if c.User == ev.User.ID {
-						c.Avatar, c.Name, c.StatusEmoji = ev.User.Avatar, ev.User.Name, ev.User.StatusEmojiURL
-					}
+				switch {
+				case (c.Kind == "im" || c.Kind == "app") && c.User == ev.User.ID:
+					c.Avatar, c.Name, c.StatusEmoji = ev.User.Avatar, ev.User.Name, ev.User.StatusEmojiURL
+					changed = true
+				case c.Kind == "mpim" && contains(c.Members, ev.User.ID):
+					changed = true // its name lists its members
 				}
 			}
-			changed = true
 		}
 	case "conv", "conv_removed", "sidebar_changed", "resync", "team": // "prefs" is handled above (it resnapshots too)
 		if ev.Type == "conv_removed" && ev.Channel != "" {
@@ -668,6 +679,71 @@ func (b *backend) handle(a *App, ev core.Event) {
 		m.version++
 		a.Invalidate()
 	}
+}
+
+// wants reports whether handle does anything with ev (the event
+// goroutine). Each Post draws a frame, and a busy workspace's socket
+// brings typing, reactions, new emoji, presence and profile changes about
+// conversations and people the window doesn't show, many a second (Karim
+// 2026-11-14: Hack Club's, while Clack sat idle): handle only logs typing,
+// leaves updates other than a settled stream to the message lists, never
+// reads new emoji, and changes the model for presence and profiles of the
+// viewer and DM people only. The lists' hub, the composer and the views
+// follow the events they draw on their own.
+func (b *backend) wants(ev core.Event) bool {
+	switch ev.Type {
+	case "typing":
+		return os.Getenv("CLACK_TYPINGLOG") != ""
+	case "update":
+		return ev.StreamDone
+	case "emoji_changed":
+		return false
+	case "presence":
+		return b.shows(ev.UserID) || b.shows(ev.Users...)
+	case "user":
+		id := ev.UserID
+		if ev.User != nil {
+			id = ev.User.ID
+		}
+		return b.shows(id)
+	}
+	return true
+}
+
+// shows reports whether any of ids is in people (any goroutine); before
+// the first model, everyone is.
+func (b *backend) shows(ids ...string) bool {
+	p := b.people.Load()
+	if p == nil {
+		return true
+	}
+	for _, id := range ids {
+		if id != "" && (*p)[id] {
+			return true
+		}
+	}
+	return false
+}
+
+// notePeople rebuilds people from the model (UI goroutine).
+func (b *backend) notePeople() {
+	p := map[string]bool{}
+	if b.selfID != "" {
+		p[b.selfID] = true
+	}
+	for _, c := range b.m.Convs {
+		switch c.Kind {
+		case "im", "app":
+			if c.User != "" {
+				p[c.User] = true
+			}
+		case "mpim":
+			for _, u := range c.Members {
+				p[u] = true
+			}
+		}
+	}
+	b.people.Store(&p)
 }
 
 // maybeNotify is maybeShowNotification for a message (or a settled

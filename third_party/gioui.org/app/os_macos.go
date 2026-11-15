@@ -1403,6 +1403,19 @@ func (w *window) init(customRenderer bool) error {
 			return
 		}
 		w.runOnMain(func() {
+			// Clack patch (CLACK_PATCHES.md §30): a tick that came while
+			// a frame was being drawn runs here after it, and that frame
+			// may have stopped the animation (nothing due now: the
+			// display link only stops 500 ms later). Drawing again then
+			// would be a frame nobody asked for, after every frame slower
+			// than a vsync: let the tick go.
+			if !w.anim {
+				select {
+				case <-w.redraw:
+				default:
+				}
+				return
+			}
 			C.setNeedsDisplay(w.view)
 		})
 	})
