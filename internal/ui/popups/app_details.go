@@ -531,11 +531,14 @@ func adGlass() (paint.ImageOp, bool) {
 // of the 128px image (the 100×68 SVG fit into it), the title and the
 // message.
 func (v *AppDetailsView) notFound(gtx layout.Context, th *theme.Theme, cl *Colors, w, h int) layout.Dimensions {
+	return notFoundBox(gtx, th, cl, w, h, "App not found", "The app may have been uninstalled or you do not have permission to view it.")
+}
+
+// notFoundBox lays AppNotFound's column out w×h.
+func notFoundBox(gtx layout.Context, th *theme.Theme, cl *Colors, w, h int, title, msg string) layout.Dimensions {
 	pad := dp(gtx, 16)
 	iw := maxInt(1, w-2*pad)
 	box := dp(gtx, 128)
-	title := "App not found"
-	msg := "The app may have been uninstalled or you do not have permission to view it."
 	tc, td := record(loose(gtx, image.Pt(iw, 1<<20)), func(gtx layout.Context) layout.Dimensions {
 		return paraCenteredW(gtx, th, 18, 24, theme.Black, cl.Fg, title, iw)
 	})
