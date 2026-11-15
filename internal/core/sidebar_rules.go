@@ -135,6 +135,7 @@ var defaultExperimentGroups = map[string]string{
 	// every other experiment Clack reads, as experiments.getByUser had it
 	// on 2026-11-13 (testdata/account_experiments.json; TestDefaultExperimentsMatchAccount)
 	"a11y_no_auto_highlight_search_multi_select": "on", "agent_badge": "on", "agentforce_deprecation": "on",
+	"agent_channel_header": "on", "sc_remove_full_access_user": "on", // exp_wave10.go
 	"agents_in_channels_improvements": "on", "ai_channel_exclusions": "on",
 	"autocomplete_affinity_ml_model": "on", "autocomplete_demote_flannel_passthrough_rltv_exact_match": "on",
 	"autocomplete_frequently_used_emojis_frecency": "on", "basic_select_placeholder_option": "on",

@@ -54,6 +54,11 @@ func init() {
 	// (its check a hole).
 	reg("real-checkbox-empty", s("M6.1 1.75 H13.9 C16.45 1.75 18.25 3.56 18.25 6.1 V13.9 C18.25 16.45 16.45 18.25 13.9 18.25 H6.1 C3.56 18.25 1.75 16.45 1.75 13.9 V6.1 C1.75 3.56 3.56 1.75 6.1 1.75 Z"))
 	reg("real-checkbox-checked", f("M6.1 1C3.14 1 1 3.14 1 6.1V13.9C1 16.86 3.14 19 6.1 19H13.9C16.86 19 19 16.86 19 13.9V6.1C19 3.14 16.86 1 13.9 1ZM13.99 7.4C13.99 7.63 13.92 7.85 13.76 8.03L9.17 13.46C8.97 13.7 8.7 13.82 8.41 13.82C8.07 13.82 7.78 13.66 7.58 13.38L6.03 11.17C5.91 10.99 5.85 10.79 5.85 10.58C5.85 10.23 6 9.95 6.28 9.77C6.45 9.66 6.64 9.6 6.85 9.6C7.18 9.6 7.47 9.76 7.66 10.02L8.49 11.19L12.23 6.75C12.43 6.52 12.69 6.4 12.98 6.4C13.23 6.4 13.44 6.47 13.63 6.62C13.87 6.81 13.99 7.1 13.99 7.4Z"))
+	// U+E148 icon_vertical_ellipsis (c-icon--vertical-ellipsis): the
+	// channel details roster rows' "More options" (ia-details-popover-members
+	// IaDetailsPopoverMemberItemActionsMenu: a c-button--icon outline
+	// Button, type "vertical-ellipsis", 16px)
+	reg("vertical-ellipsis", disc(10, 3.5, 1.75), disc(10, 10, 1.75), disc(10, 16.5, 1.75))
 	// U+E706 icon_form_checkbox_dash (c-menu_item__checkbox_dash): an
 	// indeterminate menu row's mark (the Move to… menu over several
 	// conversations).

@@ -57,8 +57,8 @@ package views
 // agent_mention_dm_user_token, which the account isn't assigned);
 // yWXb's empty-query Suggestions (agents.sunroof.get's pinned agents and
 // flannel's empty-query results, neither of which Clack loads); the
-// rows' "…" menu (Edit agent settings, Remove from channel); the native
-// channel expert and Slackbot rows; the Members search's out-of-channel
+// rows' "…" menu's Channel Manager items (details_agents_menu.go has the
+// rest of it); the native channel expert and Slackbot rows; the Members search's out-of-channel
 // results (in both groups); renderEntirelyEmptyState's Slack Connect
 // description; EtJj's private-channel history prompt; and
 // ChannelManagerRestrictedInvitesAlert ("You can only add agents and apps
@@ -138,6 +138,8 @@ type cdAgents struct {
 	addBtns map[string]*widget.Clickable
 	list    widget.List
 	appsN   int // the app count the roster was loaded for
+	// the rows' "…" menus (details_agents_menu.go)
+	rowMenus map[string]*cdRowMenu
 }
 
 func (d *ChannelDetails) ag() *cdAgents {
@@ -652,8 +654,26 @@ func (d *ChannelDetails) agentRosterRow(gtx C, u core.User, self string, out boo
 	ag := d.ag()
 	u = d.viewUser(u)
 	c := dirClick(d.memberClk, "ag:"+u.ID)
-	if c.Clicked(gtx) {
+	// a channel member's secondary content: the actions menu
+	// (details_agents_menu.go), its button read before the row's click
+	secondary := !out && u.ID != core.SlackbotUserID
+	var items []popups.MenuItem
+	var rm *cdRowMenu
+	took := false
+	if secondary {
+		items = d.agentRowMenuItems(u)
+		rm = d.rowMenu(u.ID)
+		if rm.btn.Clicked(gtx) {
+			took = true
+			d.openRowMenu(rm, items)
+		}
+	}
+	if c.Clicked(gtx) && !took {
 		openProfileCard(d.h, d.press.at, u.ID)
+	}
+	padR := unit.Dp(cdPadX)
+	if secondary {
+		padR += cdRowSecondaryMargin
 	}
 	badge := core.BadgeApp
 	if u.Agent || u.Agentforce {
@@ -662,7 +682,7 @@ func (d *ChannelDetails) agentRosterRow(gtx C, u core.User, self string, out boo
 	full, disp := cdMemberNames(u, self)
 	body := func(gtx C) D {
 		m := op.Record(gtx.Ops)
-		dims := layout.Inset{Top: 12, Bottom: 12, Left: cdPadX, Right: cdPadX}.Layout(gtx, func(gtx C) D {
+		dims := layout.Inset{Top: 12, Bottom: 12, Left: cdPadX, Right: padR}.Layout(gtx, func(gtx C) D {
 			gtx.Constraints.Min.X = gtx.Constraints.Max.X
 			return row(gtx, layout.Middle,
 				layout.Rigid(func(gtx C) D { return d.avatar(gtx, u.Avatar, 36) }),
@@ -718,6 +738,9 @@ func (d *ChannelDetails) agentRosterRow(gtx C, u core.User, self string, out boo
 			fill(gtx, image.Rectangle{Max: dims.Size}, d.p.ReadFill)
 		}
 		call.Add(gtx.Ops)
+		if len(items) > 0 {
+			d.rowMenuButton(gtx, rm, dims.Size, c.Hovered())
+		}
 		return dims
 	}
 	return d.hoverable(gtx, c, false, 0, body)
