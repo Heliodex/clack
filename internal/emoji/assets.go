@@ -16,7 +16,7 @@ import (
 //   - URLs (Ak7A constructStandardEmojiUrl): <CDN>/<style>-<size>/<unicode>
 //     <"@2x" when window.devicePixelRatio > 1>.png, sizes small, medium,
 //     large and xlarge (s2rp). Version "16.0", or "17.0" with the emoji_v17
-//     feature on.
+//     experiment on (getEmojiVersion; Base, set.go).
 //   - The URL's size is the Emoji component's CSS class (vbPY): c-emoji__
 //     small 16px, medium 22px (the default: message text), large 32px
 //     (jumbomoji), larger 56px (loads xlarge), xsmall 12px and relative
@@ -35,14 +35,21 @@ func Style() string {
 }
 
 // URL is the CDN image for an image stem ("1f601") in style ("" for
-// Style()), at Slack's default size (medium, 22px). Callers draw it at any
-// size: the image cache loads the variant that covers the pixels it is
-// asked for (ForPixels).
-func URL(stem, style string) string {
+// Style()), at Slack's default size (medium, 22px), in the set in use's
+// version (Base). Callers draw it at any size: the image cache loads the
+// variant that covers the pixels it is asked for (ForPixels).
+func URL(stem, style string) string { return URLFor(stem, style, V17()) }
+
+// URLFor is URL in the 17.0 set's version (v17) or the 16.0 one's.
+func URLFor(stem, style string, v17 bool) string {
 	if style == "" {
 		style = Style()
 	}
-	return CDN + style + "-medium/" + stem + ".png"
+	base := CDN
+	if v17 {
+		base = CDN17
+	}
+	return base + style + "-medium/" + stem + ".png"
 }
 
 // assetBase is where Slack serves the standard emoji, per version.

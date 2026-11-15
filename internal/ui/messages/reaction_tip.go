@@ -66,6 +66,9 @@ func reactionGroupTooltip(gtx layout.Context, h Host, th *theme.Theme, c *colors
 	bold := cssText(tip, textStyle{size: 13, weight: theme.Bold, col: c.TooltipText, lineH: 16.25})
 	reg := bold
 	reg.weight, reg.col = theme.Regular, tooltipSubtitle(th, c, bold.col)
+	bg := tip.Background(c.Tooltip)
+	var bars tipBars // a reactor core can't name: the subtler MissingText
+	bars.fill, bars.line = subtlerMissing(c, bg)
 
 	// the emoji rows
 	tile, es := dp(gtx, 64), dp(gtx, 56)
@@ -91,7 +94,7 @@ func reactionGroupTooltip(gtx layout.Context, h Host, th *theme.Theme, c *colors
 	textW, textH := 0, 0
 	for i, txt := range gt.lines {
 		m := op.Record(gtx.Ops)
-		td := flowTip(gtx, th, tipRuns(txt, bold, reg), maxW-2*padX)
+		td := flowTip(gtx, th, tipRuns(txt, bold, reg), maxW-2*padX, bars)
 		paras = append(paras, para{m.Stop(), td})
 		textW = max(textW, td.X)
 		textH += td.Y
@@ -110,7 +113,6 @@ func reactionGroupTooltip(gtx layout.Context, h Host, th *theme.Theme, c *colors
 	if o := tip.Opacity(); o < 1 {
 		defer paint.PushOpacity(gtx.Ops, max(o, 0)).Pop()
 	}
-	bg := tip.Background(c.Tooltip)
 	arrow := pl.Arrow
 	// box and arrow, outlined together in dark mode (theme/tooltip.go)
 	theme.TooltipShape(gtx, r, dp(gtx, 8), arrow, bg, tipGlow(th))
@@ -171,7 +173,7 @@ func (r *row) groupTip(h Host, k int, selfID string) groupTip {
 		}
 		gt.urls = append(gt.urls, url)
 	}
-	if multiSkinTone[g.name] {
+	if isMultiSkintone(g.name) {
 		one := rs[g.idx[0]]
 		one.Name, one.Users = g.name, groupUsers(rs, g)
 		gt.lines = []string{reactionTipLine(h, &one, selfID, false)}
@@ -276,12 +278,18 @@ type tipRun struct {
 	txt string
 }
 
+// tipBars are the colours flowTip draws a missing reactor's MissingText
+// in (tipMissing: fill; tipMissingGone: the 1px line).
+type tipBars struct{ fill, line color.NRGBA }
+
 // flowTip lays runs out as one inline paragraph at most maxW wide: words
 // in their run's style, wrapped at spaces and between CJK characters (not
 // before closing or after opening punctuation), each line centred on the
 // widest (text-align: center); returns the size. Runs meet without a
-// space unless their text has one ("Ann" + "さんが" is one word).
-func flowTip(gtx layout.Context, th *theme.Theme, runs []tipRun, maxW int) image.Point {
+// space unless their text has one ("Ann" + "さんが" is one word). A
+// missing reactor (tipMissing, tipMissingGone) is MissingText's 120px bar
+// on the line's baseline, in bars' colours.
+func flowTip(gtx layout.Context, th *theme.Theme, runs []tipRun, maxW int, bars tipBars) image.Point {
 	type word struct {
 		st textStyle
 		s  string
@@ -298,7 +306,12 @@ func flowTip(gtx layout.Context, th *theme.Theme, runs []tipRun, maxW int) image
 		if tk.space {
 			space = measure(gtx, th, tk.st, "x x").X - measure(gtx, th, tk.st, "xx").X
 		}
-		wd := word{st: tk.st, s: tk.s, w: measure(gtx, th, tk.st, tk.s).X}
+		wd := word{st: tk.st, s: tk.s}
+		if tk.bar {
+			wd.w = dp(gtx, missingBarW)
+		} else {
+			wd.w = measure(gtx, th, tk.st, tk.s).X
+		}
 		add := wd.w
 		if len(cur.ws) > 0 {
 			add += space
@@ -329,8 +342,16 @@ func flowTip(gtx layout.Context, th *theme.Theme, runs []tipRun, maxW int) image
 	for i, l := range lines {
 		x := (wmax - l.w) / 2
 		for _, wd := range l.ws {
-			if wd.s != " " {
-				st := wd.st
+			switch st := wd.st; {
+			case wd.s == tipMissing || wd.s == tipMissingGone:
+				blh := st.lineH
+				if blh <= 0 {
+					blh = 16.25
+				}
+				bl := i*lh + cssBaseline(gtx, st.size, blh)
+				r := image.Rect(x, bl-dp(gtx, 8), x+wd.w, bl)
+				paintMissing(gtx, r, wd.s == tipMissingGone, bars.fill, bars.line)
+			case wd.s != " ":
 				at(gtx, x, i*lh, func(gtx layout.Context) layout.Dimensions {
 					return lineBox(gtx, st, func(gtx layout.Context) layout.Dimensions { return label(gtx, th, st, wd.s) })
 				})
@@ -347,6 +368,7 @@ type tipToken struct {
 	s     string
 	space bool // whitespace came before it
 	brk   bool // a line may break before it
+	bar   bool // a missing reactor's MissingText (s is its mark)
 }
 
 // tipTokens cuts runs into tokens: words split at whitespace, each CJK
@@ -371,6 +393,13 @@ func tipTokens(runs []tipRun) []tipToken {
 				flush()
 				space = true
 			case r == '\u2060': // a word joiner (group_cjk) holds its neighbours together
+			case tipMissingRune(r):
+				// a missing reactor's bar, an atomic inline: a line may
+				// break before it (UAX #14 LB20), not before the comma
+				// after it (LB13)
+				flush()
+				out = append(out, tipToken{st: run.st, s: string(r), space: space, brk: space || len(out) > 0, bar: true})
+				last, space = r, false
 			case isCJK(r):
 				flush()
 				brk := space || len(out) > 0 && !noBreakBefore(r) && !noBreakAfter(last)

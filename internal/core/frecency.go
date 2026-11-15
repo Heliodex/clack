@@ -400,19 +400,32 @@ type coreEmojiSet struct {
 	custom map[string]string
 }
 
+// The standard emoji lists below are per set ([0] 16.0, [1] 17.0:
+// emoji.V17).
 var (
-	stdFrecOnce sync.Once
-	stdFrec     []frecency.Emoji
+	stdFrecOnce [2]sync.Once
+	stdFrecList [2][]frecency.Emoji
 )
 
+// emojiSetIndex is the emoji set in use as an index into the per-set
+// caches.
+func emojiSetIndex() int {
+	if emoji.V17() {
+		return 1
+	}
+	return 0
+}
+
 func (s *coreEmojiSet) All() []frecency.Emoji {
-	stdFrecOnce.Do(func() {
-		for _, e := range emoji.StandardList() {
+	si := emojiSetIndex()
+	stdFrecOnce[si].Do(func() {
+		for _, e := range emoji.StandardListFor(si == 1) {
 			if len(e.Names) > 0 {
-				stdFrec = append(stdFrec, frecency.Emoji{Name: e.Names[0], ID: frecency.EmojiID(e.Unicode, e.Names[0])})
+				stdFrecList[si] = append(stdFrecList[si], frecency.Emoji{Name: e.Names[0], ID: frecency.EmojiID(e.Unicode, e.Names[0])})
 			}
 		}
 	})
+	stdFrec := stdFrecList[si]
 	names := make([]string, 0, len(s.custom))
 	for n, v := range s.custom {
 		if !strings.HasPrefix(v, "alias:") {
@@ -448,8 +461,8 @@ func (s *coreEmojiSet) Canonical(name string) (string, bool) {
 }
 
 var (
-	stdByUniOnce sync.Once
-	stdByUni     map[string]string // unicode -> primary name
+	stdByUniOnce [2]sync.Once
+	stdByUniMap  [2]map[string]string // unicode -> primary name
 )
 
 // EmojiFrecencyName maps an emoji frecency id back to its name: a
@@ -460,15 +473,17 @@ func EmojiFrecencyName(id string) string {
 	if !ok || rest == "" {
 		return ""
 	}
-	stdByUniOnce.Do(func() {
-		stdByUni = map[string]string{}
-		for _, e := range emoji.StandardList() {
+	si := emojiSetIndex()
+	stdByUniOnce[si].Do(func() {
+		m := map[string]string{}
+		for _, e := range emoji.StandardListFor(si == 1) {
 			if len(e.Names) > 0 {
-				stdByUni[e.Unicode] = e.Names[0]
+				m[e.Unicode] = e.Names[0]
 			}
 		}
+		stdByUniMap[si] = m
 	})
-	if n, ok := stdByUni[rest]; ok {
+	if n, ok := stdByUniMap[si][rest]; ok {
 		return n
 	}
 	return rest

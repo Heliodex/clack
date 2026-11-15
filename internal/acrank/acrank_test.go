@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/some-du6e/clack/internal/frecency"
+	"github.com/some-du6e/clack/internal/paritytest"
 )
 
 var t0 = time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
@@ -63,21 +64,18 @@ func TestMatcherScores(t *testing.T) {
 	}
 }
 
-// Values from Slack's own PositionAwareFuzzyMatcher (j8FV) run in node.
+// Values from Slack's own PositionAwareFuzzyMatcher (j8FV) run in node,
+// in testdata/parity/fuzzy-similarity.json (docs/PARITY.md).
 func TestSimilarityOracle(t *testing.T) {
-	cases := []struct {
-		q, c string
-		want float64
-	}{
-		{"kar", "karim", 0.898877105}, {"kar", "akari", 0.466084425}, {"karim", "karim", 1}, {"k", "karim", 0},
-		{"gen", "general", 0.872594591}, {"sweat-sm", "sweat_smile", 0.920906099}, {"ale", "alex", 0.928279122},
-		{"ale", "alexis", 0.882777292},
+	type pair struct {
+		Q    string `json:"q"`
+		Name string `json:"name"`
 	}
-	for _, c := range cases {
-		if got := Similarity(c.q, c.c); math.Abs(got-c.want) > 1e-8 {
-			t.Errorf("Similarity(%q, %q) = %.9f, want %.9f", c.q, c.c, got, c.want)
-		}
-	}
+	s := paritytest.Load[pair, float64](t, "testdata/parity/fuzzy-similarity.json")
+	s.Run(t, paritytest.Check[pair, float64]{
+		Clack: func(t *testing.T, p pair) float64 { return Similarity(p.Q, p.Name) },
+		Same:  func(slack, clack float64) bool { return math.Abs(clack-slack) <= 1e-8 },
+	})
 }
 
 func TestSimilarity(t *testing.T) {

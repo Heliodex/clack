@@ -134,6 +134,9 @@ type actDesc struct {
 	typeIcon  string // Dense: the 20px type icon after the status
 	list      *actListBody
 	nameDense string // the sender in Dense rows ("Ana +2")
+	// nameBlank: an empty name is blank, not BaseMissingMember's bar
+	// (BaseInviteSenderName names an inviter the store can't name "")
+	nameBlank bool
 	team      string // a Slack Connect inviter's organisation, after the name
 	teamIcon  string // its icon (TeamIcon, 16px), in both densities
 	subtext   string // before the message body ("You: ", "Ana Example: ")
@@ -157,6 +160,11 @@ type actDesc struct {
 	invite bool
 	dm     bool
 	hay    string // lower-cased search haystack
+	// waits are the members (and bots) the row named without a name yet
+	// (missing_member.go): the sender's bar, a participant's, a group
+	// DM's member left out of its title. "names" listing one describes
+	// the row again (membersIn).
+	waits []string
 }
 
 type actRow struct {
@@ -197,6 +205,8 @@ type actRow struct {
 	// nameHov is Slack's ProfileHoverTrigger on a reaction row's reactor
 	// (ActivityItemMember in "X reacted to your message").
 	nameHov hovercard.Trigger
+	// missTip is the sender's BaseMissingMember tooltip (missing_member.go)
+	missTip missTip
 
 	// The read row's mark (actMark) and its tooltip; the Detailed
 	// reminder's Mark Complete button; the invite's text actions.
@@ -216,6 +226,16 @@ type actRow struct {
 	agentUntil time.Time
 	agentHov   gesture.Hover
 	agentTip   popups.TipState
+
+	// The agent entry's Block Kit actions (activity_leftovers.go): its
+	// element host, the block's size last frame and the press target over
+	// the buttons it drew.
+	actRq   actRowActions
+	actEls  *actActionsEls
+	actSize image.Point
+	actTag  struct{}
+	// where the hover bar went last (its top on the row, its right inset)
+	barY, barRight int
 }
 
 // Activity is the Activity view.
@@ -387,6 +407,9 @@ type Activity struct {
 	// activity_rows.go); stk the sticky section header (Eojr e5).
 	typing actTyping
 	stk    actStickyHdr
+	// lo is the tab strip's More, the tooltips and the sort button's
+	// "new" badge (activity_leftovers.go).
+	lo actLeftovers
 }
 
 // NewActivity builds the Activity view; it loads on first Layout.
@@ -445,10 +468,17 @@ func (v *Activity) watchItems() {
 				// core looked a conversation up (LookupConv) or named
 				// channels in the background: the rows waiting for a
 				// channel's name read it again, as Slack's entities
-				// render again once the fetch upserts the channel
-				if actConvIDs(ev.Users) {
+				// render again once the fetch upserts the channel; the
+				// member fetcher's (and bots.info's) carry the people a
+				// row drew without a name (membersIn)
+				ids := ev.Users
+				if len(ids) > 0 {
+					conv := actConvIDs(ids)
 					v.notes.mu.Lock()
-					v.notes.fns = append(v.notes.fns, v.namesIn)
+					if conv {
+						v.notes.fns = append(v.notes.fns, v.namesIn)
+					}
+					v.notes.fns = append(v.notes.fns, func() { v.membersIn(ids) })
 					v.notes.mu.Unlock()
 					v.h.Invalidate()
 				}
@@ -503,6 +533,19 @@ func actConvIDs(ids []string) bool {
 func (v *Activity) namesIn() {
 	for _, r := range v.rows {
 		if r.built && r.d.entOn && r.d.ent.Loading() {
+			r.built = false
+			v.dirty = true
+		}
+	}
+}
+
+// membersIn describes again the rows that drew a member (or a bot) "names"
+// lists without a name (actDesc.waits), keeping their widgets: the store
+// has them now, or knows they don't exist, as Slack's rows render again
+// once the fetch upserts the member.
+func (v *Activity) membersIn(ids []string) {
+	for _, r := range v.rows {
+		if r.built && namesAny(r.d.waits, ids) {
 			r.built = false
 			v.dirty = true
 		}
@@ -1041,7 +1084,16 @@ func (v *Activity) isUnread(it *core.ActivityItem, key string) bool {
 	return it.Unread
 }
 
+// describe is the row's text for it, with the members it couldn't name
+// yet (waits): the row is described again when "names" lists one.
 func (v *Activity) describe(it *core.ActivityItem, refs map[string]core.ConvRef) actDesc {
+	var d actDesc
+	waits := v.recording(func() { d = v.describeItem(it, refs) })
+	d.waits = waits
+	return d
+}
+
+func (v *Activity) describeItem(it *core.ActivityItem, refs map[string]core.ConvRef) actDesc {
 	d := actDesc{at: tsTime(it.FeedTS), thread: actThread(it)}
 	d.when, d.whenNarrow = actWhen(time.Now(), d.at, false), actWhen(time.Now(), d.at, true) // activity_time.go
 	kind := ""
@@ -1091,10 +1143,11 @@ func (v *Activity) describe(it *core.ActivityItem, refs map[string]core.ConvRef)
 	if it.Actor != "" {
 		if u, ok := v.user(it.Actor); ok {
 			actor, actorAv = displayName(u), u.Avatar
-		} else if actor == "" {
-			actor = v.userName(it.Actor)
 		}
 	}
+	// the item has a person behind it, named or not yet (an actor the
+	// store can't name is "": the sender's bar)
+	hasActor := actor != "" || it.Actor != ""
 	if name == "" && actor != "" {
 		name, av = actor, actorAv
 	}
@@ -1142,16 +1195,21 @@ func (v *Activity) describe(it *core.ActivityItem, refs map[string]core.ConvRef)
 		}
 	case actExternal(it.Type):
 		// InviteSenderName: "{user} from {team}", else "Slack Connect
-		// Invitation"; ExternalInviteContent for the body.
-		d.name, d.avatar = firstNonEmpty(actor, i18n.T("slack_connect", "Slack Connect Invitation")), actorAv
-		if actor != "" {
+		// Invitation"; ExternalInviteContent for the body. The user is
+		// BaseInviteSenderName's getPrefCompliantMemberNameById, ""
+		// for an inviter the store can't name yet: blank, not the bar.
+		d.name, d.avatar = actor, actorAv
+		if !hasActor {
+			d.name = i18n.T("slack_connect", "Slack Connect Invitation")
+		} else {
+			d.nameBlank = actor == ""
 			d.team = it.Team
 			if it.Invite != nil {
 				d.teamIcon = it.Invite.TeamIcon
 			}
 		}
 		switch {
-		case it.InviteStatus == "revoked" || it.InviteStatus == "expired" || actor == "":
+		case it.InviteStatus == "revoked" || it.InviteStatus == "expired" || !hasActor:
 			body(nsActivity.T("You received an invitation that has been ignored, expired, or is no longer available for another reason."))
 		case it.Type == "external_dm_invite":
 			body(nsActivity.T("invited you to direct message"))
@@ -1163,7 +1221,7 @@ func (v *Activity) describe(it *core.ActivityItem, refs map[string]core.ConvRef)
 		d.tile = d.avatar == ""
 	case it.Type == "internal_channel_invite" || it.Type == "quietly_added_to_channel":
 		// InviteContent: the message text becomes "invited you to <#C>".
-		if it.Type == "quietly_added_to_channel" && actor != "" {
+		if it.Type == "quietly_added_to_channel" && hasActor {
 			d.name, d.avatar = actor, actorAv
 		}
 		// "invited you to <#{channelId}|{channelName}>": the channel
@@ -1178,7 +1236,7 @@ func (v *Activity) describe(it *core.ActivityItem, refs map[string]core.ConvRef)
 	case it.Type == "shared_workspace_invite":
 		body("")
 	case it.Type == "team_joiner_invite":
-		if actor != "" {
+		if hasActor {
 			d.name, d.avatar = actor, actorAv
 		}
 		if it.JoinerReminder {
@@ -1187,7 +1245,7 @@ func (v *Activity) describe(it *core.ActivityItem, refs map[string]core.ConvRef)
 			body(nsActivity.T("Accepted your invitation to join Slack \u2014\u00a0take a second to say hello."))
 		}
 	case it.Type == "prejoin_dm_welcome_party_alert":
-		if actor != "" {
+		if hasActor {
 			d.name, d.avatar = actor, actorAv
 		}
 		body(nsActivity.T("Was invited to join {teamName} \u2014 take a second to say hello.", "teamName", v.teamName()))
@@ -1372,7 +1430,7 @@ func (v *Activity) head(gtx C) D {
 					if !v.headerSort() {
 						return D{}
 					}
-					return layout.Inset{Left: 8}.Layout(gtx, func(gtx C) D { return v.iconButton(gtx, &v.sortBtn, "sort", 28, 20, v.p.Sec) })
+					return layout.Inset{Left: 8}.Layout(gtx, v.sortTrigger) // activity_leftovers.go
 				}),
 				hgap(8),
 				layout.Rigid(func(gtx C) D { return v.iconButton(gtx, &v.kebab, "more", 28, 20, v.p.Sec) }),
@@ -1390,10 +1448,14 @@ func (v *Activity) head(gtx C) D {
 				g := gtx
 				g.Constraints.Min = image.Point{}
 				plusCol := v.p.Sec
+				tip := nsActivity.T("Add new view")
 				if v.viewCount() >= actMaxViews {
 					plusCol = v.p.Faint // isAddTabDisabled: 15 views
+					tip = nsActivity.T("You can only save up to {maxTabCount} tabs. Delete one to save a new tab.", "maxTabCount", actMaxViews)
 				}
-				v.iconButton(g, &v.plus, "plus", 24, 16, plusCol)
+				pd := v.iconButton(g, &v.plus, "plus", 24, 16, plusCol)
+				// CustomAddTabItem's tooltip, above it (eT tooltipText)
+				popups.Tooltip(g, v.th, &v.lo.plusTip, v.plus.Hovered(), pd.Size, popups.Above, tip, "")
 				st.Pop()
 				v.plusX = gtx.Dp(16) + x
 				return D{Size: image.Pt(gtx.Constraints.Max.X, d.Size.Y)}
@@ -1769,7 +1831,18 @@ func (v *Activity) items(gtx C) D {
 	v.listFocusEvents(gtx)
 	area := v.listFocusArea(gtx, image.Rectangle{Max: gtx.Constraints.Max})
 	v.stk.begin()
+	lead := v.leadIn(gtx) // activity_rows.go
+	v.stk.lead = lead
 	d := v.scrollList(gtx, &v.list, n+1, func(gtx C, i int) D {
+		if i == 0 && lead > 0 {
+			// the lead-in above the first item, outside its hit area
+			st := op.Offset(image.Pt(0, lead)).Push(gtx.Ops)
+			d := v.listItem(gtx, &page, i, n, failed)
+			st.Pop()
+			d.Size.Y += lead
+			v.stk.h[i] = d.Size.Y
+			return d
+		}
 		d := v.listItem(gtx, &page, i, n, failed)
 		v.stk.h[i] = d.Size.Y
 		return d
@@ -1941,7 +2014,14 @@ func (v *Activity) footer(gtx C, failed bool) D {
 func (v *Activity) row(gtx C, it *core.ActivityItem, i int) D {
 	key := actKey(it)
 	r := v.rowFor(key)
-	clicked := r.click.Clicked(gtx)
+	// a click on an agent entry's action button (activity_leftovers.go)
+	// marks the row read and doesn't open it (ControlledClick skips a
+	// BUTTON target)
+	onActions := v.agentActionsClicked(gtx, r)
+	clicked := r.click.Clicked(gtx) && !onActions
+	if onActions && v.isUnread(it, key) {
+		v.markRead(it, key)
+	}
 	if clicked && v.pk.peeking { // the peek's row: maybeClosePeek, then the item in Activity
 		v.openFromPeek(it, key, r)
 	} else if clicked {
@@ -2002,6 +2082,13 @@ func (v *Activity) row(gtx C, it *core.ActivityItem, i int) D {
 			v.actMenuOpen(v.pointerAt(), *it, key, unread)
 		}
 	}
+	if r.built && len(r.d.waits) > 0 && v.waitOver(r.d.waits) {
+		// a member the row drew without a name is in the store now (or
+		// known not to exist) before a "names" said so, e.g. another
+		// view's fetch: describe it again (missing_member.go)
+		r.built = false
+		v.dirty = true
+	}
 	if v.dirty {
 		// A click above changed rows (or the pane) already drawn this
 		// frame: draw again.
@@ -2044,20 +2131,28 @@ func (v *Activity) row(gtx C, it *core.ActivityItem, i int) D {
 		}
 	}
 	if (sel || focused || r.click.Hovered() || r.bar.Hovered()) && !v.underSticky(gtx, i) {
-		y := -gtx.Dp(25)
-		if v.dense {
+		// activity_multi_line_row_content__actions_toggle, inside the
+		// content box (the container's 12px padding): top 2px,
+		// translateY(-100%), above the row; --firstEntry (the row after
+		// the top-anchor-hack item, list item 0) top 4px with no
+		// transform, inside it; --peek top -4px, right 0, inside it
+		y, right := -gtx.Dp(25), gtx.Dp(16)
+		switch {
+		case v.dense:
 			// activity_single_line_row_content__actions_toggle: centred on
 			// the row (top 50%, translateY(-50%)), right -4px
 			y = (d.Size.Y - gtx.Dp(40)) / 2
-		} else if i == v.list.Position.First {
-			// Keep the first visible row's bar inside the list's clip.
-			y = min(max(y, v.list.Position.Offset), d.Size.Y-gtx.Dp(40))
+		case v.pk.peeking:
+			y, right = gtx.Dp(12-4), gtx.Dp(20)
+		case i == 0:
+			y = gtx.Dp(12 + 4)
 		}
 		barW := d.Size.X
 		if v.triage() {
 			barW -= gtx.Dp(actTriageEnd) // the card's right edge
 		}
-		v.hoverBar(gtx, r, unread, barW, y)
+		r.barY, r.barRight = y, right
+		v.hoverBar(gtx, r, unread, barW, y, right)
 	}
 	return d
 }
@@ -2273,22 +2368,30 @@ func (r *actRow) nameText(gtx C, st slackc.Styled, blur bool) D {
 	if v.dense && r.cur.nameDense != "" {
 		name = r.cur.nameDense
 	}
-	if name == "" { // the sender isn't known yet: Slack's loading shimmer
-		return v.shimmerLine(gtx, 120)
-	}
 	if r.nameMax > 0 {
 		gtx.Constraints.Max.X = min(gtx.Constraints.Max.X, r.nameMax)
 	}
-	var d D
-	switch {
-	case blur:
-		return v.blurPara(gtx, size, 22, r.nameW, col, name)
-	case v.dense:
-		d = v.label(gtx, size, r.nameW, col, name)
-	default:
-		d = v.para(gtx, size, 22, r.nameW, col, 1, name)
+	line := func(gtx C, s string) D {
+		switch {
+		case blur:
+			return v.blurPara(gtx, size, 22, r.nameW, col, s)
+		case v.dense:
+			return v.label(gtx, size, r.nameW, col, s)
+		}
+		return v.para(gtx, size, 22, r.nameW, col, 1, s)
 	}
-	r.nameHov.Layout(gtx, r.reactor(), d.Size)
+	if name == "" {
+		if r.cur.nameBlank {
+			return line(gtx, "")
+		}
+		// no sender, or one the store can't name yet: BaseMissingMember
+		// (missing_member.go), its default type, on the name's line
+		return v.missingBar(gtx, false, &r.missTip, func(gtx C) D { return line(gtx, "") })
+	}
+	d := line(gtx, name)
+	if !blur {
+		r.nameHov.Layout(gtx, r.reactor(), d.Size)
+	}
 	return d
 }
 
@@ -3099,7 +3202,7 @@ func (v *Activity) actAvatarOf(gtx C, d *actDesc, size unit.Dp) D {
 // hoverBar is the row's floating action bar (ActivityRowContentActions):
 // at the top-right, straddling the row's top border; 32x32 buttons with
 // 18px icons, 4px padding, as many as the item has (hoverButtons).
-func (v *Activity) hoverBar(gtx C, r *actRow, unread bool, rowW, y int) {
+func (v *Activity) hoverBar(gtx C, r *actRow, unread bool, rowW, y, right int) {
 	btns := v.hoverButtons(r.it, unread)
 	if len(btns) == 0 {
 		return
@@ -3108,7 +3211,7 @@ func (v *Activity) hoverBar(gtx C, r *actRow, unread bool, rowW, y int) {
 	if len(btns) > 0 && btns[0] == actBtnComplete {
 		bw += gtx.Dp(12) // markCompleteIconButton: margin-right 12px
 	}
-	x := max(0, rowW-bw-gtx.Dp(16))
+	x := max(0, rowW-bw-right)
 	defer op.Offset(image.Pt(x, y)).Push(gtx.Ops).Pop()
 	g := gtx
 	g.Constraints = layout.Exact(image.Pt(bw, bh))

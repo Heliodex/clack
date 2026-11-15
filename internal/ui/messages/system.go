@@ -154,8 +154,10 @@ func systemText(h Host, app *core.App, m *core.Message, redesigned bool) (spans 
 			spans = append(spans, hiddenSpan(id))
 			return
 		}
-		name := id
-		if u, ok := app.User(id); ok && u.Name != "" {
+		// RollupName (quVX): getPrefCompliantMemberNameById's name, ""
+		// for the unknown stub and a non-existent member, never the id
+		name := ""
+		if u, ok := app.User(id); ok {
 			name = u.Name
 		} else {
 			missing = true // asked for by the lookup; drawn again at "names"

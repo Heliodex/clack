@@ -7,15 +7,23 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/some-du6e/clack/internal/acrank"
 	"github.com/some-du6e/clack/internal/emoji"
 )
 
 // Emoji data for the picker and the composer's ":" autocomplete.
 //
-// The standard table (internal/emoji.StandardData(), iamcal order) is parsed
-// once. An emojiIndex combines it with the workspace's custom emoji
+// The standard table (internal/emoji.StandardData(), iamcal order) of each
+// of Slack's two sets is parsed once; the account's emoji_v17 group picks
+// the set (emoji.V17), so an index is built for one set and rebuilt when
+// it changes. The picker's groups are the set's category table
+// (emoji.Categories: getTranslatedEmojiCategories lists each group's
+// emoji as Slack's table does, and a standard emoji in no group only
+// shows up in search and the ":" list). An emojiIndex combines the table
+// with the workspace's custom emoji
 // (Hack Club has ~65,000) into id-indexed slices: ids [0, nStd) are standard
 // emoji, the rest custom emoji sorted by name. Custom aliases are attached
 // to their target as extra names (they are not separate grid cells), broken
@@ -78,31 +86,61 @@ var epSkinCodes = [5]string{"1F3FB", "1F3FC", "1F3FD", "1F3FE", "1F3FF"}
 
 // epStdTable is the parsed standard emoji table.
 type epStdTable struct {
-	names  [][]string // first is primary
-	image  []string   // file stem
-	group  []uint8
+	names [][]string // first is primary
+	image []string   // file stem
+	// groups are the picker's standard groups (epGroupSmileys through
+	// epGroupFlags), the ids of each in its category's order
+	groups [epNumGroups][]int32
 	skins  []int16     // index into skin, -1 none
 	skin   [][5]string // file stems for tones 2..6
 	byName map[string]int32
+	// keywords are Slack's keywords of each emoji, normalized
+	// (emoji.Keywords of the primary name; the ":" autocomplete's
+	// matchKeywords); order lists the ids in Slack's consolidated order
+	// (getConsolidatedEmoji), names Slack doesn't list last
+	keywords [][]string
+	order    []int32
+	v17      bool // the 17.0 set's table (epStandardFor)
 }
 
 var (
-	epStdOnce sync.Once
-	epStd     *epStdTable
+	epStdOnce [2]sync.Once // [0] the 16.0 set, [1] the 17.0 one
+	epStd     [2]*epStdTable
 )
 
-func epStandard() *epStdTable {
-	epStdOnce.Do(func() { epStd = epParseStd(emoji.StandardData()) })
-	return epStd
+// epStandard is the parsed table of the set in use.
+func epStandard() *epStdTable { return epStandardFor(emoji.V17()) }
+
+// epStandardFor is the 17.0 set's table (v17) or the 16.0 one's.
+func epStandardFor(v17 bool) *epStdTable {
+	i := 0
+	if v17 {
+		i = 1
+	}
+	epStdOnce[i].Do(func() {
+		epStd[i] = epParseStd(emoji.StandardDataFor(v17), emoji.CategoriesFor(v17))
+		epStd[i].v17 = v17
+	})
+	return epStd[i]
 }
 
-// epParseStd parses an iamcal-style table ({"emoji":[{n,i,c,s}]}).
-func epParseStd(b []byte) *epStdTable {
+// epCategoryGroups maps Slack's category names to the picker's groups.
+// "Skin Tones" has none: the picker leaves it out (bEcp's
+// getTranslatedEmojiCategories).
+var epCategoryGroups = map[string]int{
+	"Smileys & People": epGroupSmileys, "Animals & Nature": epGroupAnimals, "Food & Drink": epGroupFood,
+	"Travel & Places": epGroupTravel, "Activities": epGroupActivities, "Objects": epGroupObjects,
+	"Symbols": epGroupSymbols, "Flags": epGroupFlags,
+}
+
+// epParseStd parses an iamcal-style table ({"emoji":[{n,i,s}]}) and lays
+// its emoji out in cats' groups, in cats' order (names the table lacks
+// are skipped).
+func epParseStd(b []byte, cats []emoji.Category) *epStdTable {
 	var f struct {
 		Emoji []struct {
 			Names []string          `json:"n"`
 			Image string            `json:"i"`
-			Cat   int               `json:"c"`
 			Skins map[string]string `json:"s"`
 		} `json:"emoji"`
 	}
@@ -113,10 +151,6 @@ func epParseStd(b []byte) *epStdTable {
 			continue
 		}
 		id := int32(len(t.names))
-		g := uint8(epGroupSmileys)
-		if e.Cat >= 2 && e.Cat <= 8 {
-			g = uint8(e.Cat)
-		}
 		sk := int16(-1)
 		if len(e.Skins) > 0 {
 			var v [5]string
@@ -133,7 +167,6 @@ func epParseStd(b []byte) *epStdTable {
 		}
 		t.names = append(t.names, e.Names)
 		t.image = append(t.image, e.Image)
-		t.group = append(t.group, g)
 		t.skins = append(t.skins, sk)
 		for _, n := range e.Names {
 			if _, dup := t.byName[n]; !dup {
@@ -150,6 +183,34 @@ func epParseStd(b []byte) *epStdTable {
 			}
 		}
 	}
+	t.keywords = make([][]string, len(t.names))
+	t.order = make([]int32, len(t.names))
+	pos := make([]int, len(t.names))
+	for i, ns := range t.names {
+		if kws := emoji.Keywords(ns[0]); len(kws) > 0 {
+			norm := make([]string, len(kws))
+			for j, k := range kws {
+				norm[j] = acrank.Normalize(k)
+			}
+			t.keywords[i] = norm
+		}
+		t.order[i] = int32(i)
+		if pos[i] = emoji.SlackOrder(ns[0]); pos[i] < 0 {
+			pos[i] = 1<<20 + i
+		}
+	}
+	sort.SliceStable(t.order, func(a, b int) bool { return pos[t.order[a]] < pos[t.order[b]] })
+	for _, c := range cats {
+		g, ok := epCategoryGroups[c.Name]
+		if !ok {
+			continue
+		}
+		for _, n := range c.Names {
+			if id, ok := t.byName[n]; ok {
+				t.groups[g] = append(t.groups[g], id)
+			}
+		}
+	}
 	return t
 }
 
@@ -157,6 +218,7 @@ func epParseStd(b []byte) *epStdTable {
 type epKey struct {
 	n     int // len(custom map)
 	style string
+	v17   bool // the standard set (emoji.V17)
 }
 
 // emojiIndex is the combined standard + custom emoji table.
@@ -179,7 +241,7 @@ type emojiIndex struct {
 	sID    []int32
 }
 
-func epStdURL(style, stem string) string { return emoji.URL(stem, style) }
+func epStdURL(style, stem string, v17 bool) string { return emoji.URLFor(stem, style, v17) }
 
 // epBuild builds the index. custom maps name -> URL or "alias:target".
 func epBuild(std *epStdTable, style string, custom map[string]string) *emojiIndex {
@@ -187,7 +249,7 @@ func epBuild(std *epStdTable, style string, custom map[string]string) *emojiInde
 		style = emoji.Style()
 	}
 	nStd := len(std.names)
-	x := &emojiIndex{key: epKey{len(custom), style}, std: std, nStd: nStd}
+	x := &emojiIndex{key: epKey{len(custom), style, std.v17}, std: std, nStd: nStd}
 	n := nStd + len(custom)
 	x.names = make([]string, nStd, n)
 	x.urls = make([]string, nStd, n)
@@ -196,15 +258,16 @@ func epBuild(std *epStdTable, style string, custom map[string]string) *emojiInde
 	x.skins = make([][5]string, len(std.skin))
 	for i, v := range std.skin {
 		for t, stem := range v {
-			x.skins[i][t] = epStdURL(style, stem)
+			x.skins[i][t] = epStdURL(style, stem, std.v17)
 		}
 	}
 	for i := 0; i < nStd; i++ {
 		x.names[i] = std.names[i][0]
-		x.urls[i] = epStdURL(style, std.image[i])
+		x.urls[i] = epStdURL(style, std.image[i], std.v17)
 		x.skin[i] = std.skins[i]
-		g := std.group[i]
-		x.group[g] = append(x.group[g], int32(i))
+	}
+	for g := range std.groups {
+		x.group[g] = append(x.group[g], std.groups[g]...)
 	}
 	for name, id := range std.byName {
 		x.byName[name] = id
@@ -305,6 +368,9 @@ func (x *emojiIndex) url(id int32, tone int) string {
 	}
 	return x.urls[id]
 }
+
+// current reports whether x is of the standard set in use.
+func (x *emojiIndex) current() bool { return x.key.v17 == emoji.V17() }
 
 // hasSkins reports whether id has skin tone variants.
 func (x *emojiIndex) hasSkins(id int32) bool { return x.skin[id] >= 0 }
@@ -531,19 +597,24 @@ func (s *epSearcher) emit(x *emojiIndex, rows []int32, r, limit int) bool {
 
 // ---- index cache ----
 //
-// One full index is cached per process, keyed by the custom map's length
-// and the emoji style, so reopening the picker is instant. Standard-only
-// indexes (what the picker shows while the full one builds) are cached per
-// style.
+// One full index is cached per process, keyed by the custom map's length,
+// the emoji style and the standard set, so reopening the picker is
+// instant. Standard-only indexes (what the picker shows while the full one
+// builds) are cached per style and set.
 
 var (
-	epCacheMu  sync.Mutex
-	epFull     *emojiIndex
-	epStdIdx   = map[string]*emojiIndex{}
-	epBuilding = map[epKey]bool{}
+	epCacheMu sync.Mutex
+	epFull    *emojiIndex
+	epStdIdx  = map[epStdKey]*emojiIndex{}
+	// epBuilding holds the builds in flight; each channel closes once its
+	// index is installed
+	epBuilding = map[epKey]chan struct{}{}
 
 	epLastUse  time.Time // guarded by epCacheMu
 	epReleaser sync.Once
+
+	// epFullGen counts the full indexes installed (EmojiIndexGen)
+	epFullGen atomic.Uint64
 )
 
 // epIndexIdle: the full index (65k custom emoji on Hack Club, ~10 MB) is
@@ -574,66 +645,112 @@ func epNoteUse() {
 // macOS, Google's elsewhere); no pref picks it.
 func epStyle(Host) string { return emoji.Style() }
 
-func epStdIndex(style string) *emojiIndex {
+// epStdKey identifies a standard-only index.
+type epStdKey struct {
+	style string
+	v17   bool
+}
+
+func epStdIndex(style string, v17 bool) *emojiIndex {
+	k := epStdKey{style, v17}
 	epCacheMu.Lock()
-	x := epStdIdx[style]
+	x := epStdIdx[k]
 	epCacheMu.Unlock()
 	if x != nil {
 		return x
 	}
-	x = epBuild(epStandard(), style, nil)
+	x = epBuild(epStandardFor(v17), style, nil)
 	epCacheMu.Lock()
-	epStdIdx[style] = x
+	epStdIdx[k] = x
 	epCacheMu.Unlock()
 	return x
 }
 
 // epIndexFor returns the best available index for h and whether it is
 // complete (includes the current custom emoji). When it isn't, a build is
-// started off the UI goroutine; h is invalidated when it lands. Must be
-// called on the UI goroutine.
+// started off the UI goroutine; the build installs the index itself (so
+// EnsureEmojiIndex can wait for it) and h is invalidated when it lands.
+// Must be called on the UI goroutine.
 func epIndexFor(h Host) (*emojiIndex, bool) {
+	x, ok, _ := epIndexBuild(h)
+	return x, ok
+}
+
+// epIndexBuild is epIndexFor, plus the channel of the build it is waiting
+// on (nil when complete).
+func epIndexBuild(h Host) (*emojiIndex, bool, chan struct{}) {
 	epNoteUse()
 	epNoteCore(h)
 	style := epStyle(h)
+	v17 := emoji.V17()
 	var custom map[string]string
 	if h != nil && h.Core() != nil {
 		custom = h.Core().CustomEmoji()
 	}
 	if len(custom) == 0 {
-		return epStdIndex(style), true
+		return epStdIndex(style, v17), true, nil
 	}
-	key := epKey{len(custom), style}
+	key := epKey{len(custom), style, v17}
 	epCacheMu.Lock()
 	full := epFull
-	building := epBuilding[key]
-	if full == nil || full.key != key {
-		epBuilding[key] = true
+	if full != nil && full.key == key {
+		epCacheMu.Unlock()
+		return full, true, nil
+	}
+	done, building := epBuilding[key]
+	if !building {
+		done = make(chan struct{})
+		epBuilding[key] = done
 	}
 	epCacheMu.Unlock()
-	if full != nil && full.key == key {
-		return full, true
-	}
 	if !building {
-		std := epStandard()
-		run(h, func(ctx context.Context) (*emojiIndex, error) {
-			return epBuild(std, style, custom), nil
-		}, func(x *emojiIndex, _ error) {
+		std := epStandardFor(v17)
+		run(h, func(ctx context.Context) (struct{}, error) {
+			x := epBuild(std, style, custom)
 			epCacheMu.Lock()
 			delete(epBuilding, key)
-			if x != nil {
-				epFull = x
-			}
+			epFull = x
+			epFullGen.Add(1)
 			epCacheMu.Unlock()
+			close(done)
+			return struct{}{}, nil
+		}, func(struct{}, error) {
 			if h != nil {
 				h.Invalidate()
 			}
 		})
 	}
-	if full != nil && full.key.style == style {
-		return full, false // stale but close: better than standard only
+	if full != nil && full.key.style == style && full.key.v17 == v17 {
+		return full, false, done // stale but close: better than standard only
 	}
-	return epStdIndex(style), false
+	return epStdIndex(style, v17), false, done
+}
+
+// EmojiIndexGen counts the full emoji indexes (the standard set with the
+// workspace's custom emoji) that have landed. The ":" lists rank again
+// when it changes: rows ranked while the index was building came from the
+// standard set alone, or from the index before the latest emoji_changed.
+func EmojiIndexGen() uint64 { return epFullGen.Load() }
+
+// EnsureEmojiIndex makes sure the emoji index for h holds h's custom
+// emoji. It starts the build when none runs (as the first picker or ":"
+// list does: it takes ~170 ms for Hack Club's 65,908) and waits at most
+// wait for it. It reports whether the index is complete. UI goroutine
+// only; the wait blocks it.
+func EnsureEmojiIndex(h Host, wait time.Duration) bool {
+	_, ok, done := epIndexBuild(h)
+	if ok || wait <= 0 || done == nil {
+		return ok
+	}
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	select {
+	case <-done:
+	case <-t.C:
+		return false
+	}
+	_, ok = epIndexFor(h)
+	return ok
 }
 
 // ---- exported API for the composer ----

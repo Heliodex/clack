@@ -155,17 +155,23 @@ func hostMemberLink(gtx layout.Context, h *slackc.Host) layout.Dimensions {
 	if btn.Clicked(gtx) && id != "" && lastHost != nil {
 		lastHost.OpenProfile(hostAnchor(image.Point{}), id)
 	}
+	th := h.Theme()
+	c := colorsFor(th)
+	name := id // no core: the id
+	if app := hostCore(); app != nil && id != "" {
+		u, ok := app.User(id)
+		if !ok {
+			// MemberLink returns BaseMissingMember for the unknown stub
+			// (the lookup asked for it: "names" draws it again) and for a
+			// non-existent member, before its link and children
+			s := textStyle{size: float32(st.FontSize(15)), weight: theme.Bold}
+			return missingName(gtx, s, app.MissingMember(id) == core.MemberNonExistent, c)
+		}
+		name = u.Name
+	}
 	if h.HasChildren() {
 		return btn.Layout(gtx, h.Children)
 	}
-	name := id
-	if app := hostCore(); app != nil {
-		if u, ok := app.User(id); ok && u.Name != "" {
-			name = u.Name
-		} // else asked for by the lookup: the id until "names"
-	}
-	th := h.Theme()
-	c := colorsFor(th)
 	return btn.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		return label(gtx, th, textStyle{size: float32(st.FontSize(15)), weight: theme.Bold, col: st.Color(c.Link)}, name)
 	})

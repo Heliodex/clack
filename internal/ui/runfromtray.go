@@ -22,6 +22,25 @@ import (
 // The tray icon's click (handleTrayClick @1178197 → FOREGROUND_APP →
 // FOCUS_WINDOW's i6 @796332: show, focus) brings the window back:
 // cmd/clack's tray calls Raise, which shows a hidden window (Gio patch 13).
+//
+// macOS (W35): runFromTray defaults to true there too (mac main.bundle.cjs
+// @1118024), and the same MAIN_WINDOW_CLOSE (@1148845) hides the window
+// with no tray icon at all: the Dock icon stays, and its click (app's
+// activate, @1149631) or the app coming to the front (did-become-active)
+// shows the window again (window_darwin.m). The RunFromTray balloon needs
+// the menu bar icon, which the mac TrayHandler makes only for Slackbot
+// Mini, so there the shell logs that the tray icon doesn't exist and shows
+// nothing; hasRunFromTray is set all the same. Gio patch 24 hides the
+// window (orderOut:).
+
+// closeHidesWithoutTray: a close hides the window even with no tray icon
+// (macOS: the Dock icon brings it back; titlebar_darwin.go).
+var closeHidesWithoutTray bool
+
+// hideLeavesFullscreen: the platform's Window.Hide leaves full screen
+// before it hides, once the window has left it (macOS: Gio patch 24, as
+// Slack's hx awaits leave-full-screen), so closeToTray doesn't ask for it.
+var hideLeavesFullscreen bool
 
 // TrayIcon is the notification-area icon cmd/clack runs (desktop.Tray on
 // Windows).
@@ -36,13 +55,20 @@ type trayRef struct{ t TrayIcon }
 // SetTray tells the App a notification-area icon is running (nil: none),
 // so closing the window keeps Clack running there (Preferences > Advanced
 // > "Leave app running in notification area when the window is closed").
-// Any goroutine.
+// A desktop.Tray also gets Slack's icon states, tooltip and menu
+// (tray.go). Any goroutine.
 func (a *App) SetTray(t TrayIcon) {
 	if t == nil {
 		a.tray.Store(nil)
 		return
 	}
 	a.tray.Store(&trayRef{t})
+	if _, ok := t.(trayShell); ok { // its icon, tooltip and menu (tray.go)
+		a.Post(func() {
+			a.updateTrayIcon(true)
+			a.updateTrayMenu(true)
+		})
+	}
 }
 
 func (a *App) trayIcon() TrayIcon {
@@ -66,9 +92,10 @@ func (a *App) setRunFromTray(on bool) {
 // closeToTray handles a close request (ClosingEvent) the way
 // MAIN_WINDOW_CLOSE does, reporting whether the window was hidden or
 // minimized instead (the caller then aborts the close). With no tray icon
-// there is nowhere to come back from, so the close quits, as it does on
-// macOS and Linux (Clack has no icon there), unless the window only
-// minimizes. UI goroutine.
+// there is nowhere to come back from on Windows and Linux (Clack has no
+// icon there), so the close quits unless the window only minimizes; on
+// macOS the Dock icon brings it back (closeHidesWithoutTray). UI
+// goroutine.
 //
 // The win32 build's handler (@1149121) also reads
 // win32.windowFlashBehavior: "always" is keepAppInTaskbar, which keeps
@@ -82,7 +109,7 @@ func (a *App) closeToTray() bool {
 	}
 	t := a.trayIcon()
 	keep := a.keepAppInTaskbar()
-	if t == nil && !keep {
+	if t == nil && !keep && !closeHidesWithoutTray {
 		return false
 	}
 	on := a.runFromTrayOn()
@@ -98,7 +125,9 @@ func (a *App) closeToTray() bool {
 	} else {
 		if a.winMode == app.Fullscreen && a.win != nil {
 			log.Print("ui: attempted to close the window while fullscreen, exiting fullscreen")
-			a.win.Option(app.Windowed.Option())
+			if !hideLeavesFullscreen {
+				a.win.Option(app.Windowed.Option())
+			}
 		}
 		if !a.hideWindow() {
 			return false
@@ -117,12 +146,16 @@ func (a *App) closeToTray() bool {
 		a.savePrefs()
 		title, content = runFromTrayBalloon()
 	}
-	if title != "" && t != nil {
+	switch {
+	case title != "" && t != nil:
 		go func() {
 			if err := t.Balloon(title, content); err != nil {
 				log.Printf("ui: tray balloon: %v", err)
 			}
 		}()
+	case title != "":
+		// macOS: uW's TrayHandler has no icon to show it from
+		log.Print("ui: attempted to show a balloon before the tray icon exists")
 	}
 	return true
 }
@@ -167,9 +200,10 @@ func (a *App) hideWindow() bool {
 }
 
 // drainIdle runs what was posted on a window event that isn't a frame:
-// Gio's wake-up after an Invalidate. A hidden or minimized window draws
-// no frames, and posted work (the backend's events, notifications) would
-// otherwise wait for the window to come back. UI goroutine.
+// Gio's wake-up after an Invalidate, which is whichever event comes next
+// (a ConfigEvent too). A hidden or minimized window draws no frames, and
+// posted work (the backend's events, notifications) would otherwise wait
+// for the window to come back. UI goroutine.
 func (a *App) drainIdle() {
 	// Fonts still loading: the first frames drain. The loader's
 	// Invalidate brings a wake-up when they're ready, and a window

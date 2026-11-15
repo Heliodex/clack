@@ -312,7 +312,7 @@ func (p *EmojiPicker) SetAnchorRect(r image.Rectangle) {
 
 // refreshIndex picks up a newer (custom-inclusive) index when it lands.
 func (p *EmojiPicker) refreshIndex() {
-	if p.idx != nil && p.full {
+	if p.idx != nil && p.full && p.idx.current() {
 		return
 	}
 	x, full := epIndexFor(p.h)

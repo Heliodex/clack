@@ -13,15 +13,13 @@ import (
 )
 
 // standard.json.gz is the standard emoji table (iamcal order), gzipped:
-// 161 KB of JSON is 28 KB in the binary.
+// 161 KB of JSON is 28 KB in the binary. It is Slack's 17.0 set; the 16.0
+// set is the same table less the emoji_v17 additions (set.go).
 //
 //go:embed standard.json.gz
 var standardGz []byte
 
-// StandardData returns the standard emoji table as JSON
-// ({"categories":[…],"emoji":[{n,i,u,c,s}]}), decompressed on each call
-// (~1 ms): callers parse it into their own tables and drop the bytes.
-func StandardData() []byte {
+func standardRaw() []byte {
 	r, err := gzip.NewReader(bytes.NewReader(standardGz))
 	if err != nil {
 		return nil
@@ -30,8 +28,57 @@ func StandardData() []byte {
 	return b
 }
 
-// CDN is where Slack serves its standard emoji images.
-const CDN = assetBase + "16.0/"
+// StandardData returns the standard emoji table of the set in use (V17)
+// as JSON ({"categories":[…],"emoji":[{n,i,u,c,s}]}), built on each call
+// (~1 ms; a few more for the 16.0 set): callers parse it into their own
+// tables and drop the bytes, and build them again when V17 changes.
+func StandardData() []byte { return StandardDataFor(V17()) }
+
+// StandardDataFor is StandardData for the 17.0 set (v17) or the 16.0 one.
+func StandardDataFor(v17 bool) []byte {
+	raw := standardRaw()
+	if v17 || raw == nil {
+		return raw
+	}
+	var f struct {
+		Categories json.RawMessage `json:"categories"`
+	}
+	_ = json.Unmarshal(raw, &f)
+	once.Do(load)
+	b, err := json.Marshal(struct {
+		Categories json.RawMessage `json:"categories,omitempty"`
+		Emoji      []std           `json:"emoji"`
+	}{f.Categories, sets[0].list})
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// CDN is where Slack serves the 16.0 set's images (emoji_v17 off), CDN17
+// the 17.0 set's (getEmojiVersion, Ak7A). The 16.0 directories have no
+// image the 17.0 set added: those answer 403.
+const (
+	CDN   = assetBase + "16.0/"
+	CDN17 = assetBase + "17.0/"
+)
+
+// Base is the CDN of the set in use.
+func Base() string {
+	if V17() {
+		return CDN17
+	}
+	return CDN
+}
+
+// TrimCDN cuts either set's CDN off a standard emoji URL ("google-medium/
+// 1f44d.png"); ok is false for any other URL.
+func TrimCDN(u string) (rest string, ok bool) {
+	if rest, ok = strings.CutPrefix(u, CDN); ok {
+		return rest, true
+	}
+	return strings.CutPrefix(u, CDN17)
+}
 
 type std struct {
 	Names []string          `json:"n"`
@@ -43,45 +90,77 @@ type std struct {
 
 var (
 	once      sync.Once
-	allStd    []std // the table, in order
-	byName    map[string]*std
+	sets      [2]*set // [0] the 16.0 set, [1] the 17.0 one (the embedded table)
 	skinCodes = map[string]string{"2": "1F3FB", "3": "1F3FC", "4": "1F3FD", "5": "1F3FE", "6": "1F3FF"}
 )
+
+// set is one of Slack's standard emoji tables, parsed.
+type set struct {
+	list   []std // the table, in order
+	byName map[string]*std
+
+	uniOnce sync.Once // MatchUnicode's index
+	uni     map[string]uniEnt
+	uniMax  int
+
+	natOnce sync.Once // Native
+	nat     map[string]string
+	natMax  int
+}
 
 func load() {
 	var f struct {
 		Emoji []std `json:"emoji"`
 	}
-	_ = json.Unmarshal(StandardData(), &f)
-	allStd = f.Emoji
-	byName = make(map[string]*std, len(f.Emoji)*2)
-	for i := range f.Emoji {
-		e := &f.Emoji[i]
+	_ = json.Unmarshal(standardRaw(), &f)
+	sets[1] = newSet(f.Emoji)
+	sets[0] = newSet(without17(f.Emoji))
+}
+
+func newSet(list []std) *set {
+	s := &set{list: list, byName: make(map[string]*std, len(list)*2)}
+	for i := range list {
+		e := &list[i]
 		for _, n := range e.Names {
-			byName[n] = e
+			s.byName[n] = e
 		}
 	}
 	// common aliases Slack accepts
 	alias := map[string]string{"thumbsup": "+1", "thumbsdown": "-1", "simple_smile": "slightly_smiling_face"}
 	for a, n := range alias {
-		if e, ok := byName[n]; ok {
-			if _, exists := byName[a]; !exists {
-				byName[a] = e
+		if e, ok := s.byName[n]; ok {
+			if _, exists := s.byName[a]; !exists {
+				s.byName[a] = e
 			}
 		}
 	}
+	return s
 }
 
-// Standard resolves a standard emoji name (optionally with ::skin-tone-N).
-// It returns the image file stem (e.g. "1f44d-1f3fd") and the unicode text.
-func Standard(name string) (image, text string, ok bool) {
+// cur is the set in use.
+func cur() *set { return setFor(V17()) }
+
+// setFor is the 17.0 set (v17) or the 16.0 one.
+func setFor(v17 bool) *set {
 	once.Do(load)
+	if v17 {
+		return sets[1]
+	}
+	return sets[0]
+}
+
+// Standard resolves a standard emoji name (optionally with ::skin-tone-N)
+// in the set in use. It returns the image file stem (e.g. "1f44d-1f3fd")
+// and the unicode text.
+func Standard(name string) (image, text string, ok bool) { return cur().standard(name) }
+
+func (s *set) standard(name string) (image, text string, ok bool) {
 	skin := ""
 	if i := strings.Index(name, "::skin-tone-"); i >= 0 {
 		skin = name[i+len("::skin-tone-"):]
 		name = name[:i]
 	}
-	e, ok := byName[name]
+	e, ok := s.byName[name]
 	if !ok {
 		return "", "", false
 	}
@@ -98,7 +177,8 @@ func Standard(name string) (image, text string, ok bool) {
 // StandardURL returns the Slack CDN image URL for a standard emoji, in
 // style ("" for Style(): Google's set except on macOS).
 func StandardURL(name, style, size string) (string, bool) {
-	img, _, ok := Standard(name)
+	v17 := V17()
+	img, _, ok := setFor(v17).standard(name)
 	if !ok {
 		return "", false
 	}
@@ -108,7 +188,11 @@ func StandardURL(name, style, size string) (string, bool) {
 	if size == "" {
 		size = "medium"
 	}
-	return CDN + style + "-" + size + "/" + img + ".png", true
+	base := CDN
+	if v17 {
+		base = CDN17
+	}
+	return base + style + "-" + size + "/" + img + ".png", true
 }
 
 func unicodeText(uni string) string {
@@ -218,30 +302,31 @@ type StdEmoji struct {
 	Unicode string
 }
 
-// StandardList returns the standard emoji in table order (a fresh slice
-// sharing the name slices; don't modify them).
-func StandardList() []StdEmoji {
-	once.Do(load)
-	out := make([]StdEmoji, len(allStd))
-	for i := range allStd {
-		out[i] = StdEmoji{Names: allStd[i].Names, Unicode: allStd[i].Image}
+// StandardList returns the set in use's standard emoji in table order (a
+// fresh slice sharing the name slices; don't modify them).
+func StandardList() []StdEmoji { return StandardListFor(V17()) }
+
+// StandardListFor is StandardList for the 17.0 set (v17) or the 16.0 one.
+func StandardListFor(v17 bool) []StdEmoji {
+	s := setFor(v17)
+	out := make([]StdEmoji, len(s.list))
+	for i := range s.list {
+		out[i] = StdEmoji{Names: s.list[i].Names, Unicode: s.list[i].Image}
 	}
 	return out
 }
 
 // IsStandard reports whether name (without a skin tone) is a standard
-// emoji name or one of the aliases Slack accepts.
+// emoji name of the set in use or one of the aliases Slack accepts.
 func IsStandard(name string) bool {
-	once.Do(load)
-	_, ok := byName[name]
+	_, ok := cur().byName[name]
 	return ok
 }
 
 // StandardUnicode is a standard emoji's image stem / unicode ("1f44d"),
-// "" when name is not standard.
+// "" when name is not standard in the set in use.
 func StandardUnicode(name string) string {
-	once.Do(load)
-	if e, ok := byName[name]; ok {
+	if e, ok := cur().byName[name]; ok {
 		return e.Image
 	}
 	return ""

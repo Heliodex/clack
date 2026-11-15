@@ -44,6 +44,8 @@ var colorTokens = []struct {
 	{func(c *colors) *color.NRGBA { return &c.HuddleLiveBadgeText }, theme.Tok{Light: "var(--dt_color-content-inv-pry)", Dark: "rgb(var(--dt_color-plt-jade-0))"}},
 	{func(c *colors) *color.NRGBA { return &c.FindMuted }, theme.Both("var(--dt_color-content-ter)")},
 	{func(c *colors) *color.NRGBA { return &c.FindBorder }, theme.Both("var(--dt_color-otl-ter)")},
+	{func(c *colors) *color.NRGBA { return &c.Missing }, theme.Both("var(--dt_color-base-ter)")},
+	{func(c *colors) *color.NRGBA { return &c.MissingLine }, theme.Both("rgb(var(--sk_foreground_low_solid))")},
 }
 
 var (

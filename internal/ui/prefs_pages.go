@@ -855,8 +855,9 @@ func (p *prefsModal) huddleMotionRow(f *prefsForm) {
 // runFromTrayRow is DesktopPref's last row, the desktop setting
 // runFromTray (default on): closing the window leaves Clack running in
 // the notification area (runfromtray.go). It needs the tray icon, which
-// only Windows has, so elsewhere it stays greyed and unticked: a close
-// quits there.
+// only Windows has, so on Linux it stays greyed and unticked: a close
+// quits there. macOS has no DesktopPref; a close hides the window there
+// (the Dock icon brings it back).
 func (p *prefsModal) runFromTrayRow(f *prefsForm) {
 	const label = "Leave app running in notification area when the window is closed"
 	a := p.a
@@ -876,17 +877,18 @@ func (p *prefsModal) launchOnLoginRow(f *prefsForm) {
 		f.off("launchOnStartup", "Launch app on login", "", false, false)
 		return
 	}
-	if p.launchOn == nil { // a file or registry read: once per dialog
+	if p.launchOn == nil || p.launchAt != a.launch.gen { // a file or registry read: once per dialog, and after the tray's Launch on Login
 		v := a.opts.LaunchOnLogin()
-		p.launchOn = &v
+		p.launchOn, p.launchAt = &v, a.launch.gen
+		a.launch.on, a.launch.known = v, true
 	}
 	on := *p.launchOn
 	f.option("launch_on_login", "Launch app on login", "", on, false, func() {
-		if err := a.opts.SetLaunchOnLogin(!on); err != nil {
+		if err := a.setLaunchOnLogin(!on); err != nil {
 			a.Toast("Couldn’t change Launch app on login: " + err.Error())
 			return
 		}
 		v := !on
-		p.launchOn = &v
+		p.launchOn, p.launchAt = &v, a.launch.gen
 	})
 }
