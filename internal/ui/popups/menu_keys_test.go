@@ -342,12 +342,22 @@ func TestMenuKeysSubmenus(t *testing.T) {
 	if e.m.sub == nil || !e.m.sub.kbd {
 		t.Fatal("→ didn't open Organize")
 	}
+	seq := h.a.S.PinSeq()
 	e.press("P", 0)
 	if !e.m.Dismissed() {
 		t.Error("P in Organize ▸ left the menu open")
 	}
-	if ts := waitToast(h, e, 10*time.Second); len(ts) == 0 {
+	// pinMessage (core.Pin) pins the message at once, before pins.add
+	// answers, and Slack toasts nothing: the store saw a pin
+	for end := time.Now().Add(10 * time.Second); h.a.S.PinSeq() == seq && time.Now().Before(end); {
+		e.frame()
+		time.Sleep(10 * time.Millisecond)
+	}
+	if h.a.S.PinSeq() == seq {
 		t.Error("P didn't pin")
+	}
+	if ts := h.toastList(); slices.Contains(ts, "Message pinned") {
+		t.Errorf("a pin toasted %q; Slack's pinMessage toasts nothing", ts)
 	}
 }
 
