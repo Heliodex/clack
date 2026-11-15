@@ -15,7 +15,7 @@ Two other ways, both read at launch only:
 
 Then Hyper+D starts a session: ⌃⌥⇧⌘D on macOS, Ctrl+Alt+Shift+D on Linux and Windows (where Super may be held too). The shortcut works over modals too, so dialogs can be inspected.
 
-Until Gio patch 29 the shortcut, then ⌥⇧⌘D, did nothing on macOS. AppKit sends no command for that press (`interpretKeyEvents:` calls neither `doCommandBySelector:` nor `insertText:`), and Gio dropped every ⌘ press that came without one, so no key filter ever saw it. `TestMacInspectKeys` on ci's macos job posts the keys through AppKit as a keyboard makes them.
+Until Gio patch 29 the shortcut, then ⌥⇧⌘D, did nothing on macOS. AppKit sends no command for a ⌘ press with ⌥ held (`interpretKeyEvents:` calls neither `doCommandBySelector:` nor `insertText:`), and Gio dropped every ⌘ press that came without one, so no key filter ever saw it; Hyper+D has ⌥ too. `TestMacInspectKeys` on ci's macos job posts the keys through AppKit as a keyboard makes them.
 
 ## A session
 

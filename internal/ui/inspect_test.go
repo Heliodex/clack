@@ -149,11 +149,16 @@ func savedInspectTool(t *testing.T, dir string) bool {
 	return p.InspectTool
 }
 
+// hyperD presses the tool's shortcut.
+func (e *perfEnv) hyperD() {
+	f := inspectFilter()
+	e.key(f.Name, f.Required)
+}
+
 // startSession presses the shortcut and points at the pill.
 func (e *inspectEnv) startSession(t *testing.T) {
 	t.Helper()
-	n, m := parseCombo(inspectCombo)
-	e.key(n, m)
+	e.hyperD()
 	e.frame()
 	if !e.a.insp.Active() {
 		t.Fatal("the shortcut started no inspect session")
@@ -345,8 +350,7 @@ func TestInspectEscAndGate(t *testing.T) {
 		t.Error("Esc didn't end the session")
 	}
 	e.startSession(t)
-	n, m := parseCombo(inspectCombo)
-	e.key(n, m)
+	e.hyperD()
 	e.frame()
 	if e.a.insp.Active() {
 		t.Error("the shortcut again didn't end the session")
@@ -404,8 +408,7 @@ func TestInspectKonami(t *testing.T) {
 		t.Fatalf("the composer has %q, want hello", got)
 	}
 	hyper := func() {
-		n, m := parseCombo(inspectCombo)
-		e.key(n, m)
+		e.hyperD()
 		e.frame()
 	}
 	hyper()
@@ -531,13 +534,13 @@ func TestInspectComboIsHyperD(t *testing.T) {
 	} {
 		prev := shortcut.GOOS
 		shortcut.GOOS = c.goos
-		f := inspectFilter()
+		f, hint := inspectFilter(), inspectHint()
 		shortcut.GOOS = prev
 		if f.Name != "D" || f.Required != c.mods || f.Optional != key.ModSuper {
 			t.Errorf("%s: filter %+v, want D with %v (Super optional)", c.goos, f, c.mods)
 		}
-		if got := shortcut.FormatFor(c.goos, inspectCombo); got != c.label {
-			t.Errorf("%s: shown as %q, want %q", c.goos, got, c.label)
+		if hint != c.label {
+			t.Errorf("%s: shown as %q, want %q", c.goos, hint, c.label)
 		}
 	}
 }

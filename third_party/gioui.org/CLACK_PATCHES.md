@@ -1338,13 +1338,13 @@ Not in `UPSTREAM.patch`.
 A key press on macOS goes through `interpretKeyEvents:`, and Gio
 delivered a press with ⌘ only from the `doCommandBySelector:` it expected
 that call to make (`gio_onCommandBySelector`); `gio_onKeys` returned
-without it. AppKit makes one for many ⌘ presses (the key binding's
-command, or `noop:`), but not for all of them: on macos-latest
-(com.apple.keylayout.US) ⌥⇧⌘D's and ⌃⌥⇧⌘D's `keyDown:` reach the view,
-and `interpretKeyEvents:` calls neither `doCommandBySelector:` nor
-`insertText:`. No filter ever saw those presses. Karim found it with
-Clack's inspect tool, whose shortcut was ⌥⇧⌘D: it did nothing
-(2026-11-14).
+without it. AppKit makes one for ⌘ alone or with ⇧ (`noop:` for ⌘B and
+⇧⌘D, the key binding's `moveToBeginningOfDocument:` for ⌘↑), but none
+once ⌥ is held too: on macos-latest (com.apple.keylayout.US) ⌥⌘B's,
+⌥⇧⌘D's and ⌃⌥⇧⌘D's `keyDown:` reach the view, and `interpretKeyEvents:`
+calls neither `doCommandBySelector:` nor `insertText:`. So no filter ever
+saw a ⌥⌘ press. Karim found it with Clack's inspect tool, whose shortcut
+was ⌥⇧⌘D: it did nothing (2026-11-14).
 
 `gio_onKeys` now marks the press pending before `interpretKeyEvents:`,
 and `gio_onCommandBySelector`, which clears `cmdKeys`, unmarks it. A
@@ -1358,5 +1358,6 @@ with nothing after them, and no session started, posted through `NSApp`
 or straight to the view). Tests: `app/clack_keys_darwin_test.go`
 `TestMacCommandKeys` (macos job, `CLACK_MACOS_WINDOW_TESTS`: ⌘B, ⇧⌘D,
 ⌥⇧⌘D, ⌃⌥⇧⌘D, ⌥⌘B, ⌘↑, ↑, ⌥⇧D and A posted through `NSApp` reach a filter
-once each; the log says which came through `doCommandBySelector:`) and
-`internal/ui` `TestMacInspectKeys`. Not in `UPSTREAM.patch`.
+once each; the log says which came through `doCommandBySelector:`, run
+43663715941 the list above) and `internal/ui` `TestMacInspectKeys`. Not
+in `UPSTREAM.patch`.

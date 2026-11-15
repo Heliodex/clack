@@ -20,9 +20,9 @@ import (
 // keyboard makes them (cocoatest.PostKey: the modifiers' flagsChanged,
 // the key with the current layout's characters, through NSApp
 // sendEvent:) reach the window's key filter once each. That includes
-// the ⌘ presses AppKit's text system sends no command for (⌘⌥⇧D,
-// ⌃⌥⇧⌘D), which Gio lost before. The log has what the view got of each
-// key (cocoatest.TraceKeys): which ones came through
+// the ⌘ presses with ⌥ held, which AppKit's text system sends no command
+// for (⌥⌘B, ⌥⇧⌘D, ⌃⌥⇧⌘D) and Gio lost before. The log has what the view
+// got of each key (cocoatest.TraceKeys): which ones came through
 // doCommandBySelector: and which through the patch.
 func TestMacCommandKeys(t *testing.T) {
 	if !macWindowTestsEnabled() {

@@ -26,16 +26,17 @@ import (
 // session, Esc or Hyper+D again ends it, and a click copies a report of
 // the element under the pointer.
 
-// inspectCombo is the tool's shortcut (internal/ui/shortcut syntax):
-// Hyper+D, all four modifiers (off macOS Mod is Ctrl, so three).
-const inspectCombo = "Mod+Alt+Ctrl+Shift+D"
-
-// inspectFilter is inspectCombo's key filter. Super may be held as well:
-// a Linux Hyper key can add it to the other four.
+// inspectFilter is the tool's shortcut, Hyper+D: all four modifiers (off
+// macOS Mod is Ctrl, so three). Super may be held as well: a Linux Hyper
+// key can add it to the other four. inspectHint shows the same combo.
 func inspectFilter() key.Filter {
-	n, m := parseCombo(inspectCombo)
+	n, m := shortcut.Parse("Mod+Alt+Ctrl+Shift+D")
 	return key.Filter{Name: n, Required: m, Optional: key.ModSuper}
 }
+
+// inspectHint is the shortcut as this platform writes it: ⌃⌥⇧⌘D on
+// macOS, Ctrl+Alt+Shift+D elsewhere.
+func inspectHint() string { return shortcut.Format("Mod+Alt+Ctrl+Shift+D") }
 
 // inspectGated reports the tool's gate.
 func (a *App) inspectGated() bool { return envFlag("INSPECT") || a.prefs.InspectTool }
@@ -57,7 +58,7 @@ func (a *App) setInspectTool(on bool) {
 	a.savePrefs()
 	if on {
 		a.initInspect()
-		a.Toast("Inspect tool on: " + shortcut.Format(inspectCombo) + " to inspect")
+		a.Toast("Inspect tool on: " + inspectHint() + " to inspect")
 		return
 	}
 	if a.insp != nil {

@@ -28,11 +28,11 @@ import (
 //     menu's Hide Sidebar is ⌘⇧D).
 //  5. The code again turns the tool off, in ui.json too.
 //
-// Before Gio patch 29 no ⌘ press AppKit's text system sends no command
-// for reached the window: the view got ⌘⌥⇧D's and ⌃⌥⇧⌘D's keyDown:, its
-// interpretKeyEvents: called neither doCommandBySelector: nor
-// insertText:, and Gio dropped the press (ci run 43661396830). The log
-// has what the view got of each key (cocoatest.TraceKeys).
+// Before Gio patch 29 no ⌘ press with ⌥ held reached the window: the
+// view got ⌥⇧⌘D's and ⌃⌥⇧⌘D's keyDown:, its interpretKeyEvents: called
+// neither doCommandBySelector: nor insertText:, and Gio dropped the press
+// (ci run 43661396830). The log has what the view got of each key
+// (cocoatest.TraceKeys).
 func TestMacInspectKeys(t *testing.T) {
 	if !macWindowTests {
 		t.Skip("CLACK_MACOS_WINDOW_TESTS not set")

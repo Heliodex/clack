@@ -73,10 +73,11 @@ func (q *Router) noteKey(e event.Event) {
 }
 
 // KeyLogged reports whether the router kept a key press for KeyPresses
-// since the last call. The window then draws a frame even when no filter
-// matched the key, which still counts as not handled (WakeupTime): Gio
-// still moves the focus for an unhandled Tab, and macOS still gets an
-// unhandled key's command (doCommandBySelector:).
+// since the last call or the last frame. The window asks after every
+// event and draws a frame for it even when no filter matched the key,
+// which still counts as not handled (WakeupTime): Gio still moves the
+// focus for an unhandled Tab, and macOS still gets an unhandled key's
+// command (doCommandBySelector:).
 func (q *Router) KeyLogged() bool {
 	w := q.keyLog.wake
 	q.keyLog.wake = false
@@ -90,6 +91,7 @@ func (q *Router) frameKeyLog() {
 	clear(l.presses)
 	l.presses = l.presses[:0]
 	l.on, l.read = l.read, false
+	l.wake = false
 }
 
 // requeue queues events the router was already given (a state replay):

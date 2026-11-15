@@ -845,9 +845,9 @@ func gio_onKeys(h C.uintptr_t, event C.CFTypeRef, cstr C.CFTypeRef, ti C.double,
 		w.cmdKeys.pending = true
 		C.interpretKeyEvents(w.view, event)
 		// Clack patch 29 (CLACK_PATCHES.md): AppKit's text system sends no
-		// command for some ⌘ presses (⌘⌥⇧D, ⌃⌥⇧⌘D: neither
-		// doCommandBySelector: nor insertText:), and they were lost. Such a
-		// press is delivered below instead.
+		// command for a ⌘ press with ⌥ held (⌥⌘B, ⌥⇧⌘D, ⌃⌥⇧⌘D: neither
+		// doCommandBySelector: nor insertText:), and Gio lost those. Such
+		// a press is delivered below instead.
 		commanded = !w.cmdKeys.pending
 		if cmd && !commanded {
 			w.cmdKeys = cmdKeys{}

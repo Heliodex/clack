@@ -760,13 +760,13 @@ func (w *Window) processEvent(e event.Event) bool {
 			t, handled = w.queue.WakeupTime()
 		}
 		w.updateCursor()
-		if handled {
+		// Clack patch 28: a press kept for Source.KeyPresses gets a
+		// frame, and stays unhandled
+		if logged := w.queue.KeyLogged(); handled || logged {
+			if !handled {
+				t = time.Time{}
+			}
 			w.setNextFrame(t)
-			w.updateAnimation()
-		} else if w.queue.KeyLogged() {
-			// Clack patch 28: a frame for Source.KeyPresses, the key
-			// still unhandled
-			w.setNextFrame(time.Time{})
 			w.updateAnimation()
 		}
 		return handled
