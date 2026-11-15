@@ -22,7 +22,7 @@ It should show only `gpu/gpu.go`, `widget/index.go`, `widget/editor.go`,
 `app/clack_bounds*.go`, `app/internal/windows/clack_bounds.go`,
 `app/cocoatest/`, `app/clack_cursors/`, `app/os_unix.go`, `app/os_darwin.go`, `app/os_android.go`,
 `app/os_js.go`, `gesture/clack_autoscroll.go`, `io/input/clack_values.go`,
-`internal/ops/clack_size.go`, `op/clack_size.go`, `op/clip/clack_size.go`,
+`internal/ops/clack_size.go`, `op/clack_size.go`, `op/clip/clack_size.go`, `op/clack_whole.go`,
 `io/input/clack_hover.go`, `io/input/clack_hover_test.go`,
 `font/opentype/opentype.go`, `io/input/pointer.go`, `io/input/key.go`,
 `io/input/clack_release_test.go`, `gpu/clack_release_test.go`,
@@ -1390,3 +1390,34 @@ Test: `internal/ui` `TestMacIdleCPU` on ci's macos job
 (`CLACK_MACOS_WINDOW_TESTS`): its "frames slower than a vsync" period
 makes every frame take 30 ms (`OnWindowEvent`) and allows the caret's
 blinks and `idleOtherFrames` more. Not in `UPSTREAM.patch`.
+
+## 31. op: a finished Ops list as one CallOp
+
+`op/clack_whole.go` (`Ops.Whole`). An addition, not a fix: no upstream
+API changes behaviour.
+
+Clack's inspect tool (`internal/ui/inspect`) copies an image of the
+element a click picked. It used to read the frame back at the window's
+size and paste the whole window: every channel and message around the
+element came along, and Slack shrank the 2880 px wide paste (a Retina
+window) to fit a message, so the element came out soft. The tool now
+draws only the element and a margin, at about 4 px per dp whatever the
+display: the frame's ops once more, through a headless GPU context,
+under a transform that scales the crop up and moves it to the origin.
+Gio's paths and glyph outlines are vectors (`drawOps.buildVerts`
+transforms them), so the scaled frame is as sharp as one laid out at
+that density.
+
+That needs the frame's ops as something another `Ops` can call, and
+upstream only gives one for a `Record`ed macro: the window's frame isn't
+recorded, and recording it would cross the push/pop of every stack the
+layout opens and closes around the tool's own calls. `Whole` is a
+`CallOp` from the start of the list to its current end. The ops reader
+already reads a call into any `Ops` from any start: macro definitions in
+it are skipped as usual, and deferred macros are copied into the
+reader's deferred list and run after the caller's ops, with the state
+(transform included) saved when they were deferred, so the outer
+transform applies to them too.
+
+Test: `internal/ui` `TestInspectShots` (feel-shots, llvmpipe) renders the
+pick through it. Not in `UPSTREAM.patch`.

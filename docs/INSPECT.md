@@ -25,8 +25,8 @@ The window keeps working while the session runs, minus clicks and keys. Hover st
 
 A click picks the outlined element and ends the session. Clack then:
 
-1. renders the click's frame again through a headless GPU context (the window's own GPU can't read frames back) and outlines the element on it,
-2. draws the report as a panel under the screenshot, on the CPU with the Go fonts,
+1. renders the element and 24 dp around it, and nothing else of the window, from the click's frame again through a headless GPU context (the window's own GPU can't read frames back). It draws that crop at 4 px per dp whatever the display, under a transform over the frame's ops (Gio patch 31, `Ops.Whole`). Paths and glyphs are vectors, so the element comes out as sharp as a window four times as dense, and the image stays small enough that Slack shows it near its own size. An element whose image would pass 3200 px is drawn less dense, never below the window's own px,
+2. blurs the 24 dp margin past reading (a 5 dp box blur, three passes), so the neighbouring messages, channels and names are smears and only the element is sharp, outlines the element, and draws the report as a panel under it, on the CPU with the Go fonts. The image is as wide as the crop, or as the panel's 420 dp minimum for a small element (the crop sits centred above the panel at its own size),
 3. copies that one image to the clipboard, so a paste in #clack carries both,
 4. saves the image and the report's text as `inspect-reports/inspect-<date>-<time>.png` and `.txt` in the config folder, readable by the owner only.
 
@@ -55,7 +55,7 @@ The report is meant for #clack, so it holds no content. It never collects messag
 
 An id becomes a tag: its kind and the first 6 hex digits of SHA-256 over a salt and the id (`ch:3fa2b1`, `user:77ab02`, `ts:9c01de`). Each report gets a new random salt, which is never written anywhere. Within one report the same channel always has the same tag, so "the same message" and "another one" stay apparent. Across reports, and for anyone without the salt, a tag says nothing. Routes keep their page (`c/`, `dms`) and tag every other segment. A run-time attribute value (a channel id in `data-qa-channel-sidebar-channel-id`) becomes a tag unless it is an enumeration such as `data-qa=add_reaction`.
 
-The screenshot is the window as the user saw it. The user decides whether to paste it.
+The image shows the picked element as the user saw it, and of the rest of the window only the blurred margin around it. Whatever the element itself holds (a picked message's text) is in it, so the user decides whether to paste it.
 
 ## Coverage
 

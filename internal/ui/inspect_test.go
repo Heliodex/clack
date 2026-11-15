@@ -214,9 +214,9 @@ func nearRect(a, b image.Rectangle, d int) bool {
 func fakeShots(t *testing.T) (shots *int, copied *image.Image) {
 	shots, copied = new(int), new(image.Image)
 	prevShoot, prevWrite := inspect.Shoot, inspect.WriteImage
-	inspect.Shoot = func(_ *op.Ops, size image.Point) (*image.RGBA, error) {
+	inspect.Shoot = func(_ *op.Ops, region image.Rectangle, k float32) (*image.RGBA, error) {
 		*shots++
-		img := image.NewRGBA(image.Rectangle{Max: size})
+		img := image.NewRGBA(image.Rectangle{Max: inspect.ShotSize(region, k)})
 		draw.Draw(img, img.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
 		return img, nil
 	}
@@ -287,8 +287,35 @@ func TestInspectReactionPill(t *testing.T) {
 	if *shots != 1 || *copied == nil {
 		t.Fatalf("after the pick: %d shots, image copied %v", *shots, *copied != nil)
 	}
-	if b := (*copied).Bounds(); b.Dx() != e.size.X || b.Dy() <= e.size.Y {
-		t.Errorf("the copied image is %v: want the window with the report under it", b)
+	// the image is the pill and its margin (the fake shot is white, the
+	// panel's colour beside it), drawn ShotDensity times as dense as this
+	// 1x window, over the report: nothing else of the window
+	crop := r.Inset(-inspect.CropMargin).Intersect(image.Rectangle{Max: e.size})
+	want := inspect.ShotSize(crop, inspect.ShotDensity)
+	img := (*copied).(*image.RGBA)
+	b := img.Bounds()
+	white := color.RGBA{0xff, 0xff, 0xff, 0xff}
+	shotW, shotH, left := 0, 0, -1
+	for x := 0; x < b.Dx(); x++ {
+		if img.RGBAAt(x, 2) == white {
+			shotW++
+			if left < 0 {
+				left = x
+			}
+		}
+	}
+	for y := 0; left >= 0 && y < b.Dy() && img.RGBAAt(left+2, y) == white; y++ {
+		shotH++ // down the margin left of the pill, to the band over the panel
+	}
+	abs := func(v int) int { return max(v, -v) }
+	if abs(shotW-want.X) > 2*inspect.ShotDensity || abs(shotH-want.Y) > 2*inspect.ShotDensity {
+		t.Errorf("the copied image's shot is %dx%d px, want the pill's crop, %v", shotW, shotH, want)
+	}
+	if shotW/inspect.ShotDensity*5 > e.size.X {
+		t.Errorf("the copied image shows %d dp of the %d dp window: more than the pill", shotW/inspect.ShotDensity, e.size.X)
+	}
+	if b.Dx() < shotW || b.Dx() >= e.size.X || b.Dy() <= shotH+100 {
+		t.Errorf("the copied image is %v (shot %dx%d): want the pill's crop with the report under it, narrower than the %d px window", b, shotW, shotH, e.size.X)
 	}
 	if !strings.Contains(e.a.toast.text, "Copied the inspect report") {
 		t.Errorf("toast %q", e.a.toast.text)
@@ -584,7 +611,7 @@ func TestInspectShots(t *testing.T) {
 		if _, _, ok := e.a.insp.Hovered(); !ok {
 			t.Fatalf("%s: nothing outlined over the pill", mode)
 		}
-		hover, err := inspect.Shoot(&e.ops, e.size)
+		hover, err := inspect.Shoot(&e.ops, image.Rectangle{Max: e.size}, 1)
 		if err != nil {
 			t.Fatalf("%s: the headless capture: %v", mode, err)
 		}

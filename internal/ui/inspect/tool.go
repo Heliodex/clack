@@ -5,8 +5,8 @@
 // inspect element: the Slack component under the pointer gets an outline
 // and a label, ↑ and ↓ pick its parent or go back, Esc ends the session,
 // and a click picks the element. Clack then copies one image to the
-// clipboard: the window as it was drawn with the element outlined, over
-// a panel with a report (which component and element, its classes, its
+// clipboard: the element as it was drawn, outlined, with a small blurred
+// margin and nothing else of the window, over a panel with a report (which component and element, its classes, its
 // rect, the colours drawn there, the theme, the experiments its code
 // read, and tags for the ids it was drawn for: one-way hashes, salted
 // per report, so the report is safe to paste in #clack). The image and
