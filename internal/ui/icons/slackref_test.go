@@ -114,6 +114,7 @@ var slackRef = map[string]string{
 	"email":                       "email",
 	"email-filled":                "email-filled",
 	"emoji":                       "emoji",
+	"reaction":                    "reaction",
 	"emoji-filled":                "emoji-filled",
 	"emoji-objects":               "emoji-objects",
 	"emoji-objects-filled":        "emoji-objects-filled",

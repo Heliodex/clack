@@ -270,6 +270,20 @@ type srCard struct {
 	// (SearchResult: BaseAvatar showCard at 36px, MessageSender)
 	avHov, nameHov hovercard.Trigger
 
+	// the density card (srp_card_explore, search_card.go): the clamped
+	// body (dense; denseOwn without a plugin's text) wrapped at dW, the
+	// count pills and their tooltips, the attachments count, the
+	// attachments pill (card coords, last frame) and the viewer's reply
+	dense, denseOwn       srDense
+	dToks                 []srTok
+	dLines, dW            int
+	dOver, dExp           bool
+	reacts, atts          widget.Clickable
+	tipReplies, tipReacts TipState
+	attN                  int
+	attR                  image.Rectangle
+	reply                 srViewerReply
+
 	// hover action bar
 	bar, fwd, jump, kebab    widget.Clickable
 	tipFwd, tipJump, tipMore TipState
@@ -632,11 +646,14 @@ func (v *SearchView) addMessages(res core.SearchResult, page int) {
 		m := &res.Messages[i]
 		name, av := srAuthor(v.h, m)
 		body := srBody(m)
+		dense := srDenseOf(v.h, m, terms)
 		v.cards = append(v.cards, srCard{
 			name: name, avatar: av, when: dayTime(tsTime(m.TS), now),
 			where: srWhereOf(v.h, v.convs, m),
 			flat:  srHighlight(srFlatten(body), terms),
 			full:  srHighlight(strings.TrimSpace(body), terms),
+			dense: dense, denseOwn: dense, dW: -1,
+			attN: srAttachmentCount(m),
 		})
 	}
 	v.msgs = append(v.msgs, res.Messages...)
@@ -1004,6 +1021,15 @@ func (v *SearchView) handle(gtx layout.Context) {
 			c := &v.cards[i]
 			if c.more.Clicked(gtx) {
 				c.expanded = !c.expanded
+			}
+			if c.reacts.Clicked(gtx) {
+				// onReactionsPillClick: the message, scrolled to its
+				// reactions
+				RecordRecentConversation(v.msgs[i].Channel)
+				v.h.Navigate(msgRoute(v.msgs[i]))
+			}
+			if c.atts.Clicked(gtx) {
+				v.srOpenAttachments(gtx, i)
 			}
 			if c.chip.Clicked(gtx) {
 				m := v.msgs[i]
@@ -1728,6 +1754,13 @@ func (v *SearchView) overText(i int, over slackc.Props) {
 	terms := v.q.Highlights()
 	c.flat, c.full = srHighlight(srFlatten(body), terms), srHighlight(strings.TrimSpace(body), terms)
 	c.tokW = -1 // wrap again
+	// the density body shows the plugin's text whole (compactCardBlocks
+	// keeps it: it has no blocks of its own), its own text again after
+	c.dense = c.denseOwn
+	if t != "" {
+		c.dense.segs = c.full
+	}
+	c.dW = -1
 }
 
 func (a srCardArgs) resultProps() slackc.Props {
@@ -1768,7 +1801,9 @@ func (v *SearchView) cardNative(gtx layout.Context, th *theme.Theme, cl *Colors,
 		bw = 1
 	}
 	lh := dp(gtx, 22)
-	if c.tokW != bw || c.tokExp != c.expanded {
+	explore := srExplore(v.h)
+	dense := explore && c.dense.on
+	if !dense && (c.tokW != bw || c.tokExp != c.expanded) {
 		c.tokW, c.tokExp = bw, c.expanded
 		if c.expanded {
 			c.toks, c.lines, c.over = srWrapFit(gtx, th, c.full, bw, 0, 0)
@@ -1780,11 +1815,21 @@ func (v *SearchView) cardNative(gtx layout.Context, th *theme.Theme, cl *Colors,
 	lines := maxInt(1, c.lines)
 	nameH := dp(gtx, 20)
 	bodyY := padT + nameH
+	var pills []srPill
+	if explore {
+		pills = srPills(c, m)
+		v.srAskViewerReply(i)
+	}
 	h := bodyY + lines*lh
-	if c.expanded {
+	if dense {
+		h = bodyY + v.srDenseHeight(gtx, th, c, bw, lh)
+	} else if c.expanded {
 		h += dp(gtx, 20) // "Show less"
 	}
-	if m.ReplyCount > 0 {
+	switch {
+	case explore:
+		h += srPillsHeight(gtx, th, pills, bw)
+	case m.ReplyCount > 0:
 		h += dp(gtx, 9) + dp(gtx, 22)
 	}
 	h += padB
@@ -1792,6 +1837,7 @@ func (v *SearchView) cardNative(gtx layout.Context, th *theme.Theme, cl *Colors,
 	r := image.Rectangle{Max: sz}
 	rad := dp(gtx, 12)
 	hovered := c.click.Hovered() || c.more.Hovered() || c.chip.Hovered() || c.bar.Hovered() ||
+		c.reacts.Hovered() || c.atts.Hovered() ||
 		c.fwd.Hovered() || c.jump.Hovered() || c.kebab.Hovered() || v.menuCard == i
 	bg := cl.Bg
 	if hovered {
@@ -1833,6 +1879,16 @@ func (v *SearchView) cardNative(gtx layout.Context, th *theme.Theme, cl *Colors,
 		return d
 	})
 	srDrawWhere(gtx, v.h, c.where, tx+d.Size.X+dp(gtx, 4), padT, right, nameH, bg)
+	if dense {
+		y := bodyY + v.srDenseBody(gtx, th, cl, c, tx, bodyY, bw, lh, bg)
+		v.srDrawPills(gtx, th, cl, c, m, pills, tx, y, bw)
+		if hovered {
+			v.hoverBar(gtx, th, cl, c, w)
+		} else {
+			c.tipFwd, c.tipJump, c.tipMore = TipState{}, TipState{}, TipState{}
+		}
+		return layout.Dimensions{Size: sz}
+	}
 	at(gtx, image.Pt(tx, bodyY), func(gtx layout.Context) layout.Dimensions {
 		srDrawToks(gtx, th, cl, c.toks, lh, cl.Fg)
 		return layout.Dimensions{}
@@ -1858,7 +1914,10 @@ func (v *SearchView) cardNative(gtx layout.Context, th *theme.Theme, cl *Colors,
 		})
 		y += dp(gtx, 20)
 	}
-	if m.ReplyCount > 0 {
+	switch {
+	case explore:
+		v.srDrawPills(gtx, th, cl, c, m, pills, tx, y, bw)
+	case m.ReplyCount > 0:
 		y += dp(gtx, 9)
 		at(gtx, image.Pt(tx, y), func(gtx layout.Context) layout.Dimensions {
 			return v.replyChip(gtx, th, cl, &c.chip, m.ReplyCount)
@@ -2024,7 +2083,14 @@ func (v *SearchView) cardHidden(gtx layout.Context, th *theme.Theme, cl *Colors,
 	toks, lines := srRichLayout(gtx, th, 15, srHiddenContents(v.h, m), bw)
 	bodyY := padT + nameH
 	h := bodyY + lines*lh
-	if m.ReplyCount > 0 {
+	explore := srExplore(v.h)
+	var pills []srPill
+	switch {
+	case explore:
+		pills = srPills(c, m)
+		v.srAskViewerReply(i)
+		h += srPillsHeight(gtx, th, pills, bw)
+	case m.ReplyCount > 0:
 		h += dp(gtx, 9) + dp(gtx, 22)
 	}
 	h += padB
@@ -2032,6 +2098,7 @@ func (v *SearchView) cardHidden(gtx layout.Context, th *theme.Theme, cl *Colors,
 	r := image.Rectangle{Max: sz}
 	rad := dp(gtx, 12)
 	hovered := c.click.Hovered() || c.chip.Hovered() || c.bar.Hovered() ||
+		c.reacts.Hovered() || c.atts.Hovered() ||
 		c.fwd.Hovered() || c.jump.Hovered() || c.kebab.Hovered() || v.menuCard == i
 	bg := cl.Bg
 	if hovered {
@@ -2051,7 +2118,10 @@ func (v *SearchView) cardHidden(gtx layout.Context, th *theme.Theme, cl *Colors,
 	srDrawHiddenHead(gtx, th, cl, m, tx, padT, w-padR, nameH)
 	srDrawRich(gtx, th, cl, toks, tx, bodyY, lh) // the break, then the contents
 	y := bodyY + lines*lh
-	if m.ReplyCount > 0 {
+	switch {
+	case explore:
+		v.srDrawPills(gtx, th, cl, c, m, pills, tx, y, bw)
+	case m.ReplyCount > 0:
 		y += dp(gtx, 9)
 		at(gtx, image.Pt(tx, y), func(gtx layout.Context) layout.Dimensions {
 			return v.replyChip(gtx, th, cl, &c.chip, m.ReplyCount)
