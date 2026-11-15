@@ -231,6 +231,7 @@ type File struct {
 	Thumb720           string          `json:"thumb_720"`
 	Thumb960           string          `json:"thumb_960"`
 	Thumb1024          string          `json:"thumb_1024"`
+	Thumb800           string          `json:"thumb_800,omitempty"` // HEIC/HEIF: fileIsImage takes it in thumb_360's place
 	ThumbVideo         string          `json:"thumb_video"`
 	ThumbPDF           string          `json:"thumb_pdf"`
 	ThumbPDFW          int             `json:"thumb_pdf_w"`
@@ -270,6 +271,9 @@ type File struct {
 	// upload is still being processed). Slack's web client doesn't draw by
 	// it; Clack only reads it to spot unprocessed uploads.
 	MediaDisplayType string `json:"media_display_type,omitempty"`
+	// IsSalesforceFile: Slack's fileIsImage takes a Salesforce image
+	// without thumbs (9NKl).
+	IsSalesforceFile bool `json:"is_salesforce_file,omitempty"`
 	// An animated GIF's animated thumbs (thumb_360_w/h and thumb_480_w/h
 	// are their sizes too; FileImageThumbnail plays them in messages) and
 	// its first frame as a still at the original's size (deanimate is

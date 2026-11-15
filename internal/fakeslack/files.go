@@ -16,7 +16,8 @@ import (
 // (snippets.go), a zip; two documents in the
 // mixed grid) plus an image the viewer uploaded (its file menu has Delete
 // file), a wide short screenshot and a small one (thumbs only up to
-// thumb_360, like a pasted 1022x125 composer or a 223px crop), and a thread
+// thumb_360, like a pasted 1022x125 composer or a 223px crop), two images
+// Slack made no thumbs for (file cards, as in Slack), and a thread
 // whose replies are a single image and a "+ N" gallery. files.info answers
 // for every file here. Every image is this server's /img gradient;
 // nothing is a real file. Messages go oldest first: FilesCases order.
@@ -41,6 +42,14 @@ type filesFixture struct {
 
 // FilesThread is the #files-gallery thread's root (FilesCases "thread").
 const FilesThread = "thread"
+
+// FilesUnthumbedImage and FilesUnthumbedSized are #files-gallery images
+// Slack made no thumbnails for: the first without original_w/h too (as
+// Slack sends a 828×25208 screenshot), the second with them.
+const (
+	FilesUnthumbedImage = "unthumbed image"
+	FilesUnthumbedSized = "unthumbed sized image"
+)
 
 // FilesCases are the #files-gallery messages in channel order.
 func (s *Server) FilesCases() []FilesCase {
@@ -144,6 +153,15 @@ func (s *Server) filesFixtures() []filesFixture {
 	wide.MediaDisplayType, wide.FileAccess = "unknown", "visible"
 	tiny := s.fakeImage("F0FILESIMG42", "image.png", 223, 150)
 	tiny.MediaDisplayType, tiny.FileAccess = "unknown", "visible"
+	// images Slack made no thumbs for (a 828×25208 phone screenshot has
+	// no thumb_*, and no original_w/h either): Slack's fileIsImage needs
+	// thumb_360, so they're file cards (getFileType "generic")
+	unthumbed := func(id, name string, w, h int) slack.File {
+		u := s.URL + "files-pri/" + TeamID + "-" + id + "/" + name
+		return slack.File{ID: id, Name: name, Title: name, Mimetype: "image/png", Filetype: "png", PrettyType: "PNG",
+			Size: 3272505, Mode: "hosted", URLPrivate: u, URLPrivateDownload: u, OriginalW: w, OriginalH: h,
+			Permalink: s.URL + "files/" + id + "/" + name, Created: filesBaseTS, MediaDisplayType: "unknown", FileAccess: "visible"}
+	}
 	return []filesFixture{
 		{"one image", "One landscape image", 1, ims(1, land), nil},
 		{"portrait image", "A portrait", 2, ims(2, port), nil},
@@ -163,6 +181,8 @@ func (s *Server) filesFixtures() []filesFixture {
 		{"own image", "My own upload", -1, []slack.File{own}, nil},
 		{"wide short image", "this too", 1, []slack.File{wide}, nil},
 		{"tiny image", "a small paste", 1, []slack.File{tiny}, nil},
+		{FilesUnthumbedImage, "a very long screenshot", 2, []slack.File{unthumbed("F0FILESIMG43", "IMG_0001.png", 0, 0)}, nil},
+		{FilesUnthumbedSized, "the same, with its size", 3, []slack.File{unthumbed("F0FILESIMG44", "IMG_0002.png", 828, 25208)}, nil},
 		{FilesThread, "A thread of images", 2, nil, []filesFixture{
 			{"thread image", "One in the thread", 1, ims(50, land), nil},
 			{"thread gallery", "Six in the thread", 3, ims(51, land, land, land, land, sq, port), nil},
