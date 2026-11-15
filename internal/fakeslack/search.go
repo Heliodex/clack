@@ -11,6 +11,8 @@ package fakeslack
 // other query matches the generated histories of the first channels.
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"sort"
@@ -373,6 +375,17 @@ func (s *Server) searchCorpus(withHistory bool) []searchHit {
 	return out
 }
 
+// escapeMarkers encodes an answer with its highlight markers JSON-escaped
+// (\ue000 / \ue001), as Slack's API writes every non-ASCII character;
+// encoding/json leaves them raw. search.inline answers this way, so the
+// popover's Recent messages see the wire form (a raw-only strip once
+// drew the markers as tofu there).
+func escapeMarkers(v any) []byte {
+	b, _ := json.Marshal(v)
+	b = bytes.ReplaceAll(b, []byte("\ue000"), []byte(`\ue000`))
+	return bytes.ReplaceAll(b, []byte("\ue001"), []byte(`\ue001`))
+}
+
 // hl wraps the query terms in Slack's highlight markers.
 func hl(text string, terms []string) string {
 	low := strings.ToLower(text)
@@ -381,7 +394,7 @@ func hl(text string, terms []string) string {
 			continue
 		}
 		if i := strings.Index(low, t); i >= 0 {
-			text = text[:i] + "" + text[i:i+len(t)] + "" + text[i+len(t):]
+			text = text[:i] + "\ue000" + text[i:i+len(t)] + "\ue001" + text[i+len(t):]
 			low = strings.ToLower(text)
 		}
 	}
@@ -665,8 +678,8 @@ func (s *Server) handleSearch(method string, f url.Values) (any, bool) {
 				"permalink": "https://fake.slack.com/archives/" + h.ch + "/p" + strings.ReplaceAll(h.m.TS, ".", ""),
 				"extracts":  []map[string]any{{"text": hl(text, o.terms), "truncated_head": head, "truncated_tail": false}}})
 		}
-		return ok("query", f.Get("query"), "items", items, "pagination", map[string]any{"total_count": n, "page": 1,
-			"per_page": cnt, "page_count": 1}), true
+		return escapeMarkers(ok("query", f.Get("query"), "items", items, "pagination", map[string]any{"total_count": n, "page": 1,
+			"per_page": cnt, "page_count": 1})), true
 	case "search.autocomplete.files":
 		q := strings.ToLower(strings.TrimSpace(f.Get("query")))
 		var files []any
