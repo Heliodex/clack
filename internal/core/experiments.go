@@ -280,8 +280,7 @@ var experimentReads = map[string][]string{
 	// rail (rail.go)
 	"unified_global_triage": on, "activity_in_home_prototype": on, "activity_inbox": on, "activity_with_sidebar": on,
 	// the Activity badge's entry types (activity_badges.go)
-	"code_review_requested_in_activity": on, "inviter_joiner_first_dm_v2": {"treatment"},
-	"agentforce_deprecation": on, "agent_tasks": on, "later_todos": on, "agents_landing_page": on, "agentic_ia": on,
+	"code_review_requested_in_activity": on, "agentforce_deprecation": on, "agent_tasks": on, "later_todos": on, "agents_landing_page": on, "agentic_ia": on,
 	// the Agents & tools peek's session menu (rail_peek_agents_menu.go: M/qt Kw, HLQ9 GL)
 	"agent_ux_august2026_release_translations": on, "agent_channel_thread_naming": on,
 	// activity (activity_agent.go: 5Ns/, M/qt ji; nested_secondary_view is
@@ -321,7 +320,7 @@ var experimentReads = map[string][]string{
 	"ia4_slash_command_fe":                                     on,
 	"unarchive_channel_banner_polish":                          on,
 	// code channels
-	"session_channels": on, "session_channels_code_tab_pr": on, "session_channels_gh_wo": on,
+	"session_channels": on, "session_channels_code_tab_pr": on,
 	"session_channels_inline_diff": on, "code_channels_naming": on, "session_channel_views": on,
 	"code_channels_auto_close": on, "session_channels_slug_peek": on, // channel_card.go ChannelTabSlugCard
 	// agents (agent.go; plan and task blocks: ui/blockkit/agent.go)
