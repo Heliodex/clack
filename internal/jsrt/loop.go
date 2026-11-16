@@ -33,11 +33,21 @@ type Runtime struct {
 	globalMu sync.RWMutex
 	global   map[string]int // window/document listener counts by event type
 
-	goid     atomic.Int64         // JS thread goroutine id
-	deadline atomic.Int64         // unix nanos; the running task is interrupted after it (0 = none)
-	running  atomic.Pointer[task] // the macrotask on the JS thread, for timeout lines (nil = none)
+	goid      atomic.Int64         // JS thread goroutine id
+	deadline  atomic.Int64         // monoNow; the running task is interrupted after it (0 = none)
+	taskStart atomic.Int64         // monoNow the running task began (0 = idle)
+	running   atomic.Pointer[task] // the macrotask on the JS thread, for timeout lines (nil = none)
 
 	interrupts atomic.Uint64 // watchdog interrupts (Interrupts)
+
+	// For freeze reports (Snapshots), written on the JS thread.
+	lastExit  atomic.Int64  // monoNow the JS thread last polled its interrupt or yielded
+	yields    atomic.Uint64 // host_yield calls (csrc/quickjs-yield.patch)
+	gcStart   atomic.Int64  // monoNow QuickJS's running collection began (0 = none)
+	gcLast    atomic.Int64  // the last collection's length (ns)
+	gcObjects atomic.Uint32 // objects the last collection scanned
+	gcs       atomic.Uint64 // collections so far
+	heap      atomic.Uint64 // JS heap bytes << 32 | live allocations (jr_heap)
 
 	// JS-thread-only state below.
 	eng        *engine
@@ -59,6 +69,11 @@ type Runtime struct {
 	builtins map[string]string
 	bootTime time.Duration
 	phases   []Phase
+
+	gcDepth   int    // nesting of QuickJS collections (gcEvent)
+	slowGCs   int    // slow collections not logged yet
+	slowGCMsg string // the latest one, logged after the task
+	slowGCLog int64  // monoNow of the last slow-collection line
 
 	initErr error
 	ready   chan struct{}
@@ -91,6 +106,7 @@ func New(opts Options) (*Runtime, error) {
 		start:   time.Now(),
 		ready:   make(chan struct{}),
 	}
+	live.Store(r, struct{}{})
 	go r.loop()
 	<-r.ready
 	if r.initErr != nil {
@@ -108,7 +124,7 @@ func (r *Runtime) Close() {
 		return
 	}
 	r.cancel()
-	r.deadline.Store(time.Now().UnixNano()) // interrupt whatever runs now
+	r.deadline.Store(monoNow()) // interrupt whatever runs now
 	r.signal()
 }
 
@@ -194,6 +210,7 @@ func curGoid() int64 {
 func (r *Runtime) loop() {
 	r.goid.Store(curGoid())
 	defer r.markDone()
+	defer live.Delete(r) // before Done fires; an abandoned runtime stays listed while it still runs
 	r.js = &Ctx{r: r}
 	r.initErr = r.boot()
 	close(r.ready)
@@ -255,14 +272,18 @@ func (r *Runtime) loop() {
 func (r *Runtime) runTask(t task) {
 	defer func() {
 		r.deadline.Store(0)
+		r.taskStart.Store(0)
 		r.running.Store(nil)
 		if p := recover(); p != nil {
 			r.afterPanic(p)
 		}
+		r.logSlowGC()
 	}()
+	start := monoNow()
 	t.start = time.Now()
 	r.running.Store(&t)
-	r.deadline.Store(t.start.Add(r.opts.Timeout).UnixNano())
+	r.taskStart.Store(start)
+	r.deadline.Store(start + int64(r.opts.Timeout))
 	t.f()
 	r.checkpoint()
 }
@@ -308,9 +329,9 @@ func (t *task) label() string {
 	if !t.start.IsZero() {
 		ran := time.Since(t.start) // monotonic
 		s += fmt.Sprintf(", running %v", ran.Round(time.Millisecond))
-		// The deadline is on the wall clock, which goes on while a Mac
-		// sleeps and the monotonic one doesn't: a wide gap is a sleep, not
-		// a slow task.
+		// The wall clock goes on while a Mac sleeps and the monotonic one
+		// (ran, and the deadline: monoNow) doesn't: a wide gap means the
+		// system slept during the task.
 		if wall := time.Now().Round(0).Sub(t.start.Round(0)); wall-ran > 2*time.Second {
 			s += fmt.Sprintf(", %v on the wall clock (the system slept?)", wall.Round(time.Second))
 		}
@@ -349,6 +370,9 @@ func (r *Runtime) checkpoint() {
 	r.eng.runJobs(r.js)
 	r.flushRender()
 	r.eng.gcFloor()
+	if r.eng != nil && r.eng.fns["jr_heap"] != nil && r.eng.mod != nil {
+		r.heap.Store(r.eng.call("jr_heap"))
+	}
 }
 
 // watchdog backs up the interrupt handler. QuickJS polls it in JS code,
@@ -372,7 +396,7 @@ func (r *Runtime) watchdog() {
 			return
 		case <-tick.C:
 		}
-		if d := r.deadline.Load(); d != 0 && time.Now().UnixNano() > d+int64(grace) {
+		if d := r.deadline.Load(); d != 0 && monoNow() > d+int64(grace) {
 			what := ""
 			if l := r.runningLabel(); l != "" {
 				what = " (" + l + ")"
@@ -394,11 +418,15 @@ func (r *Runtime) markDone() { r.doneOnce.Do(func() { close(r.done) }) }
 // callers waiting on a promise can use this to stop. Any goroutine.
 func (r *Runtime) Interrupts() uint64 { return r.interrupts.Load() }
 
-// interrupted is polled by the engine's interrupt handler.
-func (r *Runtime) interrupted() bool {
-	d := r.deadline.Load()
-	return d != 0 && time.Now().UnixNano() > d
-}
+// monoBase anchors the clock of every jsrt deadline. time.Since reads the
+// monotonic clock, which (unlike UnixNano's wall clock) stands still while
+// the computer sleeps: a task that was running when the lid closed isn't
+// past its deadline on wake, so the watchdog doesn't abandon the runtime
+// (and restart every plugin) over a sleep.
+var monoBase = time.Now()
+
+// monoNow is the time since monoBase in ns on the monotonic clock; never 0.
+func monoNow() int64 { return int64(time.Since(monoBase)) + 1 }
 
 // ---- timers (setTimeout & co. are JS wrappers around these) ----
 
