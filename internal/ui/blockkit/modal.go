@@ -142,6 +142,18 @@ func (s *Stack) Dismiss() {
 	s.userBack()
 }
 
+// Close closes the whole stack without the speedbump, telling Slack (the
+// ×'s closeAll): the window closing everything (Replay introduction).
+func (s *Stack) Close() {
+	switch {
+	case s.done:
+	case len(s.views) == 0 && s.dialog == nil:
+		s.close()
+	default:
+		s.closeAll()
+	}
+}
+
 // Slack's speedbump (BlockKitModal getShouldShowSpeedBump): leaving a
 // view that has a submit button and stateful inputs whose values changed
 // asks first. Backing out of a pushed view says "Continue", otherwise
@@ -228,6 +240,17 @@ func (s *Stack) close() {
 	s.h.Invalidate()
 }
 
+// FocusHome is where the focus comes back to in the stack (its overlay
+// layer's home: a Popover in a view closed, or the focus went): its last
+// stop, where it opened with the focus.
+func (s *Stack) FocusHome() event.Tag {
+	if len(s.views) == 0 {
+		return &s.tag
+	}
+	st := s.stops()
+	return st[len(st)-1]
+}
+
 // stops is the tab order: the header (back, close) first, as in Slack's
 // c-dialog, then the footer's Close and Submit. The body's inputs take
 // the focus with the mouse.
@@ -253,7 +276,11 @@ func (s *Stack) keys(gtx C) {
 	}
 	if !s.focused {
 		s.focused = true
-		s.prev = refocus.Last(gtx.Now)
+		if !slackc.FocusInPluginLayer(gtx) {
+			// opened from a plugin's layer, the window's overlay stack gives
+			// the focus back there (slackc layers.go)
+			s.prev = refocus.Last(gtx.Now)
+		}
 		st := s.stops()
 		gtx.Execute(key.FocusCmd{Tag: st[len(st)-1]})
 	}
