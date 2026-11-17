@@ -103,6 +103,17 @@ type typer interface{ Typing() string }
 // (set through a small adapter in mount_features.go).
 type originSetter interface{ SetOrigin(image.Point) }
 
+// layoutComposerIn lays comp out with its plugin components in slackc
+// pane pane (composer.LayoutIn); a composer without one lays out as it is.
+func layoutComposerIn(comp composerView, gtx layout.Context, pane string) layout.Dimensions {
+	if p, ok := comp.(interface {
+		LayoutIn(layout.Context, string) layout.Dimensions
+	}); ok {
+		return p.LayoutIn(gtx, pane)
+	}
+	return comp.Layout(gtx)
+}
+
 // composerView is what the shell needs from composer.Composer.
 type composerView interface {
 	View
@@ -129,6 +140,14 @@ type convo struct {
 	bannerH  int             // its height last frame
 	post     core.Posting    // posting restrictions, cached at postAt
 	postAt   time.Time
+	// zeroSince is when the composer started laying out to no height (zero:
+	// it has its height); rebuiltAt when it was last replaced for that
+	// (composer_guard.go).
+	zeroSince, rebuiltAt time.Time
+	// focusKnown: a navigation here wanted the composer focused while the
+	// channel's membership was unknown (footPending); the first frame that
+	// knows it gives the composer the focus, if it has one
+	focusKnown bool
 }
 
 func (a *App) convoFor(ch, ts string) *convo {
@@ -137,6 +156,7 @@ func (a *App) convoFor(ch, ts string) *convo {
 		a.convos = map[string]*convo{}
 	}
 	if c := a.convos[k]; c != nil {
+		a.convoOrder = lruTouch(a.convoOrder, k) // view_lru.go
 		return c
 	}
 	c := &convo{ch: ch, ts: ts}
@@ -145,27 +165,35 @@ func (a *App) convoFor(ch, ts string) *convo {
 	} else {
 		c.list = a.mountThreadList(ch, ts)
 	}
-	if cv, ok := a.mountComposer(ch, ts).(composerView); ok {
-		c.comp = cv
-		c.comp.SetOnEditLast(func() { a.editLast(c) })
-		if fl, ok := c.comp.(interface{ SetOnFocusList(func()) }); ok {
-			fl.SetOnFocusList(func() { a.focusList(c) })
-		}
-		if sn, ok := c.comp.(interface{ SetOnSend(func(string, bool)) }); ok {
-			sn.SetOnSend(func(cid string, files bool) { jumpToOwnSend(c, cid, files) })
-		}
-	}
+	a.attachComposer(c)
 	a.convos[k] = c
 	a.convoOrder = append(a.convoOrder, k)
-	if len(a.convoOrder) > 32 {
-		old := a.convoOrder[0]
+	if len(a.convoOrder) > maxConvos {
+		old := a.convoOrder[0] // the least recently used
 		a.convoOrder = a.convoOrder[1:]
 		if oc := a.convos[old]; oc != nil && oc.comp != nil {
 			oc.comp.Close() // saves the draft
 		}
 		delete(a.convos, old)
+		noteEvicted("convo", old)
 	}
 	return c
+}
+
+// attachComposer mounts c's composer and wires it to c's list.
+func (a *App) attachComposer(c *convo) {
+	cv, ok := a.mountComposer(c.ch, c.ts).(composerView)
+	if !ok {
+		return
+	}
+	c.comp = cv
+	c.comp.SetOnEditLast(func() { a.editLast(c) })
+	if fl, ok := c.comp.(interface{ SetOnFocusList(func()) }); ok {
+		fl.SetOnFocusList(func() { a.focusList(c) })
+	}
+	if sn, ok := c.comp.(interface{ SetOnSend(func(string, bool)) }); ok {
+		sn.SetOnSend(func(cid string, files bool) { jumpToOwnSend(c, cid, files) })
+	}
 }
 
 // layoutConvo draws the list with the composer under it. fallback is the
@@ -203,7 +231,20 @@ func (a *App) layoutConvo(gtx layout.Context, c *convo, fallback image.Point) la
 	compH := 0
 	var call op.CallOp
 	foot := a.footerFor(c)
-	if foot != footNone {
+	if foot != footPending && c.focusKnown {
+		// the navigation's focus, held while membership was unknown
+		// (focusAfterNavigate): MessagePaneInput's onFocusTransition once
+		// the input mounts
+		c.focusKnown = false
+		if foot == footNone && c.comp != nil && c.edit == nil && a.router.Current().Channel() == c.ch && !a.overlayOpen() {
+			c.comp.Focus()
+		}
+	}
+	switch foot {
+	case footNone:
+	case footPending:
+		comp = nil // membership unknown: neither the composer nor a footer yet
+	default:
 		// a preview or an archived channel: Slack's footer, no composer
 		comp = nil
 		m := op.Record(gtx.Ops)
@@ -239,7 +280,19 @@ func (a *App) layoutConvo(gtx layout.Context, c *convo, fallback image.Point) la
 		g := gtx
 		g.Constraints = layout.Constraints{Min: image.Pt(sz.X-2*mx, 0), Max: image.Pt(sz.X-2*mx, sz.Y*6/10)}
 		st := op.Offset(image.Pt(mx, 0)).Push(gtx.Ops)
-		d := comp.Layout(g)
+		// in its list's slackc pane: the plugin roots are this
+		// conversation's, never another place's composer for it
+		pane := ""
+		if p, ok := c.list.(interface{ PaneID() string }); ok {
+			pane = p.PaneID()
+		}
+		d := layoutComposerIn(comp, g, pane)
+		if a.composerHeight(gtx, g, c, comp, d.Size.Y) { // no height: a new composer (composer_guard.go)
+			comp = c.comp
+			comp.SetOrigin(origin.Add(image.Pt(mx, compY)))
+			a.composerRoadblock(c, comp)
+			d = layoutComposerIn(comp, g, pane)
+		}
 		st.Pop()
 		call = m.Stop()
 		compH = d.Size.Y + mb
@@ -285,7 +338,7 @@ func (a *App) layoutConvo(gtx layout.Context, c *convo, fallback image.Point) la
 		defer clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops).Pop()
 		return c.list.Layout(gtx)
 	})
-	if comp != nil || foot != footNone {
+	if comp != nil || (foot != footNone && foot != footPending) {
 		t := op.Offset(image.Pt(0, listH)).Push(gtx.Ops)
 		call.Add(gtx.Ops)
 		t.Pop()

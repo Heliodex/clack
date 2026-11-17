@@ -279,6 +279,7 @@ func (a *App) tabDragEvent(gtx layout.Context, d *tabDragState, e pointer.Event,
 		}
 		a.Invalidate()
 	case pointer.Release:
+		was := d.pressed || d.dragging
 		if d.dragging {
 			d.swallow = true
 			if tgt, ok := a.dragTarget(d); ok {
@@ -289,10 +290,15 @@ func (a *App) tabDragEvent(gtx layout.Context, d *tabDragState, e pointer.Event,
 			}
 		}
 		d.pressed, d.dragging = false, false
-		a.Invalidate()
+		if was { // nothing to redraw for a release or cancel no press began here
+			a.Invalidate()
+		}
 	case pointer.Cancel:
+		was := d.pressed || d.dragging
 		d.pressed, d.dragging = false, false
-		a.Invalidate()
+		if was { // a scroll's grab or the window's focus going cancels every handler
+			a.Invalidate()
+		}
 	}
 }
 
@@ -601,11 +607,8 @@ func (a *App) dragPreview(gtx layout.Context, d *tabDragState, h int) {
 		return
 	}
 	t := d.all[d.src.idx]
-	lw := a.th.Measure(gtx, 13, theme.Bold, t.label)
-	if t.spans != nil {
-		lw = a.spansWidth(gtx, t.spans, 13)
-	}
-	w := gtx.Dp(8) + gtx.Dp(16) + gtx.Dp(4) + lw + gtx.Dp(8)
+	lw := a.tabLabelWidth(gtx, t)
+	w := tabWidth(gtx, t, lw)
 	off := op.Offset(d.at.Round()).Push(gtx.Ops)
 	defer off.Pop()
 	r := image.Rectangle{Max: image.Pt(w, h)}

@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/some-du6e/clack/internal/richtext"
 	"github.com/some-du6e/clack/internal/slack"
 	"github.com/some-du6e/clack/internal/store"
 )
@@ -36,7 +37,9 @@ type File struct {
 	Channels         []string // channels, groups and DMs it is shared in
 	Mode             string   // hosted | external | quip | list | tombstone | …
 	IsCanvas, IsList bool
-	IsImage          bool
+	// IsImage is Slack's fileIsImage (slack.FileIsImage): image/* with
+	// thumbs, so an image Slack made no thumbs for is a plain file.
+	IsImage bool
 	// LastRead is when the viewer last opened it (last_read: milliseconds
 	// or seconds, 0 never), for the collections' Last viewed sort.
 	LastRead int64
@@ -166,10 +169,20 @@ type UsergroupOpts struct {
 type Tab struct {
 	ID, Type     string // Type: canvas | list | folder | bookmarks | files | workflows | channel_canvas | …
 	Label, Title string // Title: what to show (file title, "Bookmarks", "Deleted file", …)
-	FileID       string // canvas / list tabs
-	Deleted      bool   // the tab's file is gone
-	Unread       bool   // a canvas the viewer never opened (no last_read): Slack's blue tab dot
-	Bookmarks    []Bookmark
+	// TitleSpans is an unlabeled canvas tab's title as Slack draws it:
+	// the file's title_blocks (useTabLabel's file Name → QuipTitleParsedId),
+	// where a channel element reads #name, not the title string's raw
+	// <#C…> token. Title is then their plain text. Nil without title_blocks.
+	TitleSpans []richtext.Span
+	// FileTitle is the tab file's title string (files.info title, else its
+	// name), set even when the tab has a label of its own. Slack's
+	// SmallFileEntity reads a leading :emoji: from it for an unlabeled
+	// tab's icon (getFileTitle).
+	FileTitle string
+	FileID    string // canvas / list tabs
+	Deleted   bool   // the tab's file is gone
+	Unread    bool   // a canvas the viewer never opened (no last_read): Slack's blue tab dot
+	Bookmarks []Bookmark
 	// DefaultView is a list tab's data.lists_channel_tab_default_refine_view_id
 	// (Slack's listsChannelTabDefaultRefineViewId), ViewName that view's
 	// name in the list's list_metadata.views (getListViewById), "" when
@@ -181,6 +194,13 @@ type Tab struct {
 	// AppID is a tab's data.app_id (an agent's own tab: the Channel
 	// Expert's knowledge folder).
 	AppID string
+	// TitleUnknown: the tab's file read (files.info) failed, so Title,
+	// TitleSpans, FileTitle, Deleted, Unread and ViewName are the
+	// defaults; BookmarksUnknown: a folder tab's bookmarks.list failed, so
+	// Bookmarks is empty. A caller holding an earlier read keeps that part
+	// of it (ui backend.opened).
+	TitleUnknown     bool `json:",omitempty"`
+	BookmarksUnknown bool `json:",omitempty"`
 }
 
 // MemberCounts is edge users/counts. Slack's channel header shows People.
@@ -273,12 +293,16 @@ type browseFileRaw struct {
 	Mode       string          `json:"mode"`
 	IsDeleted  bool            `json:"is_deleted"`
 	FileAccess string          `json:"file_access"`
+	// fileIsImage's other thumbs and its Salesforce case (slack.FileIsImage)
+	Thumb360GIF      string `json:"thumb_360_gif"`
+	Thumb800         string `json:"thumb_800"`
+	IsSalesforceFile bool   `json:"is_salesforce_file"`
 }
 
 func (r *browseFileRaw) file() File {
 	f := File{ID: r.ID, Name: stripHighlight.Replace(r.Name), Title: stripHighlight.Replace(r.Title),
 		Filetype: r.Filetype, PrettyType: r.PrettyType, Mime: r.Mimetype, User: r.User,
-		Thumb: firstNonEmpty(r.Thumb360, r.ThumbPDF, r.ThumbVideo), URL: r.URLPrivate, Permalink: r.Permalink,
+		Thumb: firstNonEmpty(r.Thumb360, r.Thumb360GIF, r.ThumbPDF, r.ThumbVideo), URL: r.URLPrivate, Permalink: r.Permalink,
 		ThumbW: r.Thumb360W, ThumbH: r.Thumb360H, Size: r.Size, Created: r.Created, Modified: r.Updated, Mode: r.Mode,
 		Timestamp: r.Timestamp}
 	if f.Created == 0 {
@@ -290,7 +314,11 @@ func (r *browseFileRaw) file() File {
 	f.Channels = append(append(append(f.Channels, r.Channels...), r.Groups...), r.IMs...)
 	f.IsCanvas = r.Filetype == "quip" || r.Filetype == "canvas" || r.Mode == "quip" || strings.EqualFold(r.PrettyType, "canvas")
 	f.IsList = !f.IsCanvas && (r.Filetype == "list" || r.Mode == "list" || strings.EqualFold(r.PrettyType, "list"))
-	f.IsImage = strings.HasPrefix(r.Mimetype, "image/")
+	// fileIsImage: an image/* file Slack made no thumbs for (a very tall
+	// screenshot) is a plain file here, as in Slack's Files browser and
+	// channel Files tab (getMainFileAction "download", not the viewer)
+	f.IsImage = slack.FileIsImage(&slack.File{Mimetype: r.Mimetype, Filetype: r.Filetype, Thumb360: r.Thumb360,
+		Thumb360GIF: r.Thumb360GIF, Thumb800: r.Thumb800, IsSalesforceFile: r.IsSalesforceFile})
 	var lr json.Number
 	if len(r.LastRead) > 0 && json.Unmarshal(r.LastRead, &lr) == nil {
 		f.LastRead, _ = lr.Int64()
@@ -923,6 +951,9 @@ func (a *App) Tabs(ctx context.Context, ch string) ([]Tab, error) {
 			bms, err := a.Bookmarks(ctx, ch)
 			if err != nil {
 				log.Printf("tabs %s: bookmarks.list: %v", ch, err)
+				for _, i := range folderTabs {
+					out[i].BookmarksUnknown = true
+				}
 				return
 			}
 			byParent := map[string][]Bookmark{}
@@ -945,20 +976,29 @@ func (a *App) Tabs(ctx context.Context, ch string) ([]Tab, error) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			title, deleted, unread, views, err := a.tabFileTitle(ctx, t.FileID)
+			f, err := a.tabFileTitle(ctx, t.FileID)
 			if err != nil {
 				log.Printf("tabs %s: files.info %s: %v", ch, t.FileID, err)
+				t.TitleUnknown = true
 				return
 			}
-			if deleted {
+			if !f.deleted {
+				t.FileTitle = f.title
+			}
+			if f.deleted {
 				t.Title, t.Deleted = "Deleted file", true
-			} else if title != "" && t.Label == "" {
-				t.Title = title // a tab's own label wins (RenameTabModal: "Clear text to default to file name")
+			} else if f.title != "" && t.Label == "" {
+				t.Title = f.title // a tab's own label wins (RenameTabModal: "Clear text to default to file name")
+				if t.Type == "canvas" {
+					if sp := a.tabTitleSpans(ctx, f.titleBlocks, f.title); len(sp) > 0 {
+						t.TitleSpans, t.Title = sp, richtext.PlainSpans(sp)
+					}
+				}
 			}
 			if t.Type == "list" && t.DefaultView != "" {
-				t.ViewName = views[t.DefaultView]
+				t.ViewName = f.views[t.DefaultView]
 			}
-			t.Unread = unread && !deleted && t.Type == "canvas"
+			t.Unread = f.unread && !f.deleted && t.Type == "canvas"
 		}(&out[i])
 	}
 	wg.Wait()
@@ -966,13 +1006,22 @@ func (a *App) Tabs(ctx context.Context, ch string) ([]Tab, error) {
 	return out, nil
 }
 
-// tabFileTitle returns a tab file's title, or deleted when it is gone, and
-// unread when the viewer never opened it (files.info has no last_read);
-// for a list, its views' names by id (list_metadata.views).
-func (a *App) tabFileTitle(ctx context.Context, fileID string) (title string, deleted, unread bool, views map[string]string, err error) {
+// tabFile is what a tab needs from its file's files.info.
+type tabFile struct {
+	title       string
+	deleted     bool              // the file is gone (not found, tombstone)
+	unread      bool              // the viewer never opened it (no last_read)
+	views       map[string]string // a list's views' names by id (list_metadata.views)
+	titleBlocks json.RawMessage   // a canvas's title_blocks
+}
+
+// tabFileTitle reads a tab file's title, title_blocks, deleted and unread
+// state and, for a list, its views' names.
+func (a *App) tabFileTitle(ctx context.Context, fileID string) (tabFile, error) {
 	var r struct {
 		File struct {
 			browseFileRaw
+			TitleBlocks  json.RawMessage `json:"title_blocks"`
 			ListMetadata struct {
 				Views []struct {
 					ID   string `json:"id"`
@@ -981,24 +1030,73 @@ func (a *App) tabFileTitle(ctx context.Context, fileID string) (title string, de
 			} `json:"list_metadata"`
 		} `json:"file"`
 	}
-	err = a.C.Call(ctx, "files.info", url.Values{"file": {fileID}}, &r)
+	err := a.C.Call(ctx, "files.info", url.Values{"file": {fileID}}, &r)
 	if isCode(err, "file_not_found", "file_deleted") {
-		return "", true, false, nil, nil
+		return tabFile{deleted: true}, nil
 	}
 	if err != nil {
-		return "", false, false, nil, err
+		return tabFile{}, err
 	}
 	if r.File.Mode == "tombstone" || r.File.IsDeleted {
-		return "", true, false, nil, nil
+		return tabFile{deleted: true}, nil
 	}
+	f := tabFile{title: firstNonEmpty(r.File.Title, r.File.Name), titleBlocks: r.File.TitleBlocks}
 	if vs := r.File.ListMetadata.Views; len(vs) > 0 {
-		views = make(map[string]string, len(vs))
+		f.views = make(map[string]string, len(vs))
 		for _, v := range vs {
-			views[v.ID] = v.Name
+			f.views[v.ID] = v.Name
 		}
 	}
 	lr := strings.TrimSpace(string(r.File.LastRead))
-	return firstNonEmpty(r.File.Title, r.File.Name), false, lr == "" || lr == "null" || lr == "0", views, nil
+	f.unread = lr == "" || lr == "null" || lr == "0"
+	return f, nil
+}
+
+// tabTitleSpans is an unlabeled canvas tab's label (useTabLabel, boot-shared
+// 83sY → the file's Name, client-boot c9YI → renderQuipTitle, GF/w
+// QuipTitleParsedId): its title_blocks' first block, as the canvas header
+// reads them (canvasInfo). Slack never parses the title string's <#C…>
+// tokens (that path is FormatTextWithEmoji, emoji only), so nil without
+// title_blocks. Channels and users the blocks mention that the store
+// doesn't know are looked up first: a channel element reads #name, or
+// BaseMissingChannel's "Private channel" when conversations.info says
+// channel_not_found (BaseMrkdwnChannel's isNonExistent).
+func (a *App) tabTitleSpans(ctx context.Context, blocks json.RawMessage, title string) []richtext.Span {
+	switch strings.TrimSpace(string(blocks)) {
+	case "", "null", "[]":
+		return nil
+	}
+	build := func() []richtext.Span {
+		d := richtext.FromMessage(a.S, &slack.Message{Text: title, Blocks: blocks})
+		if len(d.Blocks) == 0 {
+			return nil
+		}
+		return d.Blocks[0].Spans
+	}
+	sp := build()
+	var users []string
+	fetched := false
+	for _, s := range sp {
+		switch s.Kind {
+		case richtext.Channel:
+			if _, known := a.Conv(s.ID); !known && s.ID != "" && a.S.ChannelAccess(s.ID) == richtext.ChannelUnresolved {
+				a.ResolveConv(ctx, s.ID)
+				fetched = true
+			}
+		case richtext.User:
+			if s.ID != "" {
+				users = append(users, s.ID)
+			}
+		}
+	}
+	if len(a.S.MissingUsers(users)) > 0 {
+		a.EnsureUsers(ctx, users)
+		fetched = true
+	}
+	if fetched {
+		sp = build()
+	}
+	return sp
 }
 
 // RemoveTab deletes a tab from a channel's tab bar (conversations.removeTab;

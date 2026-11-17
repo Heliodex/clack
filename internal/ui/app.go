@@ -165,6 +165,7 @@ type App struct {
 
 	router          router
 	clicks          clickables
+	wd              *watchdog    // the frame watchdog (Run; nil in tests)
 	hdrx            *headerExtra // the channel header's topic card and edit-name tooltip (channel_mpdm.go)
 	joinBannerCh    string       // the channel whose join banner was last laid out (joinbanner.go)
 	megaBooted      bool         // the megaphone boot load went out (joinbanner.go)
@@ -199,6 +200,7 @@ type App struct {
 	ptrOK           bool
 	hover           profileHover // the profile hover card (hover_card.go)
 	overlays        []Overlay
+	overlayLayers   map[Overlay]*shellLayer // the overlays' layers in the window's stack (overlay_layers.go)
 	slackc          slackcState
 	toast           toastState
 	toastClick      gesture.Click // a rich toast's links (toast_slack.go)
@@ -207,6 +209,15 @@ type App struct {
 	intro           *intro // the introduction: first launch, or replayed (intro.go)
 	welcome         *intro // the sign-in backdrop's state when no introduction runs
 	motionOverride  int    // tests: 1 reduced motion, -1 full motion, 0 the OS and Slack's setting
+	// inert: the introduction's preview renderer (intro_preview_child.go):
+	// no Dock, taskbar or tray badge, no notification, sound or bounce
+	inert bool
+	// previews are the introduction's renderers still running (intro_preview.go): quit waits for them
+	previews sync.WaitGroup
+	// pinAcct keeps the account theme ui.json gave: the account's prefs
+	// don't replace it (the preview renderer draws the window's theme over
+	// the demo workspace's prefs)
+	pinAcct bool
 
 	views     map[Route]View // cached primary views (instant switch)
 	viewOrder []Route
@@ -220,6 +231,7 @@ type App struct {
 	title       string
 	firstPaint  bool
 	frameStats  frameStats
+	frameSeq    atomic.Uint64 // frames laid out (FrameSeq)
 	lastChannel string
 	dock        dockState // the macOS Dock badge last set (dock.go)
 	// previewFrom is the channel-browser route previewFromCh was opened
@@ -290,9 +302,18 @@ type App struct {
 	standIn          bool                       // keepBody's draw is running
 	standIns         int                        // keepBody draws so far
 	missedFrameLog   focusLog                   // the missed-frame log line (focus_log.go)
+	shownConvos      shownConvos                // the conversations the last frame showed (composer_release.go)
 	sw               startupWatch               // the startup timeline (startup.go)
 	rv               revealState                // the cover until the window is ready (reveal.go)
 	panelOrigin      image.Point                // the primary panel's window origin this frame
+
+	// quiet frames (quiet.go): an Invalidate since the last frame (layout
+	// to do), an animation repaint since then, what the last full frame
+	// was drawn for, and how many frames were quiet
+	layoutDue, animDue atomic.Bool
+	quiet              quietState
+	quietFrames        atomic.Uint64 // QuietFrames
+	quietWhy           string        // why the last frame wasn't quiet ("" when it was; tests, the perf job)
 
 	swipe         swiper          // trackpad history swipes (swipe.go, nav.go)
 	swipeNow      swipeState      // this frame's swipe progress, for the arrow
@@ -395,6 +416,11 @@ func (a *App) postLazy(f func()) {
 	a.mu.Unlock()
 }
 
+// FrameSeq counts the frames laid out so far (any goroutine): a view that
+// notes it as it draws knows, from an event's goroutine, whether it is
+// still on screen (views' shownTracker).
+func (a *App) FrameSeq() uint64 { return a.frameSeq.Load() }
+
 // Invalidate requests a redraw. It is safe from any goroutine, including the
 // UI goroutine mid-layout and AppKit callbacks: it never calls into Gio itself.
 //
@@ -406,6 +432,7 @@ func (a *App) postLazy(f func()) {
 // before the freeze watchdog can report it. That was the macOS launch
 // beachball. Only invalidator, on its own goroutine, may call it.
 func (a *App) Invalidate() {
+	a.layoutDue.Store(true) // not a quiet frame (quiet.go)
 	if h := invalidateHook; h != nil {
 		h(a)
 	}
@@ -467,6 +494,7 @@ func (a *App) Run() error {
 	}
 	if a.images != nil {
 		a.images.SetInvalidate(a.imagesReady) // huddle_wire.go
+		a.wireQuietFrames()                   // animations repaint as quiet frames (quiet.go)
 		a.th.Images = a.images
 	}
 	if installHooks != nil {
@@ -485,6 +513,9 @@ func (a *App) Run() error {
 	var ops, coverOps op.Ops
 	uiguard.MarkUI() // this goroutine handles every window event (uiguard)
 	wd := newWatchdog(a.opts.ConfigDir, a.opts.Started)
+	// the execution trace of the seconds before a slow frame (flightrec.go)
+	wd.startRecorder(a.prefs.FlightRecorder)
+	a.wd = wd // drainIdle's stage
 	go wd.run()
 	for {
 		ev := a.win.Event()
@@ -508,6 +539,7 @@ func (a *App) Run() error {
 		case app.DestroyEvent:
 			wd.end()
 			wd.stop()
+			a.shutdownIntro() // the introduction's preview renderer and its folder (intro_preview.go)
 			if a.hud != nil {
 				a.hud.Close() // leave the huddle cleanly (Chime LEAVE)
 			}
@@ -528,16 +560,22 @@ func (a *App) Run() error {
 			if a.closeToTray() {
 				e.Abort()
 			}
-			a.drainIdle() // Gio counts every event as the wake-up (below)
+			a.layoutDue.Store(true) // UI work between frames: not a quiet frame next (quiet.go)
+			a.drainIdle()           // Gio counts every event as the wake-up (below)
 		case app.FileDropEvent: // files dragged from the OS (Gio patch 11, drop_overlay.go)
 			a.fileDrop(e)
+			a.layoutDue.Store(true)
 			a.drainIdle()
 		case app.ConfigEvent:
+			a.layoutDue.Store(true)
 			a.winMode = e.Config.Mode
 			a.noteWindowPlace(e.Config) // mainWindowSettings (winbounds.go)
 			if e.Config.Focused && !a.focused {
 				a.nudgeUpdates()       // back from sleep, often: is a check due?
 				a.loginWindowFocused() // a sign-in link copied in the browser (login.go)
+			}
+			if e.Config.Focused != a.focused {
+				a.Invalidate() // the indicators an inactive window held still move on (indicatorFrame)
 			}
 			a.focused = e.Config.Focused
 			a.drainIdle()
@@ -579,12 +617,23 @@ func (a *App) Run() error {
 			}
 			// patch points (slackc) are shared with the huddle call window
 			slackc.LockFrame()
+			if a.tryQuietFrame(e.Now, e.Size, e.Metric, e.Insets, e.Asked, e.AskedAt, e.Source) {
+				// only an animation asked for this frame: the last one's
+				// ops again, the GPU drawing each animation's frame now
+				// (quiet.go)
+				slackc.UnlockFrame()
+				wd.next(&stageSubmit)
+				e.Frame(&ops)
+				a.frameStats.addQuiet(time.Since(t0))
+				break
+			}
 			wd.next(&stagePosted)
 			a.drain()
 			wd.next(&stageLayout)
 			wd.notePage(a.router.Current().Page())
 			gtx := a.newContext(&ops, e)
 			before := a.router.Current()
+			a.beginFullFrame()
 			a.frame(gtx)
 			if a.router.Current() != before {
 				// A click navigated mid-frame (after the sidebar/panel split
@@ -592,9 +641,11 @@ func (a *App) Run() error {
 				// one frame with the old layout. Layout is ~2 ms.
 				ops.Reset()
 				gtx = a.newContext(&ops, e)
+				a.beginFullFrame()
 				a.frame(gtx)
 			}
 			covered := a.revealFrame()
+			a.noteFullFrame(e.Size, e.Metric, e.Insets, covered)
 			slackc.UnlockFrame()
 			tl := time.Now()
 			wd.next(&stageSubmit)
@@ -689,6 +740,8 @@ func (a *App) frame(gtx layout.Context) {
 	sz := gtx.Constraints.Max
 	a.pxPerDp = gtx.Metric.PxPerDp
 	a.winSize = sz
+	windowActive.Store(a.focused) // the indicators turn only in an active window (indicatorFrame)
+	a.frameSeq.Add(1)
 	a.syncWheelAnimation()
 	a.syncThemeTokens()
 	a.focusFadeFrame(gtx) // focus mode's view transition (focus_fade.go)
@@ -752,13 +805,16 @@ func (a *App) frame(gtx layout.Context) {
 	a.layoutHoverCardOver(gtx) // over a dialog whose own list has triggers
 	a.slackcOverlays(gtx)
 	a.layoutToast(gtx)
+	a.layoutWorkflowRunToast(gtx)
 	a.layoutIntroOverlay(gtx) // Replay introduction, over everything
 	// middle-click autoscroll's window-wide area: over everything but the
 	// tracker
 	a.autoscroll.End(gtx.Ops, gtx.Source, sz)
 	a.rootPointer(gtx)
 	a.resizeOverlay(gtx)      // over everything while a column resizer drags (resizer.go)
+	slackc.RouteEscape(gtx)   // an Escape no widget took goes to the overlay layers (slackc layers.go)
 	a.keys.processGlobal(gtx) // last: only the keys no widget took
+	a.releaseHidden(gtx)      // composers taken off the screen let go of the focus (composer_release.go)
 	composer.KeepFocus(gtx)   // a focused editor this frame didn't draw stays focused
 	a.logMissedFrames(gtx)    // after KeepFocus: what it held this frame
 	a.clickMods = 0           // splitClick: only this frame's click
@@ -839,6 +895,7 @@ func (a *App) layoutShell(gtx layout.Context) image.Rectangle {
 	if !a.th.Dark { // dark mode uses Slack's 1px outline instead (below)
 		theme.Shadow(gtx, ws.Add(image.Pt(-gtx.Dp(2), -gtx.Dp(2))), rad, gtx.Dp(8), a.th.C.PanelShadow)
 	}
+	theme.FrameCostProbe(gtx) // tests only: moves every later path in the atlas
 	if sbW > 0 {
 		sb := image.Rect(ws.Min.X, ws.Min.Y, primary.Min.X, ws.Max.Y)
 		a.grad.draw(gtx, sz, image.Point{}, clip.RRect{Rect: sb, NW: rad, SW: rad}.Op(gtx.Ops), a.th.C.ChromeA, a.th.C.ChromeB, a.th.C.SidebarBg)
@@ -855,8 +912,9 @@ func (a *App) layoutShell(gtx layout.Context) image.Rectangle {
 		nw, sw = rad, rad
 	}
 	func() {
-		defer clip.RRect{Rect: primary, NW: nw, SW: sw, NE: rad, SE: rad}.Push(gtx.Ops).Pop()
-		theme.Fill(gtx, primary, a.th.C.Bg)
+		rr := clip.RRect{Rect: primary, NW: nw, SW: sw, NE: rad, SE: rad}
+		defer rr.Push(gtx.Ops).Pop()
+		theme.FillPanel(gtx, rr, a.th.C.Bg)
 		atExact(gtx, primary.Min, primary.Size(), a.layoutPrimary)
 	}()
 	if sbW > 0 {
@@ -966,16 +1024,20 @@ func pageOwnsWorkspace(r Route) bool {
 // view returns the cached view for route r, creating it with mk.
 func (a *App) view(r Route, mk func() View) View {
 	if v, ok := a.views[r]; ok {
+		a.viewOrder = lruTouch(a.viewOrder, r) // view_lru.go
 		return v
 	}
 	v := mk()
 	a.views[r] = v
 	a.viewOrder = append(a.viewOrder, r)
-	if len(a.viewOrder) > 24 { // keep the 24 most recent views warm
+	if len(a.viewOrder) > maxViews { // keep the 24 most recently used views warm
 		old := a.viewOrder[0]
 		a.viewOrder = a.viewOrder[1:]
 		if old != a.router.Current() {
 			delete(a.views, old)
+			noteEvicted("view", string(old))
+		} else {
+			a.viewOrder = append(a.viewOrder, old) // the page on screen stays (and stays in the order)
 		}
 	}
 	return v
@@ -1052,8 +1114,9 @@ func (a *App) layoutOverlays(gtx layout.Context) {
 		if i < len(panes) {
 			p = panes[i]
 		}
-		a.inPane(p, func() { o.Layout(g) })
+		a.inPane(p, func() { a.drawOverlay(g, o) })
 	}
+	a.pruneOverlayLayers()
 }
 
 type toastState struct {
@@ -1164,6 +1227,15 @@ type frameStats struct {
 	layout time.Duration
 	max    time.Duration
 	last   time.Time
+	quiet  int           // of n: quiet frames (quiet.go)
+	qtotal time.Duration // their time
+}
+
+// addQuiet counts a quiet frame (no layout) of d.
+func (s *frameStats) addQuiet(d time.Duration) {
+	s.quiet++
+	s.qtotal += d
+	s.add(d, 0)
 }
 
 func (s *frameStats) add(d, layout time.Duration) {
@@ -1175,7 +1247,8 @@ func (s *frameStats) add(d, layout time.Duration) {
 	}
 	if envFlag("FRAMESTATS") && time.Since(s.last) > 5*time.Second && s.n > 0 {
 		n := time.Duration(s.n)
-		log.Printf("ui: %d frames, avg %v (layout %v), max %v", s.n, (s.total / n).Round(10*time.Microsecond), (s.layout / n).Round(10*time.Microsecond), s.max.Round(10*time.Microsecond))
+		log.Printf("ui: %d frames, avg %v (layout %v), max %v; %d quiet (no layout, avg %v)", s.n, (s.total / n).Round(10*time.Microsecond), (s.layout / n).Round(10*time.Microsecond), s.max.Round(10*time.Microsecond),
+			s.quiet, (s.qtotal / time.Duration(max(s.quiet, 1))).Round(10*time.Microsecond))
 		s.last = time.Now()
 		*s = frameStats{last: s.last}
 	}

@@ -33,6 +33,7 @@ import (
 	"github.com/some-du6e/clack/internal/ui/hovercard"
 	"github.com/some-du6e/clack/internal/ui/popups"
 	"github.com/some-du6e/clack/internal/ui/richview"
+	"github.com/some-du6e/clack/internal/ui/slackc"
 	"github.com/some-du6e/clack/internal/ui/theme"
 )
 
@@ -132,7 +133,7 @@ type ChannelDetails struct {
 	leaveNo, joinRow, emails        widget.Clickable
 	addPeople, addPeopleRow         widget.Clickable
 	viewProfile, moreMembers        widget.Clickable
-	addApp, addWorkflow             widget.Clickable
+	addApp                          widget.Clickable
 	huddleStart, huddleLink         widget.Clickable
 	newTab                          widget.Clickable // Tabs: "New Tab"
 	orgLearn                        widget.Clickable // "Workspaces with access": Learn more
@@ -682,7 +683,10 @@ func (d *ChannelDetails) writing() bool {
 // update handles keys, clicks and finished writes before drawing.
 func (d *ChannelDetails) update(gtx C) {
 	d.inviteOnOpen()
-	for {
+	// with the focus in a plugin's layer over the dialog, its focused
+	// element has Escape first (slackc layers.go): read here, whatever has
+	// the focus, it closed the dialog under the layer
+	for !slackc.EscapeToFocus(gtx) {
 		ev, ok := gtx.Event(key.Filter{Name: key.NameEscape})
 		if !ok {
 			break
@@ -729,11 +733,6 @@ func (d *ChannelDetails) update(gtx C) {
 	}
 
 	d.updateAddApps(gtx) // "Add an App" / "Add agents and apps": the apps browser (details_more.go)
-	for _, c := range []*widget.Clickable{&d.addWorkflow} {
-		if c.Clicked(gtx) {
-			d.h.Toast(cdUnsupported)
-		}
-	}
 	if d.call.Clicked(gtx) {
 		d.callClicked() // details_call.go
 	}

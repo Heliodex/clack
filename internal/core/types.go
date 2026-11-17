@@ -9,6 +9,7 @@ package core
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/some-du6e/clack/internal/richtext"
 	"github.com/some-du6e/clack/internal/slack"
@@ -27,10 +28,20 @@ type Message struct {
 	EditedTS                 string
 	EditedBy                 string // edited.user: who made the last edit (EditedLabel names them on a workflow message)
 	Permalink                string // set on search results
-	ClientMsgID              string
-	PinnedBy                 string // who pinned it (when Pinned)
-	IsBot, Edited, Pinned    bool
-	Broadcast, System        bool // System: join/leave/topic… drawn compactly
+	// Search results only (search.go): requestor_replied (the viewer
+	// replied in the thread) and the index of the first block that held a
+	// highlight marker (0 when none), compactCardBlocks' start
+	// (exp_wave7.go).
+	RequestorReplied      bool
+	SearchHitBlock        int
+	ClientMsgID           string
+	PinnedBy              string // who pinned it (when Pinned)
+	IsBot, Edited, Pinned bool
+	Broadcast, System     bool // System: join/leave/topic… drawn compactly
+	// NewerReplies: a thread broadcast whose thread has a reply newer than
+	// it, so Slack's ThreadBroadcastFooter draws "View newer replies"
+	// under it (broadcast_footer.go).
+	NewerReplies bool
 	// A system message's own fields: who added the joiner (inviter), the
 	// topic or purpose it set, a rename's old and new names.
 	Inviter, Topic, Purpose, OldName, NewName string
@@ -48,6 +59,8 @@ type Message struct {
 	Reactions       []Reaction
 	Huddle          json.RawMessage
 	Doc             richtext.Doc
+	// Refs are the members and conversations Doc was built from (msg_refs.go)
+	Refs MsgRefs
 	// Raw Slack data for plugins (Taut): memory only, never written to disk.
 	Blocks      json.RawMessage // Block Kit blocks as sent
 	Attachments json.RawMessage // legacy attachments / unfurls as sent
@@ -86,6 +99,10 @@ type Message struct {
 	// DocumentComment is a canvas comment root's document_comment (nil
 	// for other messages; canvas_comments.go).
 	DocumentComment *slack.MessageDocumentComment
+	// Ephemeral is is_ephemeral: an "Only visible to you" message (an
+	// app's chat.postEphemeral, Slackbot's local ones), never in history
+	// and never a thread's read point (Slack's isRealMsg, 8GqV).
+	Ephemeral bool
 }
 
 // SubtypeSlackbotResponse is the subtype of Slackbot's answers to the
@@ -223,6 +240,15 @@ type Conv struct {
 	FileID    string
 	Doc       string
 	NameSpans []richtext.Span
+	// NoDMsBadge and NoDMsCount (IMs): the DM badges leave the IM out of
+	// the DMs tab's highlights (rHEx dmsBadgeCount: Slackbot's, the Slack
+	// system user's, a bot's, USEARCH's, the security bot's) or out of its
+	// unread conversations (6Z4k Sm: a bot member's). rail.go
+	// dmBadgeSkips, over the member the store holds (members.go
+	// readBadgePeople asks for a missing one). BotDM is DUy0 G isBotDm
+	// alone (Slackbot's, the Slack system user's, a bot's IM), which the
+	// classic app badge leaves out (ZVw+ getTotalUnreadHighlights).
+	NoDMsBadge, NoDMsCount, BotDM bool
 }
 
 // ConvRef describes a conversation that may not be in the sidebar
@@ -299,6 +325,11 @@ type Snapshot struct {
 	EmojiCount   int
 	EnterpriseID string
 	Rail         RailState // the left rail from Navigation prefs and experiments (rail.go)
+	// Seq orders snapshots by when their build started (1, 2, …): one
+	// started later holds at least what an earlier one does, so a UI that
+	// applies them from several goroutines skips one older than what it
+	// shows. 0 for a snapshot core didn't build.
+	Seq uint64
 	// FilterNames is what the sidebar text filter matches (sidebar_filter.go).
 	FilterNames FilterNames
 }
@@ -339,10 +370,24 @@ type Event struct {
 	// message event (Slack's messageChanged shows the deferred
 	// notification then, under defer_notification_3p_streaming).
 	StreamDone bool
-	Connected  bool   // connection: socket up; realtime: live updates on
-	Presence   string // presence: active | away
-	Users      []string
-	Prefs      *Prefs
+	Connected  bool // connection: socket up; realtime: live updates on
+	// Seen (user): when a view last read the member before this change
+	// (store.MemberAccessed); zero: none did, or the store didn't hold them
+	Seen time.Time
+	// SameNames (user, conv, conv_removed, tabs): the change left alone
+	// what message Docs read of the member or conversation (its names
+	// and picture; a channel's name, kind, membership and tabs): a
+	// status, a huddle, a topic, a bookmark (msg_refs.go)
+	SameNames bool
+	// NamePrefs (prefs): how messages name people changed
+	// (display_real_names, hidden_users)
+	NamePrefs bool
+	// DocPrefs (prefs): a pref every message's Doc reads changed (the
+	// highlight words, emoji_mode)
+	DocPrefs bool
+	Presence string // presence: active | away
+	Users    []string
+	Prefs    *Prefs
 	// sent: the confirmed message replaces the local pending row whose TS
 	// is ReplacesTS. message/sent/update/delete of own sends carry ClientMsgID.
 	ReplacesTS  string
@@ -600,6 +645,10 @@ type ActivityItem struct {
 	// LatestTS is a bundle's latest message (thread_entry.latest_ts, a DM's
 	// or channel's latest_message.ts): Slack's latestTs.
 	LatestTS string
+	// MinUnreadTS is a thread bundle's first unread reply
+	// (thread_entry.min_unread_ts): Slack's minUnreadTs, where an unread
+	// thread_v2 item opens its thread.
+	MinUnreadTS string
 
 	// Invite is a Slack Connect invitation's connect invite (nil for
 	// anything else, or a feed entry without one).
@@ -764,6 +813,12 @@ type Command struct {
 
 type CommandOpts struct {
 	Channel, Command, Text, ThreadTS string
+	// Blocks is the arguments as executeCommand sends them (the
+	// composer's CommandBlocks): with blocks, chat.command carries no
+	// text, as in Slack, and the server reads mentions from them. Text
+	// stays the plain words, for the local commands and for callers
+	// that have no blocks.
+	Blocks json.RawMessage
 	// AppID is executeCommand's slashCommandAppId: the app whose command
 	// a plugin turned the message into (chat.command app_id).
 	AppID string

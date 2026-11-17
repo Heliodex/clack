@@ -39,7 +39,7 @@ func (a *App) UserAttention() bool {
 		return false
 	}
 	for _, o := range a.overlays {
-		if !o.Dismissed() {
+		if !o.Dismissed() && !invisible(o) {
 			return false
 		}
 	}
@@ -212,16 +212,26 @@ func (a *App) focusAfterNavigate(prev, r Route) {
 	if ch == "" || prev == r || r.Thread() != "" || r.Message() != "" {
 		return
 	}
+	a.focusChannelComposer(ch)
+}
+
+// focusChannelComposer is the channel view's onFocusTransition: its
+// message input takes the focus, unless an overlay is open or the channel
+// has a footer in its place (a preview, an archived channel).
+func (a *App) focusChannelComposer(ch string) {
 	if a.data == nil || a.data.core == nil {
 		return // no workspace (a shell under test): nothing to mount
 	}
-	for _, o := range a.overlays {
-		if !o.Dismissed() {
-			return
-		}
+	if a.overlayOpen() {
+		return
 	}
 	c := a.convoFor(ch, "")
-	if a.footerFor(c) != footNone {
+	switch a.footerFor(c) {
+	case footNone:
+	case footPending: // the input mounts once membership is known (layoutConvo)
+		c.focusKnown = true
+		return
+	default:
 		return
 	}
 	switch {
@@ -230,6 +240,30 @@ func (a *App) focusAfterNavigate(prev, r Route) {
 	case c.comp != nil:
 		c.comp.Focus()
 	}
+}
+
+// overlayOpen reports an overlay still up (n7.ZV: no focus move then).
+func (a *App) overlayOpen() bool {
+	for _, o := range a.overlays {
+		if !o.Dismissed() && !invisible(o) {
+			return true
+		}
+	}
+	return false
+}
+
+// visibleOverlays reports whether the overlay list holds anything but
+// invisible pumps, dismissed ones included (they still draw while they
+// go). popups' runFor keeps a pump in the list while a closed modal's
+// request finishes, up to 3 minutes for a profile photo's upload, and no
+// such pump may hold the focus, the read marks or the split view.
+func (a *App) visibleOverlays() bool {
+	for _, o := range a.overlays {
+		if !invisible(o) {
+			return true
+		}
+	}
+	return false
 }
 
 // ApplyCoreEvent shows a core event in the message views now, on the UI
@@ -330,18 +364,18 @@ func (a *App) railBadge(key string) (int, bool) {
 		if uipref.Get().NoHomeDot { // home_unread_dot off: +oIJ hides Home's dot and badge
 			return 0, false
 		}
-		return m.Rail.HomeBadge(m.HomeUnread, m.DMCount)
-	case "dms":
-		return m.DMCount, m.DMUnread
-	case "activity":
-		return m.ActivityCount, false
+		return m.Rail.HomeBadge(m.HomeUnread, m.DMHighlights, m.ActivityDMs)
+	case "dms": // InjD: a count while rHEx dmsBadgeCount is above 0, never a dot
+		return m.Rail.DMsBadge(m.DMHighlights, m.DMUnreadConvs), false
+	case "activity": // InjD: without the inbox a dot while only threads it doesn't count are unread
+		return m.ActivityCount, m.ActivityDot
 	case "browse": // yEMG: badges of what is under More
 		n := 0
 		for _, id := range a.railOverflow {
 			switch railKey(id) {
 			case "dms":
 				if !(m.Rail.ActivityInbox && !m.Rail.DMsOptOut) && m.Rail.DMsInRail {
-					n += m.DMCount
+					n += m.DMHighlights // yEMG adds dmsBadgeCount
 				}
 			case "activity":
 				n += m.ActivityCount

@@ -1,7 +1,6 @@
 package popups
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"image"
@@ -13,7 +12,9 @@ import (
 	"gioui.org/op"
 
 	"github.com/some-du6e/clack/internal/core"
+	"github.com/some-du6e/clack/internal/imgcache"
 	"github.com/some-du6e/clack/internal/richtext"
+	"github.com/some-du6e/clack/internal/slack"
 	"github.com/some-du6e/clack/internal/ui/clipimg"
 	"github.com/some-du6e/clack/internal/ui/shortcut"
 	"github.com/some-du6e/clack/internal/ui/slackc"
@@ -197,24 +198,106 @@ func ctxImageItems(h Host, src string, proxy bool) []MenuItem {
 // CopyImage puts the image at src on the clipboard (Slack-hosted images
 // come through core.Fetch; proxy forces that). It toasts ok ("" for none)
 // or the failure.
-func CopyImage(h Host, src string, proxy bool, ok string) {
-	run(h, func(ctx context.Context) (struct{}, error) {
-		data, err := fetchBytes(ctx, h, src, proxy)
-		if err != nil {
-			return struct{}{}, err
-		}
-		img, _, err := image.Decode(bytes.NewReader(data))
-		if err != nil {
-			return struct{}{}, err
-		}
-		return struct{}{}, clipimg.Write(ctx, img)
-	}, func(_ struct{}, err error) {
+func CopyImage(h Host, src string, proxy bool, ok string) { copyImage(h, src, "", proxy, ok) }
+
+// copyFileImage is a file menu's Copy image: the original (Slack's
+// getSrcForFullSizeImage: url_private), or, when Clack can't copy the
+// original at all (standIn: it needs more decode memory than an image may
+// have, its format isn't one Clack decodes, it's past the download limit),
+// the file's largest Slack thumbnail in its place, toasted as such
+// (copiedSmaller). A slow download, decode, encode or clipboard helper is
+// the original's own failure, never a reason for the thumbnail.
+func copyFileImage(h Host, f *richtext.File, ok string) {
+	src, alt := f.URL, ""
+	if f.Thumb != nil {
+		alt = f.Thumb.URL
+	}
+	if src == "" {
+		src, alt = alt, ""
+	}
+	copyImage(h, src, alt, true, ok)
+}
+
+// copiedSmaller is the toast for a copy of the file's thumbnail in its
+// original's place. Clack's: Slack copies only the original
+// (getSrcForFullSizeImage) and toasts "Image copied to clipboard" or
+// "Failed to copy image", nothing in between.
+const copiedSmaller = "Copied a smaller version of the image"
+
+// copyImage is CopyImage with a stand-in: alt ("" for none) is copied in
+// src's place when src can't be copied for a reason a smaller copy gets
+// around (standIn), and toasted as copiedSmaller.
+func copyImage(h Host, src, alt string, proxy bool, ok string) {
+	run(h, func(ctx context.Context) (bool, error) {
+		return copyImageWork(ctx, h, src, alt, proxy)
+	}, func(smaller bool, err error) {
 		switch {
 		case err != nil:
 			h.Toast("Failed to copy image: " + errText(err))
+		case smaller:
+			h.Toast(copiedSmaller)
 		case ok != "":
 			h.Toast(ok)
 		}
+	})
+}
+
+// copyImageWork copies src with the whole of ctx, or alt ("" for none) in
+// its place when src's failure is one a smaller copy gets around
+// (standIn); smaller says alt was copied. Any other failure of src (a
+// timeout, a cancelled copy, a failed download, the clipboard helper) is
+// returned as it is.
+func copyImageWork(ctx context.Context, h Host, src, alt string, proxy bool) (smaller bool, err error) {
+	err = copyFrom(ctx, h, src, proxy)
+	if err == nil || alt == "" || alt == src || !standIn(err) || ctx.Err() != nil {
+		return false, err
+	}
+	if aerr := copyFrom(ctx, h, alt, proxy); aerr != nil {
+		return false, err // the original's reason is the one to report
+	}
+	return true, nil
+}
+
+// standIn reports whether a file's thumbnail may stand in for an original
+// that failed with err: the original needs more decode memory than an
+// image may have, or is past MaxPixels or MaxSide (imgcache.ErrTooBig), or
+// is in a format Clack doesn't decode (image.ErrFormat), or is past the
+// download limit (slack.ErrTooLarge). Those are the original itself; a
+// timeout, a busy decode memory or a failed download are not, and copy
+// nothing in its place.
+func standIn(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	return errors.Is(err, imgcache.ErrTooBig) || errors.Is(err, image.ErrFormat) || errors.Is(err, slack.ErrTooLarge)
+}
+
+// copyFetch and copyWrite are copyFrom's download and clipboard write
+// (tests swap them: no network, no clipboard).
+var (
+	copyFetch = fetchBytes
+	copyWrite = clipimg.WriteCharged
+)
+
+// copyFrom puts the image at src on the clipboard. The decode charges
+// everything it allocates to a budget from imgcache's process-wide decode
+// memory (its dead buffers given back as it goes), and the clipboard
+// conversion charges its copies (the PNG) to the same budget, held until
+// the image is on the clipboard: an untrusted emoji or image too big for it
+// returns an error here (run's callback toasts it) instead of OOM-crashing
+// (this overlay has no recover). One the decode memory is too busy for
+// right now is tried again until ctx runs out (WithBudget).
+func copyFrom(ctx context.Context, h Host, src string, proxy bool) error {
+	data, err := copyFetch(ctx, h, src, proxy)
+	if err != nil {
+		return err
+	}
+	return imgcache.WithBudget(ctx, func(b *imgcache.Budget) error {
+		img, err := imgcache.DecodeBudget(data, imgcache.MaxPixels, imgcache.MaxSide, b)
+		if err != nil {
+			return err
+		}
+		return copyWrite(ctx, img, imgcache.ChargeFunc(b))
 	})
 }
 
@@ -298,7 +381,7 @@ func NewFileMenu(h Host, at image.Point, m core.Message, f *richtext.File) *Menu
 		if src == "" && f.Thumb != nil {
 			src = f.Thumb.URL
 		}
-		cp := MenuItem{Label: "Copy image", Do: func() { CopyImage(h, src, true, nsFile.T("Image copied to clipboard")) }}.In(nsFile)
+		cp := MenuItem{Label: "Copy image", Do: func() { copyFileImage(h, f, nsFile.T("Image copied to clipboard")) }}.In(nsFile)
 		group(download)
 		if src != "" {
 			group(share, copyLink, cp, later)
@@ -397,7 +480,7 @@ func NewFileActionsMenu(h Host, btn image.Rectangle, m core.Message, f *richtext
 			src = f.Thumb.URL
 		}
 		if src != "" {
-			copyImg = MenuItem{Label: "Copy image", Do: func() { CopyImage(h, src, true, nsFile.T("Image copied to clipboard")) }}.In(nsFile)
+			copyImg = MenuItem{Label: "Copy image", Do: func() { copyFileImage(h, f, nsFile.T("Image copied to clipboard")) }}.In(nsFile)
 		}
 	}
 	group(later, open, copyLink, copyImg)

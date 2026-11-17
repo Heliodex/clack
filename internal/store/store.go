@@ -11,6 +11,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -55,6 +56,9 @@ type Store struct {
 	live        map[string]liveRec         // key channel/ts: realtime message changes (live.go)
 	liveQ       []string                   // live's keys, oldest first
 	liveSeq     uint64                     // realtime message changes seen
+	subs        map[string]subRec          // key channel/thread_ts: thread subscriptions (thread_subs.go)
+	subQ        []string                   // subs' keys, oldest first
+	subSeq      uint64                     // subscription events seen
 	CustomEmoji emoji.Custom
 	EmojiStyle  string
 	cacheDir    string
@@ -90,6 +94,11 @@ type Store struct {
 	ThreadsUnread          bool
 	ThreadMentions         int
 	ThreadsUnreadByChannel map[string]int
+	// countsLive: a client.counts answer was installed (SetCounts*), so the
+	// boot data's thread state no longer applies (bootdata.go)
+	countsLive bool
+	// jr is the write journal (journal.go)
+	jr journal
 	// names of conversations we are not a member of (from search/browse)
 	names       map[string]string
 	prefsCached bool
@@ -110,8 +119,12 @@ type Store struct {
 	// gen counts changes to what the disk cache holds; SaveCache writes
 	// only when it (or the emoji map's version) moved since the last load
 	// or save.
-	gen       atomic.Uint64
-	saveMu    sync.Mutex
+	gen    atomic.Uint64
+	saveMu sync.Mutex
+	fileMu sync.Mutex // WriteFile's (the warm boot's small files), apart from meta.json's long saves
+	// warmGone: the warm boot's files were deleted for good (a session
+	// that ended, sign-out): WriteFile writes neither again (fileMu)
+	warmGone  bool
 	dropped   atomic.Bool // DropDisk ran (signed out): never write again
 	saved     bool
 	savedGen  uint64
@@ -128,6 +141,9 @@ type Store struct {
 	// schedule
 	missUsers  []string
 	userNotify chan struct{}
+	// missBotApps are app ids the lookups that missed a bot knew (a
+	// message's app_id: getBotById's app_id param), for bots.info's app_ids
+	missBotApps map[string]string
 }
 
 // PutName remembers the name of a conversation outside the sidebar.
@@ -204,8 +220,10 @@ func (s *Store) HuddleTextOpts(channel string) richtext.HuddleTextOpts {
 
 // UserAvatar is richtext.AvatarResolver: a user's 48px picture ("" when
 // unknown, which asks for the member).
-func (s *Store) UserAvatar(id string) string {
-	if u, ok := s.User(id); ok && u != nil {
+func (s *Store) UserAvatar(id string) string { return userAvatar(s.User, id) }
+
+func userAvatar(look userLookup, id string) string {
+	if u, ok := look(id); ok && u != nil {
 		return u.Profile.Image48
 	}
 	return ""
@@ -812,8 +830,14 @@ func avatarTeam(u *slack.User, viewerTeam string) string {
 
 // ---- richtext.Resolver ----
 
-func (s *Store) UserName(id string) string {
-	u, _ := s.User(id) // a miss is asked for
+// userLookup is how a resolver method reads a member: Store.User (a
+// view's read: the hit counts) or peekUser (Peek's: it doesn't).
+type userLookup func(id string) (*slack.User, bool)
+
+func (s *Store) UserName(id string) string { return userName(s.User, id) }
+
+func userName(look userLookup, id string) string {
+	u, _ := look(id) // a miss is asked for
 	return DisplayName(u)
 }
 
@@ -822,8 +846,10 @@ func (s *Store) UserName(id string) string {
 // pref, "Name hidden" for someone in their hidden_users (0OuZ
 // isUserHidden). ok is false for a member not loaded yet, which is noted
 // to be fetched.
-func (s *Store) MemberName(id string) (string, bool) {
-	u, ok := s.User(id) // a miss is asked for
+func (s *Store) MemberName(id string) (string, bool) { return s.memberName(s.User, id) }
+
+func (s *Store) memberName(look userLookup, id string) (string, bool) {
+	u, ok := look(id) // a miss is asked for
 	if !ok || u == nil {
 		return "", false
 	}
@@ -840,8 +866,10 @@ func (s *Store) MemberName(id string) (string, bool) {
 // MemberRealName is richtext.RealNamer: the member's real name, as the
 // member tokens Slack draws with forceRealName print it (a work object's
 // user fields), else their display name; "" for a member not loaded yet.
-func (s *Store) MemberRealName(id string) string {
-	u, ok := s.User(id) // a miss is asked for
+func (s *Store) MemberRealName(id string) string { return memberRealName(s.User, id) }
+
+func memberRealName(look userLookup, id string) string {
+	u, ok := look(id) // a miss is asked for
 	if !ok || u == nil {
 		return ""
 	}
@@ -863,8 +891,10 @@ func firstNonEmptyName(v ...string) string {
 // MemberAvatar is richtext.MemberNamer: the member's own picture for a
 // 36px avatar (ConnectedBaseAvatar asks for twice that), the image
 // message rows draw; "" for a member not loaded yet.
-func (s *Store) MemberAvatar(id string) string {
-	u, ok := s.User(id)
+func (s *Store) MemberAvatar(id string) string { return s.memberAvatar(s.User, id) }
+
+func (s *Store) memberAvatar(look userLookup, id string) string {
+	u, ok := look(id)
 	if !ok || u == nil {
 		return ""
 	}
@@ -892,7 +922,11 @@ func hiddenUser(raw json.RawMessage, id string) bool {
 	return false
 }
 
-func (s *Store) ChannelName(id string) string {
+func (s *Store) ChannelName(id string) string { return s.channelName(id, true) }
+
+// channelName is ChannelName; a DM's name is its partner's, read as a hit
+// when touch (a view's read) and not otherwise (Peek).
+func (s *Store) channelName(id string, touch bool) string {
 	s.mu.RLock()
 	c, ok := s.Convs[id]
 	if !ok {
@@ -901,7 +935,13 @@ func (s *Store) ChannelName(id string) string {
 	if ok {
 		if c.IsIM {
 			partner, name := c.User, c.Name
-			u, known := s.lookupLocked(partner, time.Now().UnixMilli())
+			var u *slack.User
+			var known bool
+			if touch {
+				u, known = s.lookupLocked(partner, time.Now().UnixMilli())
+			} else {
+				u, known = s.peekLocked(partner)
+			}
 			s.mu.RUnlock()
 			s.afterLookup(partner, known)
 			if u != nil {
@@ -975,10 +1015,32 @@ func (s *Store) missInitLocked() {
 }
 
 // NoteMissingBot records a bot id whose name/icon is unknown.
-func (s *Store) NoteMissingBot(id string) {
-	if strings.HasPrefix(id, "B") {
-		s.noteMissing('b', id)
+func (s *Store) NoteMissingBot(id string) { s.NoteMissingBotApp(id, "") }
+
+// NoteMissingBotApp is NoteMissingBot with the app the bot belongs to,
+// when the message that drew it says (getBotByMsg passes its app_id):
+// bots.info gets it as app_ids.
+func (s *Store) NoteMissingBotApp(id, appID string) {
+	if !strings.HasPrefix(id, "B") {
+		return
 	}
+	if appID != "" {
+		s.missMu.Lock()
+		if s.missBotApps == nil {
+			s.missBotApps = map[string]string{}
+		}
+		s.missBotApps[id] = appID
+		s.missMu.Unlock()
+	}
+	s.noteMissing('b', id)
+}
+
+// MissingBotApp is the app id a lookup that missed bot id knew ("" when
+// none did).
+func (s *Store) MissingBotApp(id string) string {
+	s.missMu.Lock()
+	defer s.missMu.Unlock()
+	return s.missBotApps[id]
 }
 
 // MissingNotify fires (coalesced) when new unresolved channel, bot or
@@ -1134,6 +1196,12 @@ func (s *Store) SelfID() string {
 
 func (s *Store) PutConv(c slack.Conversation) {
 	s.mu.Lock()
+	s.putConvLocked(c)
+	s.mu.Unlock()
+}
+
+// putConvLocked is PutConv's body (s.mu held).
+func (s *Store) putConvLocked(c slack.Conversation) {
 	if old, ok := s.Convs[c.ID]; ok {
 		if c.NumMembers == 0 {
 			c.NumMembers = old.NumMembers
@@ -1149,7 +1217,6 @@ func (s *Store) PutConv(c slack.Conversation) {
 		}
 	}
 	s.Convs[c.ID] = &c
-	s.mu.Unlock()
 }
 
 func (s *Store) Conv(id string) (*slack.Conversation, bool) {
@@ -1292,23 +1359,73 @@ func (s *Store) Remove(ch, ts string) {
 func (s *Store) Find(ch, ts string) (slack.Message, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if m := s.findRefLocked(ch, ts, ""); m != nil {
+		return *m, true
+	}
+	return slack.Message{}, false
+}
+
+// Holds reports whether ch's cached messages (timeline and threads) have
+// ts, or with cid != "" a message with that client_msg_id: Find without
+// copying the message out.
+func (s *Store) Holds(ch, ts, cid string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.findRefLocked(ch, ts, cid) != nil
+}
+
+// findRefLocked is the cached message of ch with ts (or client_msg_id cid),
+// indexed in place: ranging by value copied every message it passed
+// (slack.Message is large), and InjectedMessages asked once per message of
+// a channel.
+func (s *Store) findRefLocked(ch, ts, cid string) *slack.Message {
+	match := func(m *slack.Message) bool { return m.TS == ts || cid != "" && m.ClientMsgID == cid }
 	if t := s.timelines[ch]; t != nil {
-		for _, m := range t.Msgs {
-			if m.TS == ts {
-				return m, true
+		for i := range t.Msgs {
+			if match(&t.Msgs[i]) {
+				return &t.Msgs[i]
 			}
 		}
 	}
+	pre := ch + "/"
 	for k, th := range s.threads {
-		if strings.HasPrefix(k, ch+"/") {
-			for _, m := range th {
-				if m.TS == ts {
-					return m, true
+		if strings.HasPrefix(k, pre) {
+			for i := range th {
+				if match(&th[i]) {
+					return &th[i]
 				}
 			}
 		}
 	}
-	return slack.Message{}, false
+	return nil
+}
+
+// MessageKeys is every ts and client_msg_id among ch's cached messages
+// (timeline and threads), in one pass.
+func (s *Store) MessageKeys(ch string) (ts, cids map[string]bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ts, cids = map[string]bool{}, map[string]bool{}
+	add := func(m *slack.Message) {
+		ts[m.TS] = true
+		if m.ClientMsgID != "" {
+			cids[m.ClientMsgID] = true
+		}
+	}
+	if t := s.timelines[ch]; t != nil {
+		for i := range t.Msgs {
+			add(&t.Msgs[i])
+		}
+	}
+	pre := ch + "/"
+	for k, th := range s.threads {
+		if strings.HasPrefix(k, pre) {
+			for i := range th {
+				add(&th[i])
+			}
+		}
+	}
+	return ts, cids
 }
 
 // MsgRef names a cached message.
@@ -1413,20 +1530,9 @@ func (s *Store) AddReply(ch string, m slack.Message) {
 
 // ---- counts ----
 
-func (s *Store) SetCounts(c *slack.Counts) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.Counts = map[string]*slack.CountEntry{}
-	for _, l := range [][]slack.CountEntry{c.Channels, c.IMs, c.MPIMs} {
-		for i := range l {
-			e := l[i]
-			s.Counts[e.ID] = &e
-		}
-	}
-	s.ThreadsUnread = c.Threads.HasUnreads
-	s.ThreadMentions = c.Threads.MentionCount
-	s.ThreadsUnreadByChannel = c.Threads.UnreadCountByChannel
-}
+// SetCounts installs a client.counts answer whole (SetCountsSince keeps
+// what changed while the call was out).
+func (s *Store) SetCounts(c *slack.Counts) { s.SetCountsSince(c, math.MaxUint64) }
 
 // Count returns a copy of a conversation's unread state.
 func (s *Store) Count(ch string) (slack.CountEntry, bool) {
@@ -1450,6 +1556,7 @@ func (s *Store) MarkRead(ch, ts string) slack.CountEntry {
 		e = &slack.CountEntry{ID: ch}
 		s.Counts[ch] = e
 	}
+	s.noteMarkLocked(ch) // a counts answer fetched before keeps this cursor (journal.go)
 	e.LastRead = ts
 	if e.Latest == "" || !TSLess(ts, e.Latest) {
 		e.HasUnreads = false
@@ -1471,6 +1578,7 @@ func (s *Store) NoteMessage(ch string, m *slack.Message, mentionsSelf bool) slac
 		e = &slack.CountEntry{ID: ch}
 		s.Counts[ch] = e
 	}
+	s.noteMessageLocked(ch) // newer than a counts answer still out (journal.go)
 	if e.Latest == "" || TSLess(e.Latest, m.TS) {
 		e.Latest = m.TS
 	}
@@ -1909,17 +2017,33 @@ func (s *Store) SaveCache() error {
 		d.Experiments = s.experiments // replaced whole, never changed in place
 	}
 	// the stored users are never changed in place (PutUsers replaces
-	// them), so they're written after the lock is let go: the viewer and
-	// the MaxSavedUsers most recently fetched
+	// them), so they're written after the lock is let go: the viewer, the
+	// people the sidebar names (DM partners, group DM members: a warm
+	// boot's rows are labelled from these, bootdata.go) and the
+	// MaxSavedUsers most recently fetched
 	users := make([]*slack.User, 0, len(s.Users))
 	for _, u := range s.Users {
 		users = append(users, u)
 	}
 	if len(users) > MaxSavedUsers {
 		self := s.Self.ID
+		side := map[string]bool{}
+		for _, c := range s.Convs {
+			if c.IsIM && c.User != "" {
+				side[c.User] = true
+			}
+			if c.IsMPIM {
+				for _, m := range c.Members {
+					side[m] = true
+				}
+			}
+		}
 		sort.Slice(users, func(i, j int) bool {
 			if (users[i].ID == self) != (users[j].ID == self) {
 				return users[i].ID == self
+			}
+			if a, b := side[users[i].ID], side[users[j].ID]; a != b {
+				return a
 			}
 			if a, b := s.userSeen[users[i].ID], s.userSeen[users[j].ID]; a != b {
 				return a > b

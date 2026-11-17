@@ -27,6 +27,7 @@ package ui
 import (
 	"gioui.org/layout"
 
+	"github.com/some-du6e/clack/internal/ui/messages"
 	"github.com/some-du6e/clack/internal/ui/views"
 )
 
@@ -126,9 +127,9 @@ func (a *App) OpenThreadAt(ch, thread, ts string) {
 //     && prev primary id !== the thread's channel`.
 //   - highlightRoot, for a thread in the Secondary, moves the primary
 //     conversation to the root (startTs) and highlights it there (lazily),
-//     then is cleared. Its callers here have the To-dos list or the Saved
-//     page in the primary, never a conversation, so it has nothing to
-//     move.
+//     then is cleared. The To-dos list and the Saved page have no
+//     conversation in the primary for it to move; jumpToMessage (jump.go),
+//     which puts the thread's conversation there, moves it itself.
 func (a *App) openThreadAt(ch, thread, ts string, prev Route) {
 	if ch == "" || thread == "" {
 		return
@@ -161,3 +162,28 @@ func (a *App) SecondaryAt() (ch, ts string) {
 }
 
 var _ views.SavedSecondary = (*App)(nil)
+
+// OpenThreadReply opens thread (its root's ts) at reply ts: Slack's
+// ThreadBroadcastFooter (boot-shared NnKv) navigates to toThread({
+// channelId, threadTs, replyTs }) with no uiState, so jumpToThreadReply
+// has no highlightTs to apply. The pane starts at replyTs (its start ts
+// is the stored one, else replyTs) and highlights it only in a child
+// window, which Clack doesn't have.
+func (a *App) OpenThreadReply(ch, thread, ts string) {
+	if ch == "" || thread == "" {
+		return
+	}
+	split := a.pane == paneSplit || a.splitClick()
+	a.OpenThread(ch, thread)
+	s := &a.secondary
+	if split || ts == "" || s.kind != secThread || s.channel != ch || s.ts != thread {
+		return
+	}
+	s.at = ts
+	if j, ok := a.convoFor(ch, thread).list.(interface{ JumpTo(ts string, flash bool) }); ok {
+		j.JumpTo(ts, false)
+	}
+	a.Invalidate()
+}
+
+var _ messages.ThreadReplyOpener = (*App)(nil)

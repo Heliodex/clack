@@ -181,7 +181,7 @@ Shared Slack shapes used below:
 #### ThreadSenderAndTimestampGeneric
 - **ShowSendingBot** P/ShowSendingBot.tsx:424-431. Reads `msg`. Context wrap (ThreadSenderContext).
 - **UserPronouns** P/UserPronouns.tsx:107-124. Reads `msg, adjacent, visible, omitTimestamp, omitLinebreak`. Unless `adjacent`, `visible===false` or the sender isn't a person, it renders `<><Original {...props} omitLinebreak/><Pronouns bulleted={!omitTimestamp}/>{props.omitLinebreak ? null : <br/>}</>`.
-- **Clack**: messages/row.go:`(*row).nameLine` as drawn in the ThreadView, and views/threads.go:`(*Threads).msg`, owned by **msgs/views**.
+- **Clack**: messages/row.go:`(*row).nameLine` as drawn in the ThreadView, and views/threads.go:`(*Threads).msg`, owned by **msgs/views**. Slack's (client-boot-shared 7aPN) is a fragment of MessageSender, `"\xa0\xa0"`, MeetingChannelRootTimeBadge, the Timestamp and, unless `omitLinebreak`, a `<br>`; `(*row).layoutThreadSender` takes the whole line only with that `<br>`, and under `omitLinebreak` is as wide as what it drew, so the plugin's pronouns stay on the sender's line.
 
 #### ThreadRootGeneric
 - **ShowRealUser** (same loop as MessageWrapper, P/ShowRealUser.tsx:185-201). Overrides `msg` with the fixed message.

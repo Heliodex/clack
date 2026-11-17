@@ -112,8 +112,10 @@ var slackRef = map[string]string{
 	"edit":                        "edit",
 	"edit-filled":                 "edit-filled",
 	"email":                       "email",
+	"workspace":                   "workspace",
 	"email-filled":                "email-filled",
 	"emoji":                       "emoji",
+	"reaction":                    "reaction",
 	"emoji-filled":                "emoji-filled",
 	"emoji-objects":               "emoji-objects",
 	"emoji-objects-filled":        "emoji-objects-filled",
@@ -347,6 +349,7 @@ var fontRef = map[string]rune{
 	"enter-font":            0xE302,
 	"broadcast":             0xE106,
 	"lock-o":                0xE029,
+	"vertical-ellipsis":     0xE148,
 }
 
 // inlineRef holds the icons drawn after a glyph Slack paints itself
@@ -378,6 +381,7 @@ var inlineRef = map[string]struct{ src, body string }{
 // icons.json on 2026-11-14: none has one).
 var clackOwn = map[string]string{
 	"bookmark-add":    "a bookmark with a plus (save for later); Slack's set has bookmark but no bookmark-add",
+	"clack-logo":      "Clack's own brand mark, monochrome (Preferences > Clack's tab); not a Slack glyph",
 	"close-small":     "a smaller close for 16px chips; Slack's set has close, close-circle and close-filled, none small",
 	"dot":             "SlackFallback, drawn for Slack names the set lacks",
 	"hackclub":        "the Hack Club plugin category's mark",

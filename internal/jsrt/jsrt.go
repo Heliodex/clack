@@ -65,6 +65,11 @@ type Options struct {
 	// Language is navigator.language (default "en-US"); Platform is
 	// navigator.platform (default from GOOS: "MacIntel", "Win32", "Linux x86_64").
 	Language, Platform string
+
+	// heapWasmMemory (tests) keeps the engine's wasm memory in a Go slice
+	// grown like wazero's own, as before wasmmem.go: the "before" side of
+	// the tests that measure the reservation.
+	heapWasmMemory bool
 }
 
 // Errors returned by the runtime.
@@ -211,7 +216,7 @@ func (r *Runtime) Call(ctx context.Context, path string, args ...any) (json.RawM
 	}
 	ch := make(chan res, 1)
 	onJS := r.onJSThread()
-	err := r.Do(func(js *Ctx) error {
+	err := r.do(task{kind: "Call", what: path}, func(js *Ctx) error {
 		fn, this, err := js.resolvePath(path)
 		if err != nil {
 			return err

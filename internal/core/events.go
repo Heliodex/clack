@@ -12,6 +12,7 @@ import (
 
 	"github.com/some-du6e/clack/internal/richtext"
 	"github.com/some-du6e/clack/internal/slack"
+	"github.com/some-du6e/clack/internal/store"
 )
 
 var mentionRe = regexp.MustCompile(`<@([UW][A-Z0-9]+)`)
@@ -75,8 +76,20 @@ func (a *App) handle(ev slack.Event) {
 		if e.User == a.S.SelfID() {
 			return
 		}
-		a.EnsureUsers(ctx, []string{e.User})
-		a.emit(Event{Type: "typing", Channel: ch, UserID: e.User, Name: a.S.UserName(e.User), ThreadTS: e.ThreadTS})
+		// Slack's typing line maps its typers through getMemberById as it
+		// renders (MessagePaneInput, cRQG), so only the conversation on
+		// screen asks for a typer it doesn't hold. Elsewhere the record
+		// waits with what the store has: a busy workspace types in
+		// hundreds of channels, and each fetch's "names" redrew the window
+		// for nothing on it.
+		name := ""
+		if a.watching(ch, e.ThreadTS) {
+			a.EnsureUsers(ctx, []string{e.User})
+			name = a.S.UserName(e.User)
+		} else if u, ok := a.S.RawUser(e.User); ok {
+			name = store.DisplayName(u)
+		}
+		a.emit(Event{Type: "typing", Channel: ch, UserID: e.User, Name: name, ThreadTS: e.ThreadTS})
 	case "channel_marked", "im_marked", "group_marked", "mpim_marked":
 		var e struct {
 			TS           string `json:"ts"`
@@ -92,6 +105,9 @@ func (a *App) handle(ev slack.Event) {
 		}
 		a.S.Unlock()
 		cv := a.Count(ch)
+		if cv.Unread || cv.Mentions > 0 { // marked unread elsewhere: the DM badges read its member (members.go)
+			a.readBadgePerson(ch)
+		}
 		a.emit(Event{Type: "marked", Channel: ch, TS: e.TS, Count: &cv})
 	case "presence_change":
 		var e struct {
@@ -120,9 +136,25 @@ func (a *App) handle(ev slack.Event) {
 		}
 		_ = json.Unmarshal(ev.Raw, &e)
 		if e.User.ID != "" {
+			// Seen: when a view last read the member (store.MemberAccessed:
+			// a row its sender, a mention its member, as they draw), so the
+			// views know whether one draws them now. One the store didn't
+			// hold, or no view read, draws nowhere (a row that wants it
+			// draws the unknown stub, and its fetch's "names" follows), as
+			// most of a large workspace's profile changes are. The event is
+			// read without a lookup, which would count as a view's.
+			seen := a.S.MemberAccessed(e.User.ID)
+			// what message Docs read of the member, before and after
+			// (a status or huddle change converts no message again)
+			var before slack.User
+			old, had := a.S.RawUser(e.User.ID)
+			if had && old != nil {
+				before = *old
+			}
 			a.S.PutUsers([]slack.User{e.User})
-			if u, ok := a.User(e.User.ID); ok {
-				a.emit(Event{Type: "user", UserID: u.ID, User: &u})
+			if su, ok := a.S.RawUser(e.User.ID); ok {
+				u := a.userOf(su)
+				a.emit(Event{Type: "user", UserID: u.ID, User: &u, Seen: seen, SameNames: had && old != nil && sameUserNames(&before, su)})
 			}
 		}
 	case "team_icon_change":
@@ -182,6 +214,10 @@ func (a *App) handle(ev slack.Event) {
 			if e.TempExp != nil {
 				a.setTemp(id, *e.TempExp)
 			}
+			// a new membership: Slack upserts the event's channel, is_open
+			// with it; Clack keeps no is_open from it, so an old close of
+			// a code channel no longer counts (codechannel_close.go)
+			a.forgetCodeChannelClosed(id)
 		}
 		a.refreshConv(ctx, id)
 	case "record_channel_close": // channelClosed for a record (code) channel (codechannel_close.go)
@@ -197,9 +233,7 @@ func (a *App) handle(ev slack.Event) {
 		_ = json.Unmarshal(ev.Raw, &e)
 		a.markDMClosed(ch)
 		if e.ConvertedTo != "" { // group DM turned into a private channel
-			a.S.Lock()
-			delete(a.S.Convs, ch)
-			a.S.Unlock()
+			a.S.DropConv(ch)
 			a.emit(Event{Type: "conv_removed", Channel: ch})
 			a.refreshConv(ctx, e.ConvertedTo)
 			return
@@ -207,6 +241,7 @@ func (a *App) handle(ev slack.Event) {
 		a.emit(Event{Type: "sidebar_changed"})
 	case "channel_left", "group_left", "channel_archive", "group_archive", "channel_deleted":
 		a.dropMembership(ch, ev.Type == "channel_archive" || ev.Type == "group_archive")
+		a.forgetCodeChannelClosed(ch) // no membership, no is_open to keep (codechannel_close.go)
 		a.emit(Event{Type: "conv_removed", Channel: ch})
 	case "pin_added", "pin_removed":
 		var e struct {
@@ -261,10 +296,8 @@ func (a *App) handle(ev slack.Event) {
 		a.emit(Event{Type: ev.Type, Raw: ev.Raw})
 		switch ev.Type {
 		case "channel_sections_upserted", "channel_sections_channels_upserted", "channel_sections_channels_removed", "channel_sections_deleted":
-			if secs, err := a.C.SectionsAll(ctx); err == nil {
-				a.S.Lock()
-				a.S.Sections = secs
-				a.S.Unlock()
+			since := a.S.Seq()
+			if secs, err := a.C.SectionsAll(ctx); err == nil && a.S.SetSectionsSince(secs, since) {
 				a.emit(Event{Type: "sidebar_changed"})
 			}
 		case "thread_marked", "update_thread_state", "badge_counts_updated":
@@ -436,12 +469,44 @@ func (a *App) refreshConv(ctx context.Context, id string) {
 	if err != nil {
 		return
 	}
-	a.S.PutConv(*c)
+	if c.ID == "" {
+		c.ID = id
+	}
+	a.putInfo(c)
 	if c.IsIM {
 		a.EnsureUsers(ctx, []string{c.User})
 	}
 	v := a.conv(c)
 	a.emit(Event{Type: "conv", Channel: id, Conv: &v})
+}
+
+// putInfo stores a conversations.info answer. Its is_member is the
+// membership (Slack's store keeps the object as fetched, and Opi6
+// isPreview reads is_member off it): a channel the viewer isn't in stays
+// out of the member set, a known non-member (PutExtConv) like
+// ResolveConv's. refreshConv runs on events every member of the team
+// gets (channel_created, channel_rename, channel_unarchive) and on a
+// message in a channel outside the member set; storing those answers with
+// PutConv made the channel a member's: a sidebar row, the composer in
+// place of JoinChannelPane, and not_in_channel on send (Karim, α.90,
+// #僕のゴミ). A conversation already in the member set stays there
+// (PutConv keeps its is_member; leaving is channel_left's
+// dropMembership), and DMs carry no is_member.
+func (a *App) putInfo(c *slack.Conversation) {
+	if _, member := a.S.Conv(c.ID); member || c.IsMember || c.IsIM || c.IsMPIM {
+		a.S.PutConv(*c)
+		return
+	}
+	a.S.PutExtConv(*c)
+}
+
+// knownNonMember reports a channel known from conversations.info as one
+// the viewer isn't in (putInfo, ResolveConv): its messages (a preview's)
+// need no new lookup each. A DM outside the member set still gets one, so
+// a new message brings it in.
+func (a *App) knownNonMember(ch string) bool {
+	c, ok := a.S.ExtConv(ch)
+	return ok && c.Name != "" && !c.IsIM && !c.IsMPIM && !c.IsMember
 }
 
 func (a *App) onMessage(ctx context.Context, ch string, ev slack.Event) {
@@ -481,10 +546,26 @@ func (a *App) onMessage(ctx context.Context, ch string, ev slack.Event) {
 			if m.ThreadTS == "" && old.ThreadTS != "" && old.ThreadTS != old.TS {
 				m.ThreadTS, m.ParentUser = old.ThreadTS, firstNonEmpty(m.ParentUser, old.ParentUser)
 			}
+			// a root's thread subscription isn't the message's: Slack's
+			// replaceMessages swaps the message, and only a copy with a
+			// "subscribed" field of its own changes the subscription
+			// (store/thread_subs.go), so the cached copies keep theirs
+			if !m.SubscribedSet {
+				sub := a.S.ThreadSubOf(ch, &old)
+				m.Subscribed, m.LastRead = sub.Subscribed, sub.LastRead
+			}
 		}
+		a.S.SlurpSub(ch, &m)
 		a.S.NoteLive(ch, m.TS, &m) // a replies answer older than this keeps it (store/live.go)
 		if _, found := a.S.Mutate(ch, m.TS, func(x *slack.Message) { *x = m }); !found {
 			a.putLocal(ch, m) // a reply goes to its (cached) thread, never the channel
+		}
+		if m.ThreadTS == "" || m.ThreadTS == m.TS {
+			// a root's copy replaces the stored root: its broadcasts'
+			// root copies take its reply metadata (broadcast_footer.go)
+			a.syncBroadcastRoots(ch, m.TS, func(x *slack.Message) {
+				x.ThreadTS, x.ReplyCount, x.ReplyUsers, x.ReplyUsersN, x.LatestReply = m.ThreadTS, m.ReplyCount, m.ReplyUsers, m.ReplyUsersN, m.LatestReply
+			})
 		}
 		if needsFileInfo(&m) {
 			go a.fillFiles(ch, m.TS)
@@ -521,9 +602,16 @@ func (a *App) onMessage(ctx context.Context, ch string, ev slack.Event) {
 		return
 	}
 	// appendMessages merges a socket message into the stored one: a pin
-	// that came first stays (store/pins.go)
+	// that came first stays (store/pins.go), and a thread's subscription
+	// changes only with a "subscribed" of the copy's own (thread_subs.go)
 	a.S.KeepPin(ch, &m)
+	a.S.SlurpSub(ch, &m)
 	a.streams.seen(ch, m.TS, m.StreamingState == "in_progress")
+	// the DM badges read the member of the IM this makes unread (members.go
+	// readBadgePerson), before EnsureUsers below can load it unannounced
+	if m.ThreadTS == "" || m.ThreadTS == m.TS || m.Subtype == "thread_broadcast" {
+		a.readBadgePerson(ch)
+	}
 	// the "message" event names its sender for the notification (and the
 	// mentions in its text), so the people are fetched before it goes out;
 	// not its reactions' (a new message has none) (lazy_users.go)
@@ -540,6 +628,7 @@ func (a *App) onMessage(ctx context.Context, ch string, ev slack.Event) {
 	if a.confirmPending(ch, &m) {
 		if isTopLevel(&m) {
 			a.S.NoteMessage(ch, &m, false)
+			a.noteCodeChannelMessage(ch, m.TS, a.RTM.Connected()) // heard live (codechannel_close.go)
 		}
 		return
 	}
@@ -559,10 +648,11 @@ func (a *App) onMessage(ctx context.Context, ch string, ev slack.Event) {
 	mention := mentionsSelf(&m, self) || (m.User != self && keywordMention(&m, a.S.HighlightWords()))
 	if !isReply || m.Subtype == "thread_broadcast" {
 		a.S.NoteMessage(ch, &m, mention)
+		a.noteCodeChannelMessage(ch, m.TS, a.RTM.Connected()) // heard live (codechannel_close.go)
 	} else if m.User != self {
 		a.refreshCountsSoon() // thread unread state lives server-side
 	}
-	if _, known := a.S.Conv(ch); !known {
+	if _, known := a.S.Conv(ch); !known && !a.knownNonMember(ch) {
 		a.refreshConv(ctx, ch)
 	}
 	if !isReply || m.Subtype == "thread_broadcast" {

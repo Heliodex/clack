@@ -249,7 +249,7 @@ func (a *App) convChanged(ctx context.Context, ch string, res *struct {
 		if old, ok := a.S.Conv(ch); ok {
 			res.Channel.LastRead = old.LastRead
 		}
-		a.S.PutConv(res.Channel)
+		a.S.PutConvLocal(res.Channel) // a rename, a topic: an older list doesn't undo it
 		if c, ok := a.Conv(ch); ok {
 			a.emit(Event{Type: "conv", Channel: ch, Conv: &c})
 		}
@@ -315,9 +315,7 @@ func (a *App) Archive(ctx context.Context, ch string) error {
 	if err := a.C.Call(ctx, "conversations.archive", url.Values{"channel": {ch}}, nil); err != nil {
 		return err
 	}
-	a.S.Lock()
-	delete(a.S.Convs, ch)
-	a.S.Unlock()
+	a.S.DropConv(ch)
 	a.emit(Event{Type: "conv_removed", Channel: ch})
 	return nil
 }
@@ -701,9 +699,12 @@ func (a *App) onSavedEvent(ctx context.Context, typ string, raw json.RawMessage)
 	a.emit(Event{Type: "saved", Name: name, Channel: it.Channel, TS: it.TS, Saved: &it, Raw: raw})
 }
 
-// activityLiveTypes is activityUpdatedV2's J (boot-shared, build
-// fa938a086569): the entry types a realtime activity_updated may add to
-// the inbox. The server also pushes entries Slack's client never shows,
+// activityLiveTypes is activityUpdatedV2's allow-list (boot-shared `ee`
+// in sD/F, build c07ab895506f): the entry types a realtime
+// activity_updated may add to the inbox. That build dropped
+// team_joiner_invite from the list (build fa938a086569's J still had it),
+// so a pushed joiner entry never reaches the inbox; the feed still returns
+// one under the Invitations filter (RmAw). The server also pushes entries Slack's client never shows,
 // such as thread_reply (one per reply in a followed thread, next to the
 // thread's thread_v2 bundle); getActivityIconType draws an unknown type
 // with the @ glyph, so letting one through gave every reply a second,
@@ -712,8 +713,8 @@ var activityLiveTypes = []string{"thread_v2", "at_user", "at_user_group", "at_ch
 	"message_reaction", "internal_channel_invite", "quietly_added_to_channel", "external_channel_invite",
 	"external_dm_invite", "unjoined_channel_mention", "code_review_requested", "list_record_assigned",
 	"list_record_edited", "list_user_mentioned", "list_todo_notification", "list_approval_request",
-	"list_approval_reviewed", "bot_dm_bundle", "saved_reminder", "dm", "channel", "mpdm", "team_joiner_invite",
-	"generic_system_alert", "prejoin_dm_welcome_party_alert"}
+	"list_approval_reviewed", "bot_dm_bundle", "saved_reminder", "dm", "channel", "mpdm", "generic_system_alert",
+	"prejoin_dm_welcome_party_alert"}
 
 func activityLiveType(t string) bool { return slices.Contains(activityLiveTypes, t) }
 
@@ -755,12 +756,13 @@ func (a *App) onThreadSubscription(raw json.RawMessage, on bool) {
 		return
 	}
 	// threadSubscribed / threadUnsubscribed: {subscribed, lastRead}
-	if m, ok := a.S.Mutate(ch, ts, func(m *slack.Message) {
-		m.Subscribed = on
+	a.S.SetThreadSub(ch, ts, func(s *store.ThreadSub) {
+		s.Subscribed = on
 		if lr := e.Subscription.LastRead; lr != "" {
-			m.LastRead = lr
+			s.LastRead = lr
 		}
-	}); ok {
+	})
+	if m, ok := a.S.Find(ch, ts); ok {
 		a.emitUpdate(ch, &m)
 	}
 	a.emit(Event{Type: "thread_subscription", Channel: ch, ThreadTS: ts, TS: ts, Name: map[bool]string{true: "follow", false: "unfollow"}[on], Raw: raw})
@@ -780,13 +782,15 @@ func (a *App) onThreadMarked(raw json.RawMessage) {
 	a.setThreadLastRead(e.Subscription.Channel, e.Subscription.ThreadTS, e.Subscription.LastRead)
 }
 
-// setThreadLastRead records a thread's last read reply on its cached root
-// (Slack's thread subscription lastRead) and tells the views.
+// setThreadLastRead records a thread's last read reply (Slack's
+// setSubscription {lastRead}: the subscription, which the cached root
+// copies take too) and tells the views.
 func (a *App) setThreadLastRead(ch, threadTS, lastRead string) {
 	if ch == "" || threadTS == "" || lastRead == "" {
 		return
 	}
-	if m, ok := a.S.Mutate(ch, threadTS, func(m *slack.Message) { m.LastRead = lastRead }); ok {
+	a.S.SetThreadSub(ch, threadTS, func(s *store.ThreadSub) { s.LastRead = lastRead })
+	if m, ok := a.S.Find(ch, threadTS); ok {
 		a.emitUpdate(ch, &m)
 	}
 }

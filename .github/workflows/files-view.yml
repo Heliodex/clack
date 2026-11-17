@@ -57,6 +57,9 @@ on:
       - "internal/ui/popups/bookmark_modals.go"
       - "internal/ui/files_tab_more.go"
       - "internal/ui/files_tab_more_test.go"
+      - "internal/slack/file_is_image.go"
+      - "internal/core/file_is_image_test.go"
+      - "internal/ui/views/files_unthumbed_test.go"
       - ".github/workflows/files-view.yml"
   workflow_dispatch:
 

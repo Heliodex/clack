@@ -15,9 +15,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"image"
-	"image/color"
-	"image/png"
 	"io"
 	"math/rand"
 	"net"
@@ -81,6 +78,12 @@ type Size struct {
 	// DMsTab answers client.dms (the DMs tab and its peek) with the open
 	// generated DMs and their latest messages, newest first.
 	DMsTab bool
+	// DMBadges adds unread DMs with Slackbot, the Slack system user
+	// (SlackUserID) and an app, a muted unread one, read ones with a person
+	// and a group, a closed app DM whose member nothing has asked for, and
+	// answers the generated DMs read (dm_badges.go): what the DM badges
+	// leave out and what they count.
+	DMBadges bool
 	// Embeds adds #embeds-gallery: one message per way Slack draws a
 	// link preview (embeds.go).
 	Embeds bool
@@ -148,6 +151,9 @@ type Size struct {
 	// AgentThread adds a DM with an agent app and a thread in it, the
 	// agent's answer edited live (agent_thread.go).
 	AgentThread bool
+	// AppPlans adds #plans (AppPlanChannelID): a custom app's plan posts
+	// and posts with an unknown block type (agents.go AppPlanMessages).
+	AppPlans bool
 	// PinsFolders adds #pins-gallery: the Pins tab's pinned messages and
 	// file, and bookmark folders with their methods (pins_folders.go).
 	PinsFolders bool
@@ -339,6 +345,12 @@ type Server struct {
 
 	actBadgeMu sync.Mutex
 	actBadges  map[string]int // client.counts activity_v2 (activity_badges.go)
+	chanBadges map[string]int // client.counts channel_badges (SetChannelBadges)
+	alerts     map[string]int // client.counts alerts (SetAlerts)
+
+	// dmBadgeRead: Size.DMBadges' DMs and their read cursors, set before
+	// serving (dm_badges.go)
+	dmBadgeRead map[string]string
 
 	// OnPost, when set, runs inside chat.postMessage before it answers,
 	// with the posted form and the new message (tests push the realtime
@@ -362,9 +374,11 @@ type Server struct {
 	convMu sync.Mutex
 	// caInvites: conversations.invite into the ChannelAgents channels
 	caInvites map[string][]string
-	others    []slack.Conversation
-	Joins     []JoinCall
-	Leaves    []string // conversations.leave calls (LeaveCalls)
+	// caKicks: conversations.kick out of them (channel → user ids)
+	caKicks map[string][]string
+	others  []slack.Conversation
+	Joins   []JoinCall
+	Leaves  []string // conversations.leave calls (LeaveCalls)
 	// BulkLeaves are conversations.bulkLeave calls' channels (BulkLeaveCalls)
 	BulkLeaves [][]string
 	// listFilters: every edge users/list filter (UserListFilters).
@@ -717,6 +731,9 @@ func Serve(ln net.Listener, sz Size) *Server {
 	if sz.GroupDMs {
 		s.addGroupDMs() // groupdms.go
 	}
+	if sz.DMBadges {
+		s.addDMBadges() // dm_badges.go
+	}
 	if sz.Workflows {
 		s.addWorkflowsChannel() // workflows.go
 	}
@@ -732,14 +749,23 @@ func Serve(ln net.Listener, sz Size) *Server {
 	if sz.GIFs > 0 {
 		s.addGIFWall() // gifs.go
 	}
+	if sz.AppPlans {
+		s.addAppPlans() // agents.go
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/", s.api)
 	mux.HandleFunc("/img/", s.img)
 	mux.HandleFunc("/ws", s.ws)
 	mux.HandleFunc("/files-pri/", s.filesPri) // canvas exports (canvas.go)
 	mux.HandleFunc("/auth", s.authPage)       // the token page (auth_page.go)
+	mux.HandleFunc("/photos/", s.photosPage)  // users.preparePhoto's images (photo.go)
 	mux.HandleFunc("/", s.otherPage)          // any other page: logged, not found
-	s.srv = &http.Server{Handler: mux}
+	s.srv = &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.asSlackHost(w, r) { // a request HostsTransport sent for one of Slack's hosts (photo.go)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})}
 	go s.srv.Serve(ln)
 	return s
 }
@@ -751,16 +777,24 @@ func (s *Server) Close() error {
 	viewsStates.Delete(s)
 	threadsAuditStates.Delete(s)
 	agentDMStates.Delete(s)
+	photoStores.Delete(s)
 	if s.srv == nil {
 		return nil
 	}
 	return s.srv.Close()
 }
 
+// The fake's tokens (Creds and the auth page's): the workspace's and the
+// org's.
+const (
+	TeamToken = "xoxc-fake"
+	OrgToken  = "xoxc-fake-org"
+)
+
 // Creds returns credentials pointing every host (team, enterprise, edge) at
 // the fake.
 func (s *Server) Creds() slack.Creds {
-	return slack.Creds{Token: "xoxc-fake", Cookie: "xoxd-fake", Team: TeamID, EnterpriseToken: "xoxc-fake-org",
+	return slack.Creds{Token: TeamToken, Cookie: "xoxd-fake", Team: TeamID, EnterpriseToken: OrgToken,
 		EnterpriseID: EnterpriseID, UserID: SelfID, TeamURL: s.URL, EnterpriseURL: s.URL}
 }
 
@@ -791,6 +825,17 @@ func (s *Server) CallCount(method string) int64 {
 		return c.Load()
 	}
 	return 0
+}
+
+// CallCounts is how often each method was called, every method so far.
+func (s *Server) CallCounts() map[string]int64 {
+	s.callsMu.Lock()
+	defer s.callsMu.Unlock()
+	out := make(map[string]int64, len(s.Calls))
+	for m, c := range s.Calls {
+		out[m] = c.Load()
+	}
+	return out
 }
 
 func (s *Server) count(method string) {
@@ -901,6 +946,19 @@ func (s *Server) generate() {
 		{ID: ArchivedChannelID, Name: "old-hackathon", IsChannel: true, IsArchived: true, Created: now - 2e8,
 			Creator: s.users[2].ID, NumMembers: 37, ContextTeamID: TeamID, Purpose: &slack.Purpose{Value: "Archived."}},
 	}
+}
+
+// AddOtherChannel adds a public channel the viewer isn't in (someone
+// else made it): conversations.info answers it with is_member false and
+// conversations.join moves it to the viewer's.
+func (s *Server) AddOtherChannel(c slack.Conversation) {
+	c.IsChannel, c.IsMember = true, false
+	if c.ContextTeamID == "" {
+		c.ContextTeamID = TeamID
+	}
+	s.convMu.Lock()
+	s.others = append(s.others, c)
+	s.convMu.Unlock()
 }
 
 // conv finds a conversation by id: the viewer's, then the others.
@@ -1263,7 +1321,10 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		form, _ = url.ParseQuery(string(body))
 		if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/") {
 			form = url.Values{}
-			if method == "users.preparePhoto" || method == "avatars.upload" { // profile.go, calls_email.go: the image part's size
+			switch method {
+			case "users.preparePhoto": // profile.go: the fields, and the image part's size, dimensions, name and type
+				form = photoUploadForm(r.Header.Get("Content-Type"), body)
+			case "avatars.upload": // calls_email.go: the image part's size
 				form.Set(photoBytesKey, multipartFileSize(r.Header.Get("Content-Type"), body, "image"))
 			}
 		}
@@ -1456,6 +1517,7 @@ func (s *Server) handle(method string, f url.Values, edge map[string]json.RawMes
 			if closedDM(c) { // closed_dms.go: read
 				e.HasUnreads, e.MentionCount, e.LastRead = false, 0, e.Latest
 			}
+			e = s.dmBadgeCount(c, e) // dm_badges.go
 			e.LastRead, e.HasUnreads, e.MentionCount = s.applyMark(c.ID, e.LastRead, e.Latest, e.HasUnreads, e.MentionCount)
 			if c.IsIM {
 				ims = append(ims, e)
@@ -1463,10 +1525,19 @@ func (s *Server) handle(method string, f url.Values, edge map[string]json.RawMes
 				chans = append(chans, e)
 			}
 		}
+		out := ok("channels", chans, "ims", ims, "mpims", []any{}, "threads", map[string]any{"has_unreads": true, "mention_count": 2})
 		if av := s.activityV2(); av != nil { // activity_badges.go
-			return ok("channels", chans, "ims", ims, "mpims", []any{}, "threads", map[string]any{"has_unreads": true, "mention_count": 2}, "activity_v2", av)
+			out["activity_v2"] = av
 		}
-		return ok("channels", chans, "ims", ims, "mpims", []any{}, "threads", map[string]any{"has_unreads": true, "mention_count": 2})
+		if badges, alerts := s.classicBadges(); badges != nil || alerts != nil { // SetChannelBadges, SetAlerts
+			if badges != nil {
+				out["channel_badges"] = badges
+			}
+			if alerts != nil {
+				out["alerts"] = alerts
+			}
+		}
+		return out
 	case "sidebar.dms": // every generated DM is open; AddClosedDM's aren't
 		var ims, mpdms []map[string]any
 		s.convMu.Lock()
@@ -1505,8 +1576,8 @@ func (s *Server) handle(method string, f url.Values, edge map[string]json.RawMes
 		for _, r := range rows {
 			item := map[string]any{"id": r.id, "channel": r.conv}
 			ts := "0000000000.000000"
-			if h := s.history(r.id); len(h) > 0 { // newest first
-				item["message"], ts = h[0], h[0].TS
+			if m, ok := s.dmsLatest(r.id); ok { // dm_badges.go
+				item["message"], ts = m, m.TS
 			}
 			outs = append(outs, dmOut{ts, item, r.conv.IsIM})
 		}
@@ -1653,6 +1724,11 @@ func (s *Server) handle(method string, f url.Values, edge map[string]json.RawMes
 	case "apps.profile.get":
 		if p, found := s.appProfile(f.Get("bot"), f.Get("app")); found {
 			return ok("app_profile", p)
+		}
+		return map[string]any{"ok": false, "error": "app_not_found"}
+	case "apps.about.info":
+		if p, found := s.appAboutInfo(f.Get("app_id")); found {
+			return p
 		}
 		return map[string]any{"ok": false, "error": "app_not_found"}
 	case "emoji.list":
@@ -1875,6 +1951,9 @@ func (s *Server) userByID(id string) (slack.User, bool) {
 	if s.Size.ThreadHeader && id == ThreadAppUserID { // threadheader.go
 		return s.threadHeaderApp(), true
 	}
+	if u, ok := s.dmBadgeUser(id); ok { // dm_badges.go
+		return u, true
+	}
 	if strings.HasPrefix(id, "U0FAKE") {
 		if n, err := strconv.Atoi(id[6:]); err == nil && n < len(s.users) {
 			return s.users[n], true
@@ -1977,15 +2056,7 @@ func (s *Server) img(w http.ResponseWriter, r *http.Request) {
 		for _, c := range parts[1] {
 			seed = seed*31 + int(c)
 		}
-		im := image.NewNRGBA(image.Rect(0, 0, iw, ih))
-		for y := 0; y < ih; y++ {
-			for x := 0; x < iw; x++ {
-				im.SetNRGBA(x, y, color.NRGBA{uint8(x*255/iw + seed), uint8(y*255/ih + seed>>3), uint8(seed >> 6), 255})
-			}
-		}
-		var buf bytes.Buffer
-		_ = (&png.Encoder{CompressionLevel: png.BestSpeed}).Encode(&buf, im)
-		b = buf.Bytes()
+		b = genPNG(iw, ih, seed)
 		s.imgMu.Lock()
 		s.imgs[r.URL.Path] = b
 		s.imgMu.Unlock()

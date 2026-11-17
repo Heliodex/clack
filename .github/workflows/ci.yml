@@ -29,6 +29,19 @@ jobs:
         run: test -z "$(gofmt -l . | tee /dev/stderr)"
       - name: vet
         run: go vet ./...
+      # The app must not link golang.org/x/image/webp: its init would
+      # register an unbudgeted WebP decoder with package image, which
+      # image.Decode could then reach, bypassing imgcache's per-decode
+      # memory budget. imgcache vendors internal/imgcache/internal/webp and
+      # registers that instead (internal/imgcache/webpreg checks the
+      # registration holds in a build that doesn't link x/image/webp).
+      - name: the binary does not link x/image/webp
+        if: ${{ !cancelled() }}
+        run: |
+          if go list -deps ./cmd/clack | grep -qx golang.org/x/image/webp; then
+            echo "::error::cmd/clack links golang.org/x/image/webp; its unbudgeted decoder would be reachable through image.Decode. Use internal/imgcache/internal/webp."
+            exit 1
+          fi
       - name: build
         if: ${{ !cancelled() }}
         run: |
@@ -92,6 +105,33 @@ jobs:
       - name: every test ran in some shard
         run: python3 .github/scripts/test-shard.py check "$RUNNER_TEMP"/shards/test-shard-*
 
+  # release.yml's test job, step for step: every package in one
+  # `go test` on a clean cache. The shards above split internal/ui
+  # across jobs, so none of them carries the whole suite's load, and
+  # timing races that only show under it (TestInspectKonami in α.82,
+  # TestFilesViewSectionsSidebar in α.83) passed ci and failed the
+  # tagged release. This fails the ui/main push instead. ui and main
+  # only (~18 min), or any branch by hand (gh workflow run ci.yml --ref
+  # <branch>); a newer push to the same ref cancels the older run.
+  full-test:
+    if: github.ref == 'refs/heads/ui' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ci-full-test-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: false # as release.yml: a clean module/build cache
+      - name: gio deps
+        run: sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" update -qq && sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" install -y -qq $GIO_DEPS
+      - name: test
+        run: go test -timeout 30m ./...
+
   # Report-only (docs/PARITY.md): tools/parity.py runs the Slack-parity
   # tests (tools/parity_checks.json) against Slack's committed output and
   # says per dimension whether Clack is the same as Slack, what no check
@@ -154,18 +194,44 @@ jobs:
       # a press no filter matches gets a frame and stays unhandled
       - name: Gio key presses whoever takes them (vendored gioui.org/io/input)
         if: ${{ !cancelled() }}
-        run: go test -count=1 -v -run 'KeyPresses' gioui.org/io/input
+        run: go test -count=1 -v -run 'KeyPresses|SinceInput' gioui.org/io/input
       # Gio patch 21: a hover-only Source (the inspect tool lays the window
       # out with one): hover, scroll and focus stay, clicks and keys don't
       - name: Gio hover-only input (vendored gioui.org/io/input)
         if: ${{ !cancelled() }}
         run: go test -count=1 -v -run 'HoverOnly' gioui.org/io/input
+      # Gio patch 34: the focused tag, whether a tag can keep the focus, and
+      # whether one was drawn inside another (slackc's overlay layers)
+      - name: Gio focus answers (vendored gioui.org/io/input)
+        if: ${{ !cancelled() }}
+        run: go test -count=1 -v -run 'FocusTagCanFocusWithin' gioui.org/io/input
+      # Gio patches 37-44: a rounded clip's interior and a stroked one's
+      # hole, ops split around them, a clip path's stencil regions, layers
+      # of one depth on one atlas page, the sub-pixel path cache key, GL's
+      # attribute query (the pixels: gpu/headless's TestClack* and theme's
+      # TestFrameCostPixels below, and the macos and windows-applog jobs'
+      # Gio frame cost steps on Metal and Direct3D 11)
+      - name: Gio frame cost (vendored gioui.org/op/clip, gpu)
+        if: ${{ !cancelled() }}
+        run: |
+          go test -count=1 -v -run 'TestRRectInterior|TestRRectStrokeHole' gioui.org/op/clip
+          go test -count=1 -v -run 'TestAddRegion|TestCollectClipInterior|TestPackLayersOneDepthOnePage|TestSplitOp|TestCollectStrokeHole|TestCollectPanelSplit|TestCollectSubPixelKey|TestPackLayersLegacy|TestClackOpCacheReturningPathHits' gioui.org/gpu
+          go test -count=1 -v -run 'TestQueryVertAttribBinding' gioui.org/gpu/internal/opengl
       # Gio patch 26: an Invalidate made while the client handles a wake-up
       # gets a wake-up of its own (hidden and minimized windows draw no
       # frame to cover it); the real windows are windows-shell's
       - name: Gio wakes the client for every Invalidate (vendored gioui.org/app)
         if: ${{ !cancelled() }}
         run: go test -count=1 -v -run 'TestInvalidateWhileHandlingAWakeup' gioui.org/app
+      # Gio patch 35: a live image draws its image as it is when the frame
+      # is drawn (the renderer's uploads; only the paints a frame shows
+      # ask), a FrameEvent says whether the window's own frames asked for
+      # it (an Invalidate asks nothing), and a frame drawn again keeps the
+      # handlers' filters and the key log (ui's quiet frames); the X11
+      # window's and the real GPU's are below, under Xvfb
+      - name: Gio live images and what a frame was asked for (vendored gioui.org/op/paint, gpu, app)
+        if: ${{ !cancelled() }}
+        run: go test -count=1 -v -run 'TestLiveImageOp|TestDrawOpsLiveImage|TestFrameEventAsked$|TestReplayKeeps' gioui.org/op/paint gioui.org/gpu gioui.org/app gioui.org/io/input
       # Gio patch 22: what each point of a window with a hidden title bar
       # is (the caption buttons, the top band, the caption, the client);
       # the Windows codes on real windows are windows-applog's. Patch 24:
@@ -175,16 +241,21 @@ jobs:
         if: ${{ !cancelled() }}
         run: go test -count=1 -v -run 'TestCaptionHit|TestHiddenTitleBarOption|TestTitlebarDoubleClickAction' gioui.org/app
       # the X11 path on a real X server: python-xlib plays a file manager's
-      # XDND source against a Gio window (enter, positions, drop, leave)
-      - name: XDND file drops on Xvfb (Gio patch 11)
+      # XDND source against a Gio window (enter, positions, drop, leave).
+      # Gio patch 35: on the X11 window, a frame only Window.Invalidate
+      # brought has FrameEvent.Asked false, and an op.InvalidateCmd's, its
+      # later wake-up's and a real (XTEST) press's frames are asked for
+      - name: XDND file drops and what a frame was asked for, on Xvfb (Gio patches 11, 35)
         if: ${{ !cancelled() }}
         env:
           CLACK_X11_DROP_TESTS: "1"
+          CLACK_X11_ASKED_TESTS: "1"
           GALLIUM_DRIVER: llvmpipe
           LIBGL_ALWAYS_SOFTWARE: "1"
         run: |
           sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" install -y -qq xvfb libgl1-mesa-dri libegl-mesa0 python3-xlib
           xvfb-run -a go test -count=1 -v -timeout 5m -run 'TestXDNDFileDrop' gioui.org/app
+          xvfb-run -a -s "-screen 0 1280x1024x24" go test -count=1 -v -timeout 5m -run '^TestFrameEventAskedX11$' gioui.org/app
       - name: pixel tests (Mesa llvmpipe)
         env:
           CLACK_PIXEL_TESTS: "1"
@@ -195,13 +266,48 @@ jobs:
           # -p 1: test binaries bringing up Mesa's EGL at once is what made
           # eglInitialize fail (0x3001); pixeltest.NewWindow also retries.
           # TestTextMatchesChrome: text against Chrome 156's (theme/testdata/text-render; font-shots' text-render jobs re-measure it)
-          xvfb-run -a go test -p 1 -count=1 -run 'TestCodeSpanAfterEmoji|TestInlineCodeDraws|TestEmojiTooltip|TestReactionTooltipDraws|TestPlaceholderHashMatchesText|TestSlugPillNotUnderlined|TestDecorationShots|TestTextMatchesChrome' ./internal/ui/richview ./internal/ui/composer ./internal/ui/messages ./internal/ui/theme
+          # TestWrapped*, TestCodeChipWrapBorders, TestPillEllipsisDrawsOverPill: a mention pill that wraps, its picture (MentionProfiles' ::before), a rule's background, border and shadow per line, its hover (its text painted once), inline code's sliced border, a clamp's "…" over a component pill, in richview and in channel and thread rows (css and plugin-patched)
+          xvfb-run -a go test -p 1 -count=1 -run 'TestCodeSpanAfterEmoji|TestInlineCodeDraws|TestSelectionOverCode|TestComposerSelectionOverCode|TestEmojiTooltip|TestReactionTooltipDraws|TestPlaceholderHashMatchesText|TestSlugPillNotUnderlined|TestDecorationShots|TestTextMatchesChrome|TestSideBarEnds|TestNewlineGapShots|TestFrameCostPixels|TestFrameCostSeams|TestWrappedPillPictureDraws|TestWrappedPillCSSBackground|TestWrappedPillBorderShadow|TestWrappedPillHover|TestCodeChipWrapBorders|TestWrappedMentionPictureInRows|TestPillEllipsisDrawsOverPill' ./internal/ui/richview ./internal/ui/composer ./internal/ui/messages ./internal/ui/theme
+          # the profile hover card's name / title / pronouns column against Slack's CSS (light + dark)
+          xvfb-run -a go test -count=1 -v -run '^TestHoverCardPronounsLikeSlack$' ./internal/ui/popups
+          # Gio patch 35 on a real GPU context: the same ops drawn twice show a live image as it is at each
+          xvfb-run -a go test -count=1 -v -run '^TestLiveImageFrames$' gioui.org/gpu/headless
+          # Gio patches 37-44 in pixels: the state caches change none, shared
+          # layer pages and splits under a transform none, a cached path at
+          # a new sub-pixel offset is built there, atlas pages shrink and go
+          xvfb-run -a go test -count=1 -v -run '^(TestClackAtlasShrinks|TestClackAtlasShrinksUsedNowAndThen|TestClackAtlasGrowKeepsSize|TestClackStateCacheIdentical|TestClackLayerPages|TestClackSubPixelCache|TestClackSplitsUnderTransform)$' gioui.org/gpu/headless
       - name: Gio drawLayers fix (patched passes, stock v0.10.3 panics)
         env:
           CLACK_PIXEL_TESTS: "1"
           GALLIUM_DRIVER: llvmpipe
           LIBGL_ALWAYS_SOFTWARE: "1"
         run: .github/scripts/gio-layer-fix.sh xvfb-run -a
+
+  # The freeze watchdog's flight recorder (internal/tracerec) on newer Go
+  # than go.mod's toolchain: from Go 1.25 its go1.25 build tag takes
+  # runtime/trace's FlightRecorder instead of golang.org/x/exp/trace's,
+  # which deadlocks on Go 1.26's tracer (and with it, quitting). go.mod's
+  # toolchain line is only a minimum, so a local build with a newer Go
+  # takes this path; GOTOOLCHAIN=local keeps the runner's.
+  newer-go:
+    name: newer-go (${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.25.x', 'stable']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+      - name: the flight recorder (internal/tracerec)
+        env:
+          GOTOOLCHAIN: local
+        run: go version && go test -count=1 -v ./internal/tracerec
 
   linux-race-taut:
     runs-on: ubuntu-latest
@@ -256,6 +362,19 @@ jobs:
         env:
           CLACK_IDLE_FRAMES: "1"
         run: go test -count=1 -v -timeout 20m -run '^(TestIdleFrames|TestHuddleWindowIdleFrames)$' ./internal/ui ./internal/ui/huddleui
+      # Gio patch 35 and ui's quiet frames on App.Run's real X11 window
+      # (Xvfb, Mesa's llvmpipe): a frame only an animated emoji asked for
+      # draws the last frame's ops again, without a layout; the same on
+      # Metal and Direct3D are the macos and windows-idle jobs'
+      - name: quiet frames on the real window (TestRealWindowQuietFrames, Xvfb)
+        if: ${{ !cancelled() }}
+        env:
+          CLACK_REAL_WINDOW_TESTS: "1"
+          GALLIUM_DRIVER: llvmpipe
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" install -y -qq xvfb libgl1-mesa-dri libegl-mesa0
+          xvfb-run -a -s "-screen 0 1920x1080x24" go test -count=1 -v -timeout 10m -run '^TestRealWindowQuietFrames$' ./internal/ui
 
   windows:
     runs-on: ubuntu-latest
@@ -302,6 +421,31 @@ jobs:
           cache: true
       - name: applog tests
         run: go test -count=1 -v ./internal/applog
+      # Gio patches 37-44 on Direct3D 11 (WARP): the state caches change no
+      # pixel, the window's drawing held to the old way (theme's
+      # TestFrameCostPixels), shared layer pages, sub-pixel paths, atlas
+      # pages; linux-gio runs them on llvmpipe, macos on Metal
+      - name: Gio frame cost on Direct3D 11 (WARP)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          CLACK_PIXEL_TESTS: "1"
+        run: |
+          go test -count=1 -v -timeout 15m -run '^(TestClackAtlasShrinks|TestClackAtlasShrinksUsedNowAndThen|TestClackAtlasGrowKeepsSize|TestClackStateCacheIdentical|TestClackLayerPages|TestClackSubPixelCache|TestClackSplitsUnderTransform)$' gioui.org/gpu/headless
+          go test -count=1 -v -timeout 25m -run '^(TestFrameCostPixels|TestFrameCostSeams)$' ./internal/ui/theme
+      # Go's monotonic clock counts sleep on Windows; awake reads
+      # QueryUnbiasedInterruptTime instead (jsrt deadlines, freeze watchdog)
+      - name: awake clock (QueryUnbiasedInterruptTime)
+        if: ${{ !cancelled() }}
+        run: go test -count=1 -v ./internal/awake
+      # the plugin engine's wasm memory in address space reserved with
+      # VirtualAlloc, committed as it grows, released on Close
+      # (internal/jsrt/wasmmem_windows.go; jsrt.yml's platforms job runs
+      # the whole package)
+      - name: jsrt wasm memory (VirtualAlloc reservation)
+        if: ${{ !cancelled() }}
+        run: go test -count=1 -v -run 'TestWasm|TestReserv' ./internal/jsrt
       - name: huddle OS hooks (WTS lock events, RegisterHotKey Ctrl+Shift+Space)
         if: ${{ !cancelled() }}
         run: go test -count=1 -v ./internal/ui/screenlock ./internal/ui/globalkey
@@ -497,8 +641,11 @@ jobs:
             Wait-Log 'sign-in: a sign-in link came from outside Clack; signing in with it' 'the sign-in card taking it'
             Wait-Log "sign-in: couldn't read the team and token from the sign-in link" 'the sign-in attempt (the fake link stops it there)'
             if ($p.HasExited) { throw "the first Clack exited ($($p.ExitCode))" }
-            for ($i = 0; $i -lt 40 -and @(Get-Process -Name Clack -ErrorAction SilentlyContinue).Count -gt 1; $i++) { Start-Sleep -Milliseconds 250 }
-            $n = @(Get-Process -Name Clack -ErrorAction SilentlyContinue).Count
+            # the window's Clack processes: not the introduction's renderer
+            # (Clack.exe intro-preview, which the first run's intro starts)
+            function Count-Clack { @(Get-CimInstance Win32_Process -Filter "Name='Clack.exe'" | Where-Object { $_.CommandLine -notlike '*intro-preview*' }).Count }
+            for ($i = 0; $i -lt 40 -and (Count-Clack) -gt 1; $i++) { Start-Sleep -Milliseconds 250 }
+            $n = Count-Clack
             if ($n -ne 1) { throw "$n Clack processes: the launch Windows started didn't hand over and exit" }
             if (Select-String -Path $log -SimpleMatch -Pattern 'magic-login/xyz' -Quiet) { throw 'the sign-in link is in the log' }
           } finally { Stop-Clack $p }
@@ -536,6 +683,27 @@ jobs:
           Assert-NoReg 'HKCU\Software\Classes\Clack.slack'
           Get-Content $log | Select-String -SimpleMatch 'slack://', 'sign-in:' | ForEach-Object { $_.Line }
           exit 0 # the last reg query's expected exit 1 would otherwise end the step
+
+      # The introduction's preview renderer as a release runs it: the
+      # Clack.exe built above (-H windowsgui) started as `intro-preview`
+      # by TestIntroSlackPreview's window, a D3D11 headless frame, the
+      # renderer's report (real components, reads only, no plugin, the
+      # user's folder untouched), quit mid-render. The beat's shots are the
+      # intro-preview-windows artifact.
+      - name: the introduction's preview renderer (Clack.exe intro-preview)
+        if: ${{ !cancelled() }}
+        shell: bash # every go test counts (pwsh steps fail only on the last command)
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p "$RUNNER_TEMP/intro-shots"
+          CLACK_INTRO_PREVIEW_BIN="$GITHUB_WORKSPACE/build/Clack.exe" LOGIN_SHOTS_DIR="$RUNNER_TEMP/intro-shots" \
+            go test -count=1 -v -timeout 15m -run '^(TestIntroSlackPreview|TestIntroPreviewPluginHome|TestIntroPreviewQuit|TestIntroPreviewWindowGone)$' ./internal/ui
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ !cancelled() }}
+        with:
+          name: intro-preview-windows
+          path: ${{ runner.temp }}/intro-shots
 
       # Closing the window keeps Clack in the notification area (Slack's
       # runFromTray): Gio patch 13's Window.Hide and the show in
@@ -851,6 +1019,15 @@ jobs:
           CGO_ENABLED: "0"
           CLACK_IDLE_FRAMES: "1"
         run: go test -count=1 -v -timeout 20m -run '^(TestIdleFrames|TestHuddleWindowIdleFrames)$' ./internal/ui ./internal/ui/huddleui
+      # Gio patch 35 and ui's quiet frames on App.Run's real Direct3D
+      # window: a frame only an animated emoji asked for draws the last
+      # frame's ops again, without a layout
+      - name: quiet frames on the real window (TestRealWindowQuietFrames)
+        if: ${{ !cancelled() }}
+        env:
+          CGO_ENABLED: "0"
+          CLACK_REAL_WINDOW_TESTS: "1"
+        run: go test -count=1 -v -timeout 10m -run '^TestRealWindowQuietFrames$' ./internal/ui
 
 
   macos:
@@ -876,10 +1053,63 @@ jobs:
           # Cmd+Backspace / Cmd+Delete / Option+Backspace in Block Kit text inputs (Gio editor patch 4)
           go test -count=1 -v -run 'TestModalTextInputsEdit$' ./internal/ui/blockkit
           go test -count=1 -v -run 'TestBlockKitModalFieldsEdit$' ./internal/ui
+      # the plugin engine's wasm memory in address space reserved with mmap,
+      # committed with mprotect as it grows, released on Close
+      # (internal/jsrt/wasmmem_unix.go): arm64, and amd64 (Intel Macs) under
+      # Rosetta 2 (jsrt.yml's platforms job runs the whole package on both)
+      - name: jsrt wasm memory (mmap reservation; arm64, then amd64 under Rosetta)
+        if: ${{ !cancelled() }}
+        run: |
+          go test -count=1 -v -run 'TestWasm|TestReserv' ./internal/jsrt
+          if /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null; then
+            GOARCH=amd64 go test -count=1 -v -run 'TestWasm|TestReserv' ./internal/jsrt
+          else
+            echo "::warning::no Rosetta 2 on this runner: the amd64 run is jsrt.yml's (macos-15-intel)"
+          fi
+      # The introduction's preview renderer as a release runs it: clack
+      # in a Clack.app made and ad-hoc signed as release.yml makes it,
+      # started as `intro-preview` from Contents/MacOS by
+      # TestIntroSlackPreview's window: a Metal headless frame, the
+      # renderer's report (real components, reads only, no plugin, the
+      # user's folder untouched) and its AppKit standing (no
+      # NSApplication, never a regular app with a Dock icon, never active);
+      # a renderer whose window went cleans up. The beat's shots are the
+      # intro-preview-macos artifact.
+      - name: the introduction's preview renderer (Clack.app's clack intro-preview, Metal, never an app)
+        if: ${{ !cancelled() }}
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/intro-shots"
+          app="$RUNNER_TEMP/intro/Clack.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          go build -o "$app/Contents/MacOS/clack" ./cmd/clack
+          cp assets/icon/clack.icns "$app/Contents/Resources/clack.icns"
+          sed "s/@VERSION@/0.0.1/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
+          printf 'APPL????' > "$app/Contents/PkgInfo"
+          plutil -lint "$app/Contents/Info.plist"
+          codesign --force --deep --sign - --entitlements packaging/macos/Clack.entitlements "$app"
+          codesign --verify --deep --strict "$app"
+          CLACK_INTRO_PREVIEW_BIN="$app/Contents/MacOS/clack" LOGIN_SHOTS_DIR="$RUNNER_TEMP/intro-shots" \
+            go test -count=1 -v -timeout 15m -run '^(TestIntroSlackPreview|TestIntroPreviewPluginHome|TestIntroPreviewQuit|TestIntroPreviewWindowGone)$' ./internal/ui
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ !cancelled() }}
+        with:
+          name: intro-preview-macos
+          path: ${{ runner.temp }}/intro-shots
       - name: Gio drawLayers fix on Metal (patched passes, stock v0.10.3 panics)
         env:
           CLACK_PIXEL_TESTS: "1"
         run: .github/scripts/gio-layer-fix.sh
+      # Gio patches 37-44 on Metal: the state caches and command batching
+      # change no pixel, the window's drawing held to the old way, shared
+      # layer pages, sub-pixel paths, atlas pages
+      - name: Gio frame cost on Metal
+        if: ${{ !cancelled() }}
+        env:
+          CLACK_PIXEL_TESTS: "1"
+        run: |
+          go test -count=1 -v -timeout 15m -run '^(TestClackAtlasShrinks|TestClackAtlasShrinksUsedNowAndThen|TestClackAtlasGrowKeepsSize|TestClackStateCacheIdentical|TestClackLayerPages|TestClackSubPixelCache|TestClackSplitsUnderTransform)$' gioui.org/gpu/headless
+          go test -count=1 -v -timeout 20m -run '^(TestFrameCostPixels|TestFrameCostSeams)$' ./internal/ui/theme
       - name: macOS freeze guards (no blocking work on the AppKit main thread)
         run: |
           go test -count=1 -v ./internal/ui/uiguard
@@ -971,6 +1201,48 @@ jobs:
           go test -count=1 -v -timeout 10m -run '^TestMacWindowCloseHides$' ./internal/ui
           ui=$?
           exit $((gio | ui))
+      # Gio patch 32 (Karim's freezes after his Mac woke, 2026-11-16: the
+      # main thread in -[CAMetalLayer nextDrawable] for seconds, minutes
+      # while the screens slept). An occluded window (an opaque window over
+      # every screen) draws nothing and comes back once it's visible; with
+      # every drawable taken a frame waits a second at most, is skipped and
+      # tried again, the window alive; the screens' sleep stops frames
+      # until their wake or a click; each wake and sleep is in the log.
+      - name: macOS wake, sleep and occlusion (Gio patch 32)
+        if: ${{ !cancelled() }}
+        env:
+          CLACK_MACOS_WINDOW_TESTS: "1"
+        run: go test -count=1 -v -timeout 10m -run '^(TestOccludedWindowPausesMac|TestNoDrawableSkipsFrameMac|TestScreensSleepWakeMac)$' gioui.org/app
+      # A notification's click (Karim, α.89: "the thing to hop to the
+      # desired message when clicking a notif doesn't work"): App.Run's
+      # window comes forward (shown after a close hid it, restored from the
+      # Dock after a minimize, key, the app active) and opens the message,
+      # highlighted, or a reply's thread at the reply, from another
+      # conversation. First with notify_mac_test.go's fake center, then from
+      # a test Clack.app through the real UNUserNotificationCenter, the
+      # click being the response macOS hands the center's delegate
+      # (usernotifyprobe.Click).
+      - name: macOS notification click jumps to the message
+        if: ${{ !cancelled() }}
+        env:
+          CLACK_MACOS_WINDOW_TESTS: "1"
+        run: |
+          set +e
+          rc=0
+          go test -count=1 -v -timeout 10m -run '^TestMacNotificationClickJumps$' ./internal/ui || rc=1
+          mkdir -p build && go test -c -o build/ui-click.test ./internal/ui || exit 1
+          app="$GITHUB_WORKSPACE/build/click/Clack.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp build/ui-click.test "$app/Contents/MacOS/clack"
+          cp assets/icon/clack.icns "$app/Contents/Resources/clack.icns"
+          sed "s/@VERSION@/0.0.1/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier io.github.some-du6e.clack.probe-click" "$app/Contents/Info.plist"
+          printf 'APPL????' > "$app/Contents/PkgInfo"
+          codesign --force --deep --sign - --entitlements packaging/macos/Clack.entitlements "$app"
+          cd internal/ui
+          CLACK_MACOS_NOTIFY_BUNDLE=1 "$app/Contents/MacOS/clack" -test.v -test.count=1 -test.timeout 10m -test.run '^TestMacNotificationClickJumps$' || rc=1
+          log show --last 10m --style compact --predicate 'process == "usernoted"' | grep -i 'probe-click' | tail -60
+          exit $rc
       # Keys posted as a keyboard makes them (cocoatest.PostKey: the
       # layout's characters) and delivered by AppKit: NSApp sendEvent:, the
       # menu bar's key equivalents, Gio's view and its interpretKeyEvents:.
@@ -987,9 +1259,31 @@ jobs:
           set +e
           go test -count=1 -v -timeout 10m -run '^TestMacCommandKeys$' gioui.org/app
           gio=$?
-          go test -count=1 -v -timeout 10m -run '^TestMacInspectKeys$' ./internal/ui
+          go test -count=1 -v -timeout 10m -run '^(TestMacInspectKeys|TestMacComposerFormatKeys)$' ./internal/ui
           ui=$?
           exit $((gio | ui))
+      # P6 (gap audit 2026-11-15): ⌘V reads the general pasteboard natively
+      # (internal/desktop/pasteboard_darwin.m), as Chromium's ClipboardMac:
+      # Finder's copied files attach as those files, an image comes as
+      # public.png's bytes or NSImage's as a PNG, rich text with a picture
+      # stays text, a busy main thread never holds the read. JXA puts the
+      # data on the real pasteboard; TestMain runs app.Main for the reads'
+      # main-thread hops (CLACK_MACOS_PASTEBOARD_TESTS).
+      - name: macOS paste from the pasteboard (P6)
+        if: ${{ !cancelled() }}
+        env:
+          CLACK_MACOS_PASTEBOARD_TESTS: "1"
+        run: go test -count=1 -v -timeout 10m -run '^TestMacPaste' ./internal/ui/composer
+      # P6b: ⌘V in App.Run's own composer, through the Edit menu's paste:
+      # and Gio's pasteboard string. A Finder copy attaches its files and
+      # leaves out their names (Finder's plain text), as Slack's
+      # useUploadPastedFiles preventDefaults the paste; plain text, an
+      # image and TextEdit's rich text with a picture are as before.
+      - name: macOS ⌘V into the composer (P6b)
+        if: ${{ !cancelled() }}
+        env:
+          CLACK_MACOS_WINDOW_TESTS: "1"
+        run: go test -count=1 -v -timeout 10m -run '^TestMacComposerPaste$' ./internal/ui
       # docs/GAPS-2026-11-14.md gap 9 (W40). Gio patch 25 on real NSWindows:
       # Displays against NSScreen, a window opened at Bounds (points from
       # the primary screen's top left), its ConfigEvents' bounds through a
@@ -1011,6 +1305,31 @@ jobs:
           for t in TestMacWindowBounds TestMacWindowBoundsOffScreen TestMacWindowBoundsFullScreen; do
             "$RUNNER_TEMP/ui-bounds.test" -test.v -test.count=1 -test.timeout 10m -test.run "^$t\$" || rc=1
           done
+          exit $rc
+      # Idle on the real macOS window (TestMacIdleCPU): App.Run's window
+      # with Metal and the AppKit glue, signed in to the fake with realtime
+      # on, left alone on each surface and then hidden; each period's
+      # frames, who asked for them, its CPU and its CPU profile's top.
+      # Then TestIdleFrames headless, as linux-idle runs it, and the quiet
+      # frames of an animated emoji on the real window
+      # (TestRealWindowQuietFrames, Gio patch 35).
+      - name: idle on the real window (TestMacIdleCPU), idle frames (TestIdleFrames), quiet frames (TestRealWindowQuietFrames)
+        if: ${{ !cancelled() }}
+        run: |
+          set +e
+          rc=0
+          go test -c -o "$RUNNER_TEMP/ui-idle.test" ./internal/ui || exit 1
+          cd internal/ui
+          CLACK_MACOS_WINDOW_TESTS=1 CLACK_IDLE_CPUPROFILE="$RUNNER_TEMP/idlecpu" "$RUNNER_TEMP/ui-idle.test" -test.v -test.count=1 -test.timeout 15m -test.run '^TestMacIdleCPU$' || rc=1
+          for f in "$RUNNER_TEMP"/idlecpu-*.pprof; do
+            [ -s "$f" ] || continue
+            echo "== $(basename "$f")"
+            go tool pprof -top -nodecount=30 "$RUNNER_TEMP/ui-idle.test" "$f" 2>&1 | head -42
+          done
+          CLACK_IDLE_FRAMES=1 "$RUNNER_TEMP/ui-idle.test" -test.v -test.count=1 -test.timeout 25m -test.run '^TestIdleFrames$' || rc=1
+          # Gio patch 35 and ui's quiet frames on Metal: a frame only an
+          # animated emoji asked for draws the last frame's ops again
+          CLACK_MACOS_WINDOW_TESTS=1 "$RUNNER_TEMP/ui-idle.test" -test.v -test.count=1 -test.timeout 10m -test.run '^TestRealWindowQuietFrames$' || rc=1
           exit $rc
       - name: build
         if: ${{ !cancelled() }}

@@ -31,7 +31,9 @@ docs/FIDELITY.md (round 2) and docs/VIEWS-AUDIT.md still stand.
   `automations_only`, `cursor`. The "all" types are hgTi `j`: mentions
   (+ `unjoined_channel_mention` behind an experiment), threads, reactions,
   apps, dms (+ `prejoin_dm_welcome_party_alert`), invitations
-  (+ `team_joiner_invite`, `quietly_added_to_channel` behind experiments),
+  (+ `quietly_added_to_channel` behind an experiment; Ku1y `j` in build
+  c07ab895506f never asks for `team_joiner_invite`, which only the
+  Invitations filter requests),
   channel, reminders (when `global_reminders_in_activity`), and
   `list_record_edited`.
 - **Writes.** `activity.markRead`, `activity.markUnread {entries}`,

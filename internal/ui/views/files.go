@@ -38,7 +38,10 @@ func (f *fileItem) title() string {
 	return f.Name
 }
 
-func (f *fileItem) isImage() bool { return f.IsImage || strings.HasPrefix(f.Mime, "image/") }
+// isImage is Slack's fileIsImage (core.File.IsImage, slack.FileIsImage):
+// an image/* file Slack made no thumbs for is a plain file, which opens
+// its page rather than the media viewer.
+func (f *fileItem) isImage() bool { return f.IsImage }
 
 func (f *fileItem) isCanvas() bool {
 	return f.IsCanvas || f.Filetype == "quip" || f.Filetype == "canvas" || strings.EqualFold(f.PrettyType, "canvas")
@@ -1389,7 +1392,9 @@ func fileTileStyle(it *fileItem, dark bool) (bg, fg color.NRGBA, icon string) {
 		return rgb(0x2eb67d), white, "list-view"
 	case isSlides(it):
 		return rgb(0xe8912d), white, "image"
-	case it.isImage():
+	case strings.HasPrefix(it.Mime, "image/"):
+		// getFileTypeSvgIconName goes by filetype: a png is "image" even
+		// when fileIsImage isn't (no thumbs)
 		return rgb(0x1264a3), white, "image"
 	case strings.HasPrefix(it.Mime, "video/"):
 		return rgb(0x1264a3), white, "video"

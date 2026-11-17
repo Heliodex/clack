@@ -48,7 +48,6 @@ package popups
 // Email Address buttons (Clack's local Slackbot messages are text).
 
 import (
-	"bytes"
 	"context"
 	"image"
 	"image/color"
@@ -984,19 +983,20 @@ func (c *ceCrop) start() {
 	}
 	f := c.file
 	type res struct {
-		up  core.EmailIcon
-		img image.Image
+		up   core.EmailIcon
+		disp *image.RGBA
+		size image.Point
 	}
 	run(c.e.h, func(ctx context.Context) (res, error) {
 		up, err := a.UploadEmailIcon(ctx, f.Name, f.Data)
 		if err != nil {
 			return res{}, err
 		}
-		img, _, err := image.Decode(bytes.NewReader(f.Data))
+		disp, size, err := cropImage(ctx, f.Data) // decoded and fitted under one budget
 		if err != nil {
 			return res{}, err
 		}
-		return res{up, img}, nil
+		return res{up, disp, size}, nil
 	}, func(r res, err error) {
 		if c.e.crop != c {
 			return
@@ -1006,9 +1006,8 @@ func (c *ceCrop) start() {
 			c.e.h.Invalidate()
 			return
 		}
-		b := r.img.Bounds()
-		c.up, c.imgW, c.imgH = &r.up, b.Dx(), b.Dy()
-		c.cropBox = newCropBox(c.e.h, r.img, core.EmailCropMinSize)
+		c.up, c.imgW, c.imgH = &r.up, r.size.X, r.size.Y
+		c.cropBox = newCropBox(c.e.h, r.disp, r.size, core.EmailCropMinSize)
 		c.ready = true
 		c.e.h.Invalidate()
 	})

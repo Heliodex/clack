@@ -147,6 +147,9 @@ type Composer struct {
 	cmdPick       core.Command  // the command last picked from the / list
 	fbar          floatBar      // the floating formatting bar (floatbar.go)
 	drewInput     bool          // the editor was laid out (no roadblock)
+	drewRoadblock bool          // a roadblock notice was drawn in its place
+	cssHidden     bool          // CSS hid the pane or the input (display: none, visibility: hidden)
+	vanish        vanishGuard   // frames the boundary drew no box (vanish.go)
 	roadblock     string        // SetRoadblock: Slack's notice instead of the editor
 	rbLink, rbURL string        // SetRoadblockLink: a link after it ("Learn more")
 	rbClick       widget.Clickable
@@ -456,6 +459,19 @@ func (c *Composer) prepareSend(d *Doc) *Doc {
 
 // ---- layout ----
 
+// LayoutIn is Layout with the composer's plugin components drawn in
+// slackc pane pane (its conversation list's): each place that draws a
+// composer for a conversation has plugin roots of its own, as Slack's
+// ThreadsFlexpane and Threads view each render their own InputContainer.
+// A thread's reply box in the Threads view and the same thread in the
+// pane (a channel in the main and the split view too) shared one root,
+// and the prepareAndSendMessage a plugin wraps called back the composer
+// drawn last: a reply sent from the other was lost.
+func (c *Composer) LayoutIn(gtx layout.Context, pane string) layout.Dimensions {
+	defer slackc.EndPane(slackc.Pane(pane))
+	return c.Layout(gtx)
+}
+
 // Layout draws the composer. Channel/thread composers take the full width
 // they're given (margins included) and size their height to the content;
 // edit composers draw just the box.
@@ -499,16 +515,17 @@ func (c *Composer) Layout(gtx layout.Context) layout.Dimensions {
 	// an edit. Unpatched each is a direct call.
 	c.cs = c.chromeState(gtx)
 	c.ui.prime(&c.cs)
-	c.top, c.drewInput = 0, false
-	c.paneP, c.inputP = nil, nil
-	var dims layout.Dimensions
-	switch {
-	case c.edit != nil || c.field != nil:
-		dims = slackc.Component(gtx, "MessageInput", c, (*Composer).inputProps, (*Composer).layoutInput)
-	case c.ts != "":
-		dims = slackc.Component(gtx, "InputContainer", c, (*Composer).paneProps, (*Composer).layoutPane)
-	default:
-		dims = slackc.Component(gtx, "MessagePaneInput", c, (*Composer).paneProps, (*Composer).layoutPane)
+	// The chrome's buttons no live draw laid out are reset once per frame,
+	// after the boundary (chrome.endFrame); a measure pass doesn't count.
+	live := gtx.Source.Enabled()
+	if live {
+		c.ui.liveShown = 0
+	}
+	// The box is always there: a boundary that drew none (a plugin's tree
+	// left it out) is drawn again without plugins (vanish.go).
+	dims := c.layoutBoundary(gtx)
+	if live {
+		c.ui.endFrame()
 	}
 
 	// Autocomplete after the editor laid out, anchored at the trigger,
@@ -730,6 +747,7 @@ func (c *Composer) chromeState(gtx layout.Context) chromeState {
 		quietBot, _ = ca.SuppressBotTyping(c.ch, c.ts)
 	}
 	if uipref.Get().ShowTyping { // Messages & media > "Display information about who is currently typing"
+		typingHub(c.h.Core()).shown(c.ch, c.ts, gtx.Now)
 		st.TypingIDs, st.TypingNames = typingHub(c.h.Core()).typers(c.ch, c.ts, c.api.self().ID)
 		if quietBot != "" {
 			st.TypingIDs, st.TypingNames = dropTyper(st.TypingIDs, st.TypingNames, quietBot)
@@ -786,7 +804,8 @@ func (c *Composer) handleEditor(gtx layout.Context) {
 			c.openLink()
 		case EvPasted:
 			if c.field == nil { // Texty there has no onFilesSelected
-				c.att.PasteClipboardImage()
+				// a paste whose files attach inserts no text (filePaste)
+				c.ed.filesRead = c.att.PasteClipboardImage()
 			}
 		case EvPasteLimit:
 			c.pasteLimitDialog(c.ed.RefusedPaste())
@@ -1240,12 +1259,17 @@ func (c *Composer) submit() {
 				app = p.AppID
 			}
 			c.cmdPick = core.Command{}
+			// executeCommand sends the arguments as blocks, so a mention
+			// goes out as its member, not as the name the chip shows
+			// (Text, the plain words, would let the server match "@karim"
+			// to someone else)
+			blocks := commandArgs(d).CommandBlocks()
 			c.clearAfterSend()
 			go func() {
 				// handleSlashCommand: the reply or the failure is
 				// Slackbot's ephemeral; the app's modal arrives as
 				// view_opened for the command's client_token
-				res, err := runCommand(context.Background(), api, core.CommandOpts{Channel: ch, Command: cmd, Text: strings.TrimSpace(rest), ThreadTS: ts, AppID: app})
+				res, err := runCommand(context.Background(), api, core.CommandOpts{Channel: ch, Command: cmd, Text: strings.TrimSpace(rest), Blocks: blocks, ThreadTS: ts, AppID: app})
 				if err == nil && res.KeepInput {
 					c.restore(doc)
 				}
@@ -1840,6 +1864,22 @@ func (c *Composer) restoreDroppedFocus(gtx layout.Context) {
 // that nothing takes focus from it).
 func (c *Composer) FocusTag() any { return c.ed }
 
+// Release lets go of the composer's focus for good (composer.Release):
+// its conversation left the screen. It stops counting itself focused, so
+// restoreDroppedFocus doesn't take the focus back when it's drawn again,
+// and a Focus asked for before it went is dropped: drawn again later (a
+// permalink, a thread route, where nothing focuses the input) it must not
+// take the focus on its own.
+func (c *Composer) Release() {
+	c.focusReq = false
+	c.focused = false
+	Release(c.ed)
+}
+
+// DrawnLive reports whether the composer's editor was drawn in this
+// frame's live layout (composer.DrawnLive).
+func (c *Composer) DrawnLive(gtx layout.Context) bool { return DrawnLive(gtx, c.ed) }
+
 // PopupOpen reports whether the composer's own popup (autocomplete) is
 // up: Escape is the popup's then, not the thread pane's.
 func (c *Composer) PopupOpen() bool { return c.ac != nil && c.ac.Open() }
@@ -1868,7 +1908,7 @@ func (c *Composer) BoxRect() image.Rectangle {
 }
 
 func (c *Composer) winRect(id crBtn) image.Rectangle {
-	if c.ui.shown&(1<<id) == 0 {
+	if (c.ui.shown|c.ui.liveShown)&(1<<id) == 0 {
 		return image.Rectangle{}
 	}
 	return c.ui.rect[id].Add(c.Origin).Add(image.Pt(0, c.top))

@@ -19,7 +19,10 @@ import (
 
 // History returns the newest page of a conversation (before == "") from
 // memory when cached, else one conversations.history call; with before set
-// it loads the next older page. Opening a cached channel takes ~1 ms.
+// it loads the next older page. Opening a cached channel takes ~1 ms: the
+// header's side reads (the member count, a conversation outside the
+// sidebar) run on their own and never hold a cached page back
+// (history_side.go).
 func (a *App) History(ctx context.Context, ch, before string) (Page, error) {
 	t0 := time.Now()
 	source := "cache"
@@ -28,42 +31,17 @@ func (a *App) History(ctx context.Context, ch, before string) (Page, error) {
 	}
 	a.noteAccess(ch)
 	defer func() { log.Printf("history %s: %s (%s)", ch, time.Since(t0).Round(time.Millisecond), source) }()
-	// Fetch the member count (people, like Slack's header) alongside the history.
-	var countDone chan struct{}
-	a.mu.Lock()
-	_, haveCount := a.memberN[ch]
-	a.mu.Unlock()
-	if c, ok := a.S.Conv(ch); ok && !haveCount && !c.IsIM && !c.IsMPIM && before == "" {
-		countDone = make(chan struct{})
-		go func() {
-			defer close(countDone)
-			a.loadMemberCount(ctx, ch)
-		}()
+	var count, conv <-chan struct{}
+	if before == "" {
+		count, conv = a.historySide(ch)
 	}
-	// A conversation outside the sidebar (closed DM, channel from a link or
-	// search): resolve it alongside so the header shows its name.
-	var convDone chan struct{}
-	if _, ok := a.Conv(ch); !ok && before == "" {
-		convDone = make(chan struct{})
-		go func() {
-			defer close(convDone)
-			a.ResolveConv(ctx, ch)
-		}()
+	// An error return waits for the side reads: after an auth failure
+	// (which cancels them) a History that failed leaves nothing of its own
+	// in flight that could reach Slack after sign-out.
+	fail := func(err error) (Page, error) {
+		waitSide(count, conv)
+		return Page{}, err
 	}
-	// Wait for the side fetches on every return path, errors included: a
-	// History that returned must have no requests left in flight (after an
-	// auth failure, one could otherwise reach Slack after sign-out).
-	waitSide := func() {
-		if countDone != nil {
-			<-countDone
-			countDone = nil
-		}
-		if convDone != nil {
-			<-convDone
-			convDone = nil
-		}
-	}
-	defer waitSide()
 	var msgs []slack.Message
 	var hasMore bool
 	if before == "" {
@@ -71,27 +49,30 @@ func (a *App) History(ctx context.Context, ch, before string) (Page, error) {
 		if t == nil {
 			source = "fetch"
 			if err := a.loadLatestIfMissing(ctx, ch); err != nil {
-				return Page{}, err
+				return fail(err)
 			}
 			t = a.S.Timeline(ch)
+			// a fetched page comes with the conversation it resolved
+			// alongside (Page.Conv); the count lands on its own
+			waitSide(conv)
 		}
 		if t != nil {
 			msgs, hasMore = t.Msgs, t.HasMore
 		}
 	} else {
 		source = "older"
-		pins := a.S.PinSeq()
+		pins, subs := a.S.PinSeq(), a.S.SubSeq()
 		p, err := a.C.History(ctx, ch, slack.HistoryOpts{Latest: before, Limit: 100})
 		if err != nil {
-			return Page{}, err
+			return fail(err)
 		}
 		a.S.PrependOlder(ch, p.Messages, p.HasMore)
 		a.S.SyncPins(ch, pins, p.Messages) // a pin event newer than the answer (store/pins.go)
+		a.S.SyncSubs(ch, subs, p.Messages) // the roots' thread subscriptions (store/thread_subs.go)
 		msgs, hasMore = p.Messages, p.HasMore
 		store.SortAsc(msgs)
 	}
 	page := Page{Messages: a.timeline(ch, msgs), HasMore: hasMore}
-	waitSide()
 	if c, ok := a.Conv(ch); ok {
 		page.Conv = &c
 	}
@@ -135,7 +116,7 @@ func (a *App) RefreshReplies(ctx context.Context, ch, ts string) ([]Message, err
 
 func (a *App) fetchThread(ctx context.Context, ch, ts string) error {
 	return a.once("r:"+ch+"/"+ts, func() error {
-		pins, live := a.S.PinSeq(), a.S.LiveSeq()
+		pins, live, subs := a.S.PinSeq(), a.S.LiveSeq(), a.S.SubSeq()
 		var all []slack.Message
 		cursor := ""
 		for {
@@ -150,6 +131,9 @@ func (a *App) fetchThread(ctx context.Context, ch, ts string) error {
 			cursor = next
 		}
 		// the replies' people are asked for as rows draw them (lazy_users.go)
+		// the root's thread subscription, as the answer has it unless an
+		// event moved it meanwhile (store/thread_subs.go)
+		a.S.SyncSubs(ch, subs, all)
 		// a reply changed, deleted or posted while the request was out
 		// keeps the socket's copy (store/live.go)
 		a.S.SetThreadSince(ch, ts, all, live)
@@ -171,11 +155,15 @@ func (a *App) hydrate(ctx context.Context, want map[string][]string) map[string]
 	return out
 }
 
-// hydrateOK is hydrate, also reporting whether every lookup answered (no
-// messages.list error): then a message missing from the result is gone.
-func (a *App) hydrateOK(ctx context.Context, want map[string][]string) (map[string]slack.Message, bool) {
+// hydrateOK is hydrate, also reporting which channels answered: every
+// channel of want found in memory, plus those whose messages.list group
+// succeeded (slack.MessagesList). A message missing from the result is
+// gone only when its channel answered; a failed group (too_many_channels,
+// a reset connection) leaves its channels' messages unknown.
+func (a *App) hydrateOK(ctx context.Context, want map[string][]string) (map[string]slack.Message, map[string]bool) {
 	out := map[string]slack.Message{}
 	missing := map[string][]string{}
+	answered := map[string]bool{}
 	for ch, tss := range want {
 		for _, ts := range tss {
 			if m, ok := a.S.Find(ch, ts); ok {
@@ -184,23 +172,25 @@ func (a *App) hydrateOK(ctx context.Context, want map[string][]string) (map[stri
 				missing[ch] = append(missing[ch], ts)
 			}
 		}
+		if len(missing[ch]) == 0 {
+			answered[ch] = true
+		}
 	}
 	if len(missing) == 0 {
-		return out, true
+		return out, answered
 	}
-	got, err := a.C.MessagesList(ctx, missing)
-	if err != nil {
-		log.Printf("messages.list: %v", err)
+	// a failed group is logged with its channels in MessagesList
+	got, asked, _ := a.C.MessagesList(ctx, missing)
+	for ch := range asked {
+		answered[ch] = true
 	}
-	var all []slack.Message
 	for ch, ms := range got {
 		for _, m := range ms {
 			out[ch+"/"+m.TS] = m
-			all = append(all, m)
 		}
 	}
 	// the messages' people are asked for as rows draw them (lazy_users.go)
-	return out, err == nil
+	return out, answered
 }
 
 // SlackbotCustomResponseInThread reports whether user (Slackbot) answered
@@ -879,7 +869,7 @@ func (a *App) Saved(ctx context.Context, filter, cursor string) (SavedPage, erro
 			chans[v.Channel] = true
 			if m, ok := got[savedKey(v.Channel, v.TS)]; ok {
 				v.Msg = a.messagePtr(v.Channel, &m)
-			} else if answered && v.ItemType == "message" && v.TS != "" {
+			} else if answered[v.Channel] && v.ItemType == "message" && v.TS != "" {
 				v.Gone = true
 			}
 		}
@@ -993,8 +983,7 @@ func (a *App) dmsTabShows(c *slack.Conversation, latest string) bool {
 		if known && u.Deleted {
 			return false
 		}
-		bot := c.User == "USLACKBOT" || c.User == "USLACK" || known && (u.IsBot || u.IsSlackbot)
-		if bot && !a.agentInDMSidebarUser(c.User) {
+		if isBotDM(c.User, u) && !a.agentInDMSidebarUser(c.User) { // rail.go
 			return false
 		}
 	}
@@ -1039,15 +1028,27 @@ func (a *App) DND(ctx context.Context) (json.RawMessage, error) {
 	return info, err
 }
 
-// loadMemberCount caches the people count of ch (edge users/counts).
+// loadMemberCount caches the people count of ch (edge users/counts). One
+// read per channel at a time: History's side read and the header's
+// ChannelInfo, both on a first open, share it, each waiting only as long
+// as its own ctx allows (onceCtx). A count that arrived or changed is
+// announced ("member_count"): the header repaints.
 func (a *App) loadMemberCount(ctx context.Context, ch string) {
-	mc, err := a.MemberCounts(ctx, ch)
-	if err != nil {
-		return
-	}
-	a.mu.Lock()
-	a.memberN[ch] = mc.People
-	a.memberG[ch] = mc.Guests
-	a.memberA[ch] = mc.Apps
-	a.mu.Unlock()
+	_ = a.onceCtx(ctx, "mc:"+ch, func() error {
+		mc, err := a.MemberCounts(ctx, ch)
+		if err != nil {
+			return err
+		}
+		a.mu.Lock()
+		old, had := a.memberN[ch]
+		changed := !had || old != mc.People || a.memberA[ch] != mc.Apps
+		a.memberN[ch] = mc.People
+		a.memberG[ch] = mc.Guests
+		a.memberA[ch] = mc.Apps
+		a.mu.Unlock()
+		if changed {
+			a.memberCountChanged(ch) // history_side.go
+		}
+		return nil
+	})
 }

@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"golang.org/x/text/collate"
-	"golang.org/x/text/language"
 
 	"github.com/some-du6e/clack/internal/slack"
 	"github.com/some-du6e/clack/internal/store"
@@ -135,6 +134,7 @@ var defaultExperimentGroups = map[string]string{
 	// every other experiment Clack reads, as experiments.getByUser had it
 	// on 2026-11-13 (testdata/account_experiments.json; TestDefaultExperimentsMatchAccount)
 	"a11y_no_auto_highlight_search_multi_select": "on", "agent_badge": "on", "agentforce_deprecation": "on",
+	"agent_channel_header": "on", "sc_remove_full_access_user": "on", // exp_wave10.go
 	"agents_in_channels_improvements": "on", "ai_channel_exclusions": "on",
 	"autocomplete_affinity_ml_model": "on", "autocomplete_demote_flannel_passthrough_rltv_exact_match": "on",
 	"autocomplete_frequently_used_emojis_frecency": "on", "basic_select_placeholder_option": "on",
@@ -148,8 +148,7 @@ var defaultExperimentGroups = map[string]string{
 	"feat_flag_message_hide_replies": "on", "file_trash_updates": "on", "flag_custom_mpdm_names": "on",
 	"flag_xorg_external_team_check": "on", "flag_xorg_refinement": "treatment",
 	"focus_mode_custom_duration": "treatment", "force_native_notifications": "off", "frontline_users": "on",
-	"ia4_slash_command_fe": "on", "inviter_joiner_first_dm_v2": "control",
-	"invite_slash_command_in_threads": "on", "list_channel_tab_show_view_name_fe": "on",
+	"ia4_slash_command_fe": "on", "invite_slash_command_in_threads": "on", "list_channel_tab_show_view_name_fe": "on",
 	"lists_channel_tabs_default_view": "on", "lists_export_enrichment": "on",
 	"lists_file_backed_templates": "on", "lists_grid_todos": "on", "mcp_ai_channel_exclusions": "on",
 	"miles_davis_themes": "on", "mpdm_default_exclude_history_clients_webapp": "on", "mpdm_naming": "on",
@@ -420,7 +419,7 @@ func sortSectionRows(rows []sortRow, inDMSection bool, sortOrder, self string, p
 	for _, r := range rows {
 		keys[r.id] = key{r.muted, sortGroup(r, inDMSection, sortOrder, self, p)}
 	}
-	col := collate.New(language.AmericanEnglish, collate.Numeric) // QJub: Intl.Collator("en-US",{numeric:true})
+	var col *collate.Collator // QJub's (collate_qjub.go): set while the sort below runs
 	alpha := func(a, b sortRow) int {
 		if a.name == b.name {
 			return 0
@@ -458,15 +457,18 @@ func sortSectionRows(rows []sortRow, inDMSection bool, sortOrder, self string, p
 			return alpha(a, b)
 		}
 	}
-	sort.SliceStable(rows, func(i, j int) bool {
-		ki, kj := keys[rows[i].id], keys[rows[j].id]
-		if ki.muted != kj.muted {
-			return !ki.muted
-		}
-		if ki.group != kj.group {
-			return ki.group < kj.group
-		}
-		return cmp(rows[i], rows[j]) < 0
+	withQjub(func(c *collate.Collator) {
+		col = c
+		sort.SliceStable(rows, func(i, j int) bool {
+			ki, kj := keys[rows[i].id], keys[rows[j].id]
+			if ki.muted != kj.muted {
+				return !ki.muted
+			}
+			if ki.group != kj.group {
+				return ki.group < kj.group
+			}
+			return cmp(rows[i], rows[j]) < 0
+		})
 	})
 	out := make([]string, len(rows))
 	for i, r := range rows {
@@ -554,7 +556,9 @@ func (a *App) dmCandidate(id string, keep sidebarKeep) bool {
 		if systemDMUsers[c.User] || c.User == slackbotID && a.slackbotDMHidden() {
 			return false
 		}
-		if u, ok := a.S.User(c.User); ok && u.Deleted {
+		// lJBI's deletedMembers (gIKW G): a selector over every member,
+		// which records no hit and asks for nothing
+		if u, ok := a.S.RawUser(c.User); ok && u.Deleted {
 			return false
 		}
 	}
@@ -845,7 +849,9 @@ func (a *App) sortName(c Conv) string {
 	if len(c.Members) > 0 {
 		for _, m := range c.Members {
 			if m != self {
-				names = append(names, a.S.UserName(m))
+				// raw: the snapshot reads the listed group DMs' members
+				// through getMemberById (sidebarUsers), and no others
+				names = append(names, a.rawUserName(m))
 			}
 		}
 	} else { // mpdm-alice--bob--me-1: handles, minus our own
@@ -863,6 +869,6 @@ func (a *App) sortName(c Conv) string {
 			}
 		}
 	}
-	collate.New(language.AmericanEnglish, collate.Numeric).SortStrings(names)
+	qjubSortStrings(names)
 	return strings.Join(names, ",")
 }

@@ -957,7 +957,16 @@ func (v *ChannelFiles) mediaCell(gtx C, c *cfRowClicks, it *fileItem, sz image.P
 				themeImage(gtx, img, sz, rad)
 			}
 		}
-		if strings.HasPrefix(it.Mime, "video/") {
+		video := strings.HasPrefix(it.Mime, "video/")
+		if it.Thumb == "" && !video {
+			// FileImageThumbnail with no thumb src (getThumbSrcForFile
+			// needs thumb_360, thumb_360_gif or thumb_pdf: an image Slack
+			// made no thumbs for): renderIconFallback, the file type's
+			// 20px icon centred in content-sec (.iconFallback__TH2Dz)
+			is := gtx.Dp(20)
+			dirAt(gtx, image.Pt((sz.X-is)/2, (sz.Y-is)/2), func(gtx C) D { return v.icon(gtx, imageTypeIcon(it.Filetype), 20, v.p.Sec) })
+		}
+		if video {
 			// the video file's play pill (VideoMessageFile at rest)
 			ps := gtx.Dp(28)
 			p := image.Pt(gtx.Dp(8), sz.Y-gtx.Dp(8)-ps)
@@ -972,6 +981,17 @@ func (v *ChannelFiles) mediaCell(gtx C, c *cfRowClicks, it *fileItem, sz image.P
 		}
 		return D{Size: sz}
 	})
+}
+
+// imageTypeIcon is getFileTypeSvgIconName (2HRR) for what the media grid
+// holds without a thumb (search's images type; videos draw their own
+// cell): the image filetypes are "image", the rest "file".
+func imageTypeIcon(filetype string) string {
+	switch filetype {
+	case "jpg", "png", "gif", "webp", "tiff", "bmp", "svg", "heic", "psd", "gdraw":
+		return "image"
+	}
+	return "file"
 }
 
 // fileRow is a DraggableExplorerFile in the list: the c-pillow_file (12px

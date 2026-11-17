@@ -87,6 +87,9 @@ type listState struct {
 	// container is the view container the list is in ("" main, "split";
 	// see stateIn)
 	container string
+	// paneID is the list's slackc pane (its listCache key): the plugin
+	// roots it draws are its own, never another list's (slackc.Pane)
+	paneID string
 
 	snap   snap
 	rows   map[string]*row
@@ -298,7 +301,7 @@ func stateIn(h Host, ch, ts, pane string) *listState {
 		return s
 	}
 	// a new core (signed in again, another account): fresh state
-	s := &listState{hb: hb, ch: ch, ts: ts, thread: ts != "", container: pane, rows: map[string]*row{}, hoverIdx: -1, tbFor: -1}
+	s := &listState{hb: hb, ch: ch, ts: ts, thread: ts != "", container: pane, paneID: key, rows: map[string]*row{}, hoverIdx: -1, tbFor: -1}
 	if ts != "" {
 		s.m = hb.threadModel(ch, ts)
 	} else {
@@ -665,6 +668,7 @@ func (s *listState) layoutList(gtx layout.Context, h Host, origin image.Point) l
 	now := time.Now()
 	lastHost = h
 	s.hb.ensureLoaded(s.m)
+	s.hb.markDrawn(s.m, gtx.Now)
 	s.sync(h, now)
 	s.placeSendJump(gtx, now)
 	sweepRows(now)
@@ -1660,10 +1664,14 @@ func (s *listState) toolbarButton(gtx layout.Context, i int) layout.Dimensions {
 	if st.Hidden() {
 		return layout.Dimensions{Size: image.Pt(bs, bs)}
 	}
+	var d layout.Dimensions
 	if st.Active() {
-		return st.Wrap(gtx, func(gtx layout.Context) layout.Dimensions { return s.toolbarIcon(gtx, btn, i, todo, st) })
+		d = st.Wrap(gtx, func(gtx layout.Context) layout.Dimensions { return s.toolbarIcon(gtx, btn, i, todo, st) })
+	} else {
+		d = s.toolbarIcon(gtx, btn, i, todo, st)
 	}
-	return s.toolbarIcon(gtx, btn, i, todo, st)
+	slackc.InspectArea(gtx, image.Rectangle{Max: d.Size}) // the button, for the inspect tool's picker
+	return d
 }
 
 // toolbarIcon draws button i's icon; todo is the to-do action's (Yoyn).

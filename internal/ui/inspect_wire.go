@@ -24,7 +24,9 @@ import (
 // CLACK_INSPECT=1 turns it on too, read at launch like ui.json. Then
 // Hyper+D (⌃⌥⇧⌘D; Ctrl+Alt+Shift+D on Linux and Windows) starts a
 // session, Esc or Hyper+D again ends it, and a click copies a report of
-// the element under the pointer.
+// the element under the pointer. A Shift+click (or a drag, for the region
+// dragged out) captures it for a review where rects can be blurred out
+// before Enter copies the report.
 
 // inspectFilter is the tool's shortcut, Hyper+D: all four modifiers (off
 // macOS Mod is Ctrl, so three). Super may be held as well: a Linux Hyper
@@ -135,6 +137,15 @@ func (a *App) inspectBegin(gtx layout.Context) layout.Context {
 	}
 	return a.insp.Begin(gtx)
 }
+
+// inspecting reports a running inspect session. While one runs the
+// window lays out no system.ActionInputOp areas (titlebar.go): the
+// system acts on a press over one before any handler sees it (on macOS,
+// X11 and Windows a press on the top nav's drag area starts moving the
+// window, a caption button minimizes or closes it), so the picker could
+// never pick the top nav's bare parts and a region dragged from there
+// would move the window instead.
+func (a *App) inspecting() bool { return a.insp != nil && a.insp.Active() }
 
 // inspectEnd draws the session's outline, label and banner over
 // everything (gtx: the frame's own context).

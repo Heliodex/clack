@@ -246,6 +246,7 @@ type DMs struct {
 	evMu  sync.Mutex
 	evq   []core.Event
 	known map[string]bool // channels in items, read by the event goroutine (evMu)
+	users map[string]bool // the people items show (partners, members, latest senders; evMu)
 }
 
 // NewDMs builds the DMs tab.
@@ -267,6 +268,26 @@ func NewDMs(h Host) *DMs {
 
 // Selected returns the selected conversation id ("" when none).
 func (d *DMs) Selected() string { return d.sel }
+
+// Listed is the list as the last frame drew it: the DMs it lists, newest
+// first, and the ones among them drawn unread (dmRow: dmsUnread, the
+// selected row read). ok is false before the first client.dms answer.
+func (d *DMs) Listed() (ids, unread []string, ok bool) {
+	if _, done, _ := d.first.get(); !done && len(d.items) == 0 {
+		return nil, nil, false
+	}
+	for _, e := range d.view {
+		if e.dm < 0 {
+			continue
+		}
+		dm := &d.items[e.dm]
+		ids = append(ids, dm.Channel)
+		if dmsUnread(dm) && (dm.Channel != d.sel || d.peeking) {
+			unread = append(unread, dm.Channel)
+		}
+	}
+	return ids, unread, true
+}
 
 // Layout draws the list pane in the themed column and the selected
 // conversation in the white pane beside it.
@@ -750,6 +771,22 @@ func (d *DMs) changed() {
 	for id := range d.index {
 		d.known[id] = true
 	}
+	if d.users == nil {
+		d.users = map[string]bool{}
+	}
+	clear(d.users)
+	for i := range d.items {
+		it := &d.items[i]
+		if it.Conv.User != "" {
+			d.users[it.Conv.User] = true
+		}
+		for _, u := range it.Conv.Members {
+			d.users[u] = true
+		}
+		if it.Latest != nil && it.Latest.User != "" {
+			d.users[it.Latest.User] = true
+		}
+	}
 	d.evMu.Unlock()
 	d.dirty = true
 }
@@ -799,7 +836,21 @@ func (d *DMs) match(ev core.Event) bool {
 		d.evMu.Unlock()
 		d.h.Invalidate()
 	case "presence", "user":
-		d.h.Invalidate() // presence and names are read live from core
+		// presence and names are read live from core: redraw for the
+		// people the list shows only (a busy workspace's socket brings
+		// everyone's, many a second)
+		d.evMu.Lock()
+		shown := d.users[ev.UserID]
+		if ev.User != nil {
+			shown = shown || d.users[ev.User.ID]
+		}
+		for _, u := range ev.Users {
+			shown = shown || d.users[u]
+		}
+		d.evMu.Unlock()
+		if shown {
+			d.h.Invalidate()
+		}
 	case "resync":
 		return true
 	case "conv":
@@ -823,6 +874,13 @@ func (d *DMs) drainEvents() {
 			}
 			m := *ev.Msg
 			d.items[i].Latest = &m
+			if m.User != "" {
+				d.evMu.Lock()
+				if d.users != nil {
+					d.users[m.User] = true // the preview names its sender
+				}
+				d.evMu.Unlock()
+			}
 			if ev.Count != nil {
 				d.items[i].Count = *ev.Count
 			}

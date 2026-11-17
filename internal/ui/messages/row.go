@@ -109,6 +109,8 @@ type row struct {
 	nameCtx, avatarCtx ctxTag            // right-click → the member context menu
 	threadBtn          widget.Clickable
 	broadcastBtn       widget.Clickable
+	newerBtn           widget.Clickable // ThreadBroadcastFooter's "View newer replies" (broadcast_footer.go)
+	newerRect          image.Rectangle  // its box (row-local), empty when not drawn
 	labelLink          widget.Clickable // the label's link (broadcastLabel)
 	laterLink          widget.Clickable // LaterLabel's "View Saved" / "View to-dos" (laterLabelLine)
 	pinnedLink         widget.Clickable // "Pinned by {member}"'s MemberLink (pinnedRuns)
@@ -137,10 +139,12 @@ type row struct {
 	// more" (richview Options.Truncate)
 	truncate bool
 
-	// plugin view of the message (taut patchMessageText…), see applyView
+	// plugin view of the message (taut patchMessageText…), see applyView;
+	// viewConv: the serial of the view's conversion it last compared
 	viewAt           time.Time
 	viewRev          uint32
 	viewed           bool
+	viewConv         uint64
 	col              image.Point  // body column origin, row-local
 	reactAt          image.Point  // reaction bar origin, row-local
 	wrapOv, blocksOv uintptr      // msg overrides applied (propsID); 0 = none
@@ -148,7 +152,7 @@ type row struct {
 	reactAs          string       // ReactionBar's currentUser override ("" = the viewer)
 
 	msgOv           uintptr      // Message / ThreadReplyGeneric msg override applied
-	wrapMsg         slackc.Props // MessageWrapper's override (what msgOv falls back to)
+	wrapMsg         slackc.Props // MessageWrapper's override (what msgOv falls back to; wrapped)
 	textOv          slackc.Props // MessageText's msg override (nil = none)
 	filesOv, attsOv slackc.Props // MessageFiles / MessageKitAttachments msg overrides
 	tailOv          [2]uintptr   // file / attachment filters applied (propsIDs)
@@ -328,6 +332,7 @@ func (r *row) setDoc() {
 	r.uRev = 0
 	r.blocksOv, r.tailOv = 0, [2]uintptr{}
 	r.needChan = blocksNeedChan(r.m.Doc.Blocks)
+	r.bk.done = false // the element host follows the blocks drawn (blockkit.go)
 	r.hasFiles, r.hasAtts = docTail(r.m.Doc.Blocks)
 	r.chansDoc = false
 }
@@ -524,8 +529,9 @@ func (r *row) viewContext() string {
 	return "message_pane"
 }
 
-// message is the msg prop of the parts inside MessageWrapper: the message
-// as the wrapper's (possibly overridden) msg left it.
+// message is the msg prop of the parts inside Message (ThreadReplyGeneric
+// in a thread pane): the message as the wrapper's and Message's (possibly
+// overridden) msgs left it. Message's own props take wrapped instead.
 func (r *row) message() slackc.Props {
 	if r.wrapOv == 0 && r.msgOv == 0 {
 		return r.sourceMessage()
@@ -543,6 +549,29 @@ func (r *row) sourceMessage() slackc.Props {
 	return r.srcMsg
 }
 
+// wrapped is the msg MessageWrapper hands Message and ThreadReplyGeneric:
+// the source, or the wrapper's override (ShowRealUser's) as its patch
+// passed it to <Original>, the very object, as Slack's MessageWrapper
+// renders Message with {...this.props}. Rebuilt from the row's message, it
+// lost what Clack doesn't model (a plugin's own fields, a reply_count it
+// set, a bot_profile it took out came back). Never the override their own
+// patched tree hands back (msgOv), which message() carries for the parts
+// inside them. Fed back into their own props, it
+// made a loop: after an update the old tree's msg is the row's override
+// until JS answers the new props, so the next frame sent JS that old
+// revision as the props, its answer was the override again, and while JS
+// answered each render before the next frame the root bounced between the
+// two revisions every frame. Each bounce rebuilt the row's Block Kit host
+// (a press went to buttons the release no longer found: the vote buttons'
+// lost clicks), and two panes never drew the new revision in the same
+// frame.
+func (r *row) wrapped() slackc.Props {
+	if r.wrapOv == 0 {
+		return r.sourceMessage()
+	}
+	return r.wrapMsg
+}
+
 func (r *row) wrapperProps() slackc.Props {
 	p := slackc.Props{"$key": r.ts, "msg": r.sourceMessage(), "channelId": r.src.Channel, "viewContext": r.viewContext()}
 	if r.rc.parent {
@@ -551,20 +580,21 @@ func (r *row) wrapperProps() slackc.Props {
 	return r.pane(p)
 }
 
-// ownMsg reports whether msg is a msg prop the row built (handed back
-// unchanged, before JS answered).
+// ownMsg reports whether msg is a msg prop the row hands its components
+// (handed back unchanged, before JS answered): one it built, or the
+// wrapper's that Message gets.
 func (r *row) ownMsg(msg slackc.Props) bool {
 	id := propsID(msg)
-	return id == 0 || id == propsID(r.srcMsg) || id == propsID(r.msg)
+	return id == 0 || id == propsID(r.srcMsg) || id == propsID(r.msg) || id == propsID(r.wrapMsg)
 }
 
 func (r *row) messageProps() slackc.Props {
-	return r.pane(slackc.Props{"$key": r.ts, "msg": r.message(), "channelId": r.src.Channel, "viewContext": r.viewContext()})
+	return r.pane(slackc.Props{"$key": r.ts, "msg": r.wrapped(), "channelId": r.src.Channel, "viewContext": r.viewContext()})
 }
 
 // replyProps are ThreadReplyGeneric's (a reply in the thread pane).
 func (r *row) replyProps() slackc.Props {
-	return r.pane(slackc.Props{"$key": r.ts, "msg": r.message(), "channelId": r.src.Channel, "parentId": r.src.ThreadTS,
+	return r.pane(slackc.Props{"$key": r.ts, "msg": r.wrapped(), "channelId": r.src.Channel, "parentId": r.src.ThreadTS,
 		"adjacent": !r.rc.header, "className": "c-message_kit__background c-message_kit__message c-message_kit__thread_message",
 		"blocksContainerContext": "message", "messageContainerType": "thread", "viewContext": r.viewContext(),
 		"highlight": r.rc.highlight > 0, "focused": false, "isCompact": false, "isInView": true, "isSingleThread": false,
@@ -808,7 +838,7 @@ func (r *row) layoutWrapper(gtx layout.Context, p slackc.Props) layout.Dimension
 		if r.wrapOv == 0 {
 			r.m = r.src
 		} else {
-			r.wrapMsg = msg
+			r.wrapMsg = msg // what Message gets (wrapped)
 			r.m = applySlackMessage(rc.h.Core(), &r.src, msg)
 		}
 		r.msgOv = 0 // the inner override re-applies over the new base
@@ -1384,6 +1414,10 @@ func (r *row) layoutColumn(gtx layout.Context) layout.Dimensions {
 		})
 		y += d.Size.Y
 	}
+	r.newerRect = image.Rectangle{}
+	if broadcast && m.NewerReplies && !rc.hiddenUser && r.edit == nil {
+		y += r.broadcastFooter(gtx, y, cw)
+	}
 	if slackc.Patched("CodeChannelEntityCard") {
 		y += r.channelCards(gtx, y, cw)
 	}
@@ -1626,11 +1660,29 @@ func (r *row) layoutPreamble(gtx layout.Context, p slackc.Props) layout.Dimensio
 }
 
 // layoutThreadSender is ThreadSenderAndTimestampGeneric (thread pane).
+// Slack's (client-boot-shared 7aPN) renders inline content in a
+// fragment: MessageSender, "\xa0\xa0", MeetingChannelRootTimeBadge, the
+// Timestamp unless omitTimestamp, then a <br> unless omitLinebreak. The
+// <br> is what ends the line, so the native takes the whole line only
+// with it. Under omitLinebreak (UserPronouns renders <Original
+// omitLinebreak/> and puts its pronouns after it), the native is as wide
+// as what it drew, and the plugin's siblings carry on along the same line.
+// The full-width box wrapped them onto a line of their own under the name.
 func (r *row) layoutThreadSender(gtx layout.Context, p slackc.Props) layout.Dimensions {
 	if p.Has("visible") && !p.Bool("visible") {
 		return layout.Dimensions{}
 	}
-	return r.nameLine(gtx, !p.Bool("omitTimestamp"))
+	withTS := !p.Bool("omitTimestamp")
+	if !p.Bool("omitLinebreak") {
+		return r.nameLine(gtx, withTS)
+	}
+	gap := dp(gtx, mt.tsGap)
+	d, end := r.nameLineEnd(gtx, withTS, gap)
+	if !withTS && end > 0 {
+		end += gap // the two no-break spaces come before the (omitted) time
+	}
+	d.Size.X = min(end, gtx.Constraints.Max.X)
+	return d
 }
 
 // nameLine draws "Name [APP] [status] 3:04 PM", baselines aligned.
@@ -1640,6 +1692,13 @@ func (r *row) nameLine(gtx layout.Context, withTS bool) layout.Dimensions {
 
 // nameLineGap is nameLine with gap px between the sender and the time.
 func (r *row) nameLineGap(gtx layout.Context, withTS bool, gap int) layout.Dimensions {
+	d, _ := r.nameLineEnd(gtx, withTS, gap)
+	return d
+}
+
+// nameLineEnd is nameLineGap, and the x where what it drew ends (the
+// time's right edge, or the sender's without one).
+func (r *row) nameLineEnd(gtx layout.Context, withTS bool, gap int) (layout.Dimensions, int) {
 	w := gtx.Constraints.Max.X
 	lh := dp(gtx, mt.nameLine)
 	g := gtx
@@ -1649,6 +1708,7 @@ func (r *row) nameLineGap(gtx layout.Context, withTS bool, gap int) layout.Dimen
 	if nd.Size.Y == 0 {
 		baseline = lh - dp(gtx, 5)
 	}
+	end := nd.Size.X
 	if withTS {
 		// Align baselines.
 		m := op.Record(gtx.Ops)
@@ -1657,11 +1717,14 @@ func (r *row) nameLineGap(gtx layout.Context, withTS bool, gap int) layout.Dimen
 		t := op.Offset(image.Pt(nd.Size.X+gap, baseline-(d.Size.Y-d.Baseline))).Push(gtx.Ops)
 		call.Add(gtx.Ops)
 		t.Pop()
+		if d.Size.X > 0 {
+			end = nd.Size.X + gap + d.Size.X
+		}
 	}
 	if !withTS && r.rc.dense {
 		w = nd.Size.X // inline before the text: its own width
 	}
-	return layout.Dimensions{Size: image.Pt(w, lh), Baseline: lh - baseline}
+	return layout.Dimensions{Size: image.Pt(w, lh), Baseline: lh - baseline}, end
 }
 
 // layoutSender is MessageSender around BaseMessageSender.

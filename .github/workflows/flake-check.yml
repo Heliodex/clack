@@ -145,6 +145,21 @@ name: flake-check
 #                                            lines on Windows' disk (94 were
 #                                            in), and the Fatal skipped Close:
 #                                            TempDir couldn't remove the file
+# and flake-fix-2's (2026-11-15: α.85's release; the race forced every run):
+#   TestDetailsSendEmailsLikeSlack           the details' conversations.info
+#     (ui/views)                             stored fakeslack's channel name
+#                                            over the test's after the email
+#                                            modal had kept the old one, so
+#                                            the copied address and Slackbot's
+#                                            prompt named another channel
+#                                            than w.name(); newW13Env now
+#                                            waits for that read. The test
+#                                            holds it back 1 s and the
+#                                            address's create until the
+#                                            client stored it (the old order
+#                                            fails every run)
+#   TestDetailsCallButtonLikeSlack,          the same read against the call
+#   TestDetailsCallMenuStartsCall (ui/views) tooltip's name
 # Synthetic data only (internal/fakeslack, the fake Chime).
 on:
   workflow_dispatch:
@@ -200,6 +215,7 @@ on:
       - "internal/huddle/videosend_test.go"
       - "internal/huddle/share_test.go"
       - "internal/ui/views/details_w14_test.go"
+      - "internal/ui/views/details_w13_test.go"
       - "internal/ui/views/views_keys_test.go"
       - "internal/ui/channel_preview_test.go"
       - "internal/ui/backend.go"
@@ -212,8 +228,29 @@ on:
       - "internal/desktop/focusassist_windows_test.go"
       - "internal/ui/titlebar_windows_test.go"
       - "third_party/gioui.org/app/window.go"
+      # the emoji-anim job's own (its timing tests guard these)
+      - "internal/imgcache/anim.go"
+      - "internal/imgcache/imgcache.go"
+      - "internal/imgcache/anim_test.go"
+      - "internal/imgcache/explodes_test.go"
+      - "internal/imgcache/livequiet_test.go"
+      - "internal/ui/quiet.go"
+      - "internal/ui/quiet_test.go"
+      - "internal/ui/quiet_window_test.go"
+      - "internal/ui/a11y_defaults.go"
+      - "third_party/gioui.org/gpu/gpu.go"
+      - "third_party/gioui.org/op/paint/clack_live.go"
+      - "third_party/gioui.org/io/input/router.go"
       - "third_party/gioui.org/app/clack_hide_windows_test.go"
       - "third_party/gioui.org/app/clack_titlebar_windows_test.go"
+      - "internal/jsrt/release_batch_test.go"
+      - "internal/ui/huddles_link_test.go"
+      # the pill-wrap job's own
+      - "internal/ui/richview/flow.go"
+      - "internal/ui/richview/comps.go"
+      - "internal/ui/richview/pill_*_test.go"
+      - "internal/ui/messages/pill_wrap_test.go"
+      - "internal/ui/slackc/wrap.go"
 
 permissions:
   contents: read
@@ -318,6 +355,83 @@ jobs:
         if: ${{ !cancelled() }}
         run: go test -cpu 1 -count=$COUNT -run 'TestSearchRecentsReadGroups$|TestRecentsLoadOnce$' ./internal/core
 
+  # imgcache's decode memory (emoji-load-6): Copy image copies the
+  # original however long it takes and its thumbnail only when the original
+  # can't be decoded at all, the viewer shows the thumbnail for an original
+  # past the decode memory, the GIF picker keeps to the small lane, and the
+  # budget's waits (big slot, memory, contexts). Dispatch with
+  # only=decode-memory; count=1 is enough (the slow-original test waits 9 s).
+  decode-memory:
+    if: ${{ !inputs.only || startsWith('decode-memory', inputs.only) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gio deps
+        run: sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" update -qq && sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" install -y -qq $GIO_DEPS
+      - name: popups (Copy image, the viewer, the GIF picker)
+        run: go test -count=$COUNT -v -run '^(TestCopyImage|TestStandInReasons|TestLightboxShowsThumbnailForOverCapOriginal|TestGIFPicker)' ./internal/ui/popups
+      - name: imgcache and its budget
+        if: ${{ !cancelled() }}
+        run: go test -count=$COUNT -v -run '^(TestBig|TestSmallLane|TestContextEndsWaits|TestFreeGivesBack|TestHeldBytesInCacheBudget|TestBusyRetryDoesntRefetch|TestPressureEndsInALoad|TestSustainedPressureNoEndlessSpinner)' ./internal/imgcache ./internal/imgcache/internal/budget
+
+  # The animated custom emoji (:explodes:, Karim's "so choppy and laggy"
+  # on α.98; branch emoji-anim-smooth): webptest.Explodes' frames on its
+  # timeline under load (photos past the cache's budget), every size of one
+  # image on one timeline, a slow window catching up, a player that
+  # outlives a stalled frame, the loop count, live ImageOps and the images
+  # a quiet frame draws again (imgcache); an animation tick drawn as a quiet
+  # frame (the last frame's ops again, no layout) in the harness and on
+  # App.Run's real X11 window (ui, Xvfb); and Gio patch 35: what a frame was
+  # asked for (an Invalidate asks nothing; X11's window too), live images
+  # through the renderer and on a real GPU context (llvmpipe), a replayed
+  # frame's filters and key log. Every check holds however slow the runner
+  # (they're against the timeline, not the clock); the imgcache step is
+  # about 25 s a run, so 20 runs need the longer timeout. Dispatch with
+  # only=emoji-anim (count=20 is the default).
+  emoji-anim:
+    if: ${{ !inputs.only || startsWith('emoji-anim', inputs.only) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gio deps, Xvfb, Mesa llvmpipe, python-xlib
+        run: sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" update -qq && sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" install -y -qq $GIO_DEPS xvfb libgl1-mesa-dri libegl-mesa0 python3-xlib
+      - name: imgcache (timeline, budget, stalls, loop count, live ops, quiet frames)
+        run: go test -count=$COUNT -v -timeout 30m -run '^(TestExplodesPlaysOnTimeUnderLoad|TestAnimSizesShareTimeline|TestAnimCatchesUp|TestKeepingPlayerSurvivesStall|TestOffscreenGIFReleased|TestGIFLoopCount|TestAnimatedGIF|TestAnimWebPEmojiPlays|TestAnimationsOff|TestLargeGIFAnimatesAtDrawnSize|TestLiveOps|TestFrameRedrawnKeepsImagesFresh)$' ./internal/imgcache
+      - name: ui (an animation tick is a quiet frame; a new member's motion default)
+        if: ${{ !cancelled() }}
+        run: go test -count=$COUNT -v -timeout 30m -run '^(TestAnimationTickIsQuiet|TestA11yNewUserDefaultsLikeSlack)$' ./internal/ui
+      - name: ui on App.Run's real X11 window (quiet frames, Xvfb)
+        if: ${{ !cancelled() }}
+        env:
+          CLACK_REAL_WINDOW_TESTS: "1"
+          GALLIUM_DRIVER: llvmpipe
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          n=$COUNT; [ "$n" -gt 5 ] && n=5 # an App and a window each: 5 runs at most
+          xvfb-run -a -s "-screen 0 1920x1080x24" go test -count=$n -v -timeout 30m -run '^TestRealWindowQuietFrames$' ./internal/ui
+      - name: Gio patch 35 (what a frame was asked for, on X11 too; live images, a real GPU context; replayed frames)
+        if: ${{ !cancelled() }}
+        env:
+          CLACK_X11_ASKED_TESTS: "1"
+          GALLIUM_DRIVER: llvmpipe
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: xvfb-run -a -s "-screen 0 1280x1024x24" go test -count=$COUNT -v -timeout 30m -run '^(TestLiveImageOp|TestDrawOpsLiveImage|TestFrameEventAsked|TestFrameEventAskedX11|TestReplayKeepsFilters|TestReplayKeepsKeyLog|TestLiveImageFrames)$' gioui.org/op/paint gioui.org/gpu gioui.org/app gioui.org/io/input gioui.org/gpu/headless
+      - name: richview (the custom emoji draws live)
+        if: ${{ !cancelled() }}
+        run: go test -count=$COUNT -v -run '^TestCustomEmojiAnimatedWebPDraws$' ./internal/ui/richview
+
   huddle:
     if: ${{ !inputs.only || startsWith('huddle', inputs.only) }}
     runs-on: ubuntu-latest
@@ -403,6 +517,67 @@ jobs:
         run: |
           go test -count=$COUNT -timeout 30m -run 'TestSlickViewMessageLoggerThreads$|TestSlickViewMessageLogger$' ./internal/ui/messages
           go test -race -cpu 1 -count=$COUNT -timeout 30m -run 'TestSlickViewMessageLoggerThreads$' ./internal/ui/messages
+
+  # mention-pill-wrap: a mention pill that wraps, MentionProfiles' picture
+  # at the start of its first line, in channel and thread rows: the rule
+  # alone, a MentionProfiles-shaped plugin over Karim's patched
+  # components, and Slick's own plugin (pill-wrap-shots artifact)
+  pill-wrap:
+    if: ${{ !inputs.only || startsWith('pill-wrap', inputs.only) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+      - id: setup-bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        continue-on-error: true # GitHub release downloads sometimes 504 three times running
+        with:
+          bun-version: 1.4.4
+      - name: bun from npm (setup-bun's download failed)
+        if: steps.setup-bun.outcome == 'failure'
+        run: |
+          for i in 1 2 3; do npm install -g bun@1.4.4 && break; sleep 15; done
+          bun --version
+      - name: clone slick
+        run: |
+          git clone -q https://github.com/3kh0/slick /tmp/slick
+          git -C /tmp/slick log --oneline -1
+      - name: "install slick deps (no scripts)"
+        working-directory: /tmp/slick
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: build every plugin with slick's build
+        run: |
+          set -o pipefail
+          mkdir -p dist/slick-plugins
+          node internal/slick/build/build.mjs /tmp/slick dist/slick-plugins 2>&1 | tail -5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gio deps
+        run: sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" update -qq && sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" install -y -qq $GIO_DEPS xvfb libgl1-mesa-dri libegl-mesa0
+      - name: wrapped mention pills in rows, COUNT runs
+        env:
+          SLICK_PLUGINS_DIR: ${{ github.workspace }}/dist/slick-plugins
+          MESSAGES_AUDIT_SHOTS_DIR: ${{ github.workspace }}/dist/shots
+          CLACK_PIXEL_TESTS: "1"
+          GALLIUM_DRIVER: llvmpipe
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          mkdir -p "$MESSAGES_AUDIT_SHOTS_DIR"
+          rc=0
+          xvfb-run -a go test -count=$COUNT -timeout 30m -run '^(TestWrappedPill|TestPillPadding|TestPillPictureSlot|TestPillAfterAndEdges|TestPillEllipsisAfterPicture|TestPillBoundsHoldPictureLine|TestPillPictureInAlignedTable|TestCodeChip|TestColorSwatchAfterValue|TestMissingMemberBarBreaks|TestPillClampOpenEnd|TestTableCellWidthPerLine|TestPillClickRectHoldsPictureLine|TestPillEllipsisDrawsOverPill)' ./internal/ui/richview || rc=1
+          xvfb-run -a go test -count=$COUNT -v -timeout 40m -run '^(TestWrappedMentionPictureInRows|TestSlickViewMentionProfilesWrap)$' ./internal/ui/messages || rc=1
+          exit $rc
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ !cancelled() }}
+        with:
+          name: pill-wrap-shots
+          path: dist/shots
 
   flakes-1111:
     if: ${{ !inputs.only || startsWith('flakes-1111', inputs.only) }}
@@ -727,6 +902,46 @@ jobs:
   # flake-fix (2026-11-14): each test that failed a first ci attempt, on two
   # fresh runners (a first attempt's state: the cursor where ci's earlier
   # steps left it, a notification service never crashed), COUNT runs each
+  # Gio patch 32 (mac-wake, 2026-11-16): ci's macOS wake, sleep and
+  # occlusion tests, each $COUNT times in one process (TestMain runs
+  # app.Main): AppKit's occlusion reports, the layer's one-second drawable
+  # timeout and the display link's restarts all have timing in them.
+  mac-wake:
+    if: ${{ !inputs.only || startsWith('mac-wake', inputs.only) }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: TestOccludedWindowPausesMac, every run counted
+        if: ${{ !cancelled() }}
+        env:
+          CLACK_MACOS_WINDOW_TESTS: "1"
+          TEST: TestOccludedWindowPausesMac
+          PKG: gioui.org/app
+          FLAKE_TAIL: "200"
+        run: sh "$GITHUB_WORKSPACE/.github/flake-count.sh"
+      - name: TestNoDrawableSkipsFrameMac, every run counted
+        if: ${{ !cancelled() }}
+        env:
+          CLACK_MACOS_WINDOW_TESTS: "1"
+          TEST: TestNoDrawableSkipsFrameMac
+          PKG: gioui.org/app
+          FLAKE_TAIL: "200"
+        run: sh "$GITHUB_WORKSPACE/.github/flake-count.sh"
+      - name: TestScreensSleepWakeMac, every run counted
+        if: ${{ !cancelled() }}
+        env:
+          CLACK_MACOS_WINDOW_TESTS: "1"
+          TEST: TestScreensSleepWakeMac
+          PKG: gioui.org/app
+          FLAKE_TAIL: "200"
+        run: sh "$GITHUB_WORKSPACE/.github/flake-count.sh"
+
   flake-fix-windows:
     if: ${{ !inputs.only || startsWith('flake-fix-windows', inputs.only) }}
     name: "flake-fix ${{ matrix.test }} (runner ${{ matrix.runner }})"
@@ -798,6 +1013,59 @@ jobs:
           PKG: ${{ matrix.pkg }}
         run: sh "$GITHUB_WORKSPACE/.github/flake-count.sh" ${{ matrix.flags }}
 
+  flake-fix-2-views:
+    if: ${{ !inputs.only || startsWith('flake-fix-2-views', inputs.only) }}
+    name: "flake-fix-2 ${{ matrix.test }} (${{ matrix.flags }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { test: TestDetailsSendEmailsLikeSlack, pkg: ./internal/ui/views, flags: "-race" }
+          - { test: TestDetailsSendEmailsLikeSlack, pkg: ./internal/ui/views, flags: "-cpu=1" }
+          - { test: TestDetailsCallButtonLikeSlack, pkg: ./internal/ui/views, flags: "-race" }
+          - { test: TestDetailsCallMenuStartsCall, pkg: ./internal/ui/views, flags: "-race" }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gio deps
+        run: sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" update -qq && sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" install -y -qq $GIO_DEPS
+      - name: "${{ matrix.test }} ${{ matrix.flags }}, every run counted"
+        env:
+          TEST: ${{ matrix.test }}
+          PKG: ${{ matrix.pkg }}
+        run: sh "$GITHUB_WORKSPACE/.github/flake-count.sh" ${{ matrix.flags }}
+
+  # the release's test job (release.yml) as it is: the whole suite in one
+  # job on a clean cache, on three fresh runners at once. Timing races
+  # that only show under the whole suite's load failed α.82, α.83 and α.85
+  # there and nowhere else.
+  release-suite:
+    if: ${{ !inputs.only || startsWith('release-suite', inputs.only) }}
+    name: "release-suite (runner ${{ matrix.runner }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: false # as release.yml: a clean module/build cache
+      - name: gio deps
+        run: sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" update -qq && sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" install -y -qq $GIO_DEPS
+      - name: go test ./...
+        run: go test -timeout 30m ./...
+
   # flake-fix: the title bar tests after the gioui.org/app steps ci's
   # windows-applog runs before them (the OLE drops move the cursor and run
   # PowerShell's drag source, typed text clicks its window), COUNT rounds
@@ -854,3 +1122,260 @@ jobs:
           done
           echo "::notice title=windows-applog's window steps::the title bar tests failed $titlebar times in $COUNT rounds; the drops and typed text $other times"
           exit $(( titlebar > 0 ))
+
+  # patched-tree-clicks: Block Kit clicks and redraws on rows under a
+  # plugin patching Message / ThreadReplyGeneric, whose own msg override
+  # went back to JS as their props (row.wrapped) and kept an updated row
+  # bouncing between two revisions (lost clicks, α.92's redraw timeouts);
+  # the lockstep variants make that timing happen every run
+  patched-clicks:
+    if: ${{ !inputs.only || startsWith('patched-clicks', inputs.only) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gio deps
+        run: sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" update -qq && sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" install -y -qq $GIO_DEPS
+      - name: "messages: the vote buttons under ThreadReplyGeneric+Message (free-running and lockstep), COUNT runs"
+        run: go test -count=$COUNT -timeout 60m -run 'TestVoteButtonsSurviveUpdates/ThreadReplyGeneric' ./internal/ui/messages
+      - name: "messages: every vote variant and the patched Message's props, 3 runs"
+        if: ${{ !cancelled() }}
+        run: go test -count=3 -timeout 30m -run 'TestVoteButtonsSurviveUpdates$|TestMessagePatchGetsWrappersMsg$' ./internal/ui/messages
+      - name: "the measure-pass audit: a test per family (slackc, kit, composer, messages, views, ui)"
+        if: ${{ !cancelled() }}
+        run: |
+          rc=0
+          go test -count=1 -v -run '^TestMeasurePassLeavesFocusAlone$' ./internal/ui/slackc || rc=1
+          go test -count=1 -v -run '^TestFormTextInputFocusThroughMeasurePasses$' ./internal/ui/slackc/kit || rc=1
+          go test -count=1 -v -run '^TestLinkDialogFocusAfterMeasurePass$' ./internal/ui/composer || rc=1
+          go test -count=1 -v -run '^TestToolbarTiltIgnoresMeasurePass$' ./internal/ui/messages || rc=1
+          go test -count=1 -v -run '^TestChannelFilesSuggestionsSurviveMeasurePass$' ./internal/ui/views || rc=1
+          go test -count=1 -v -timeout 15m -run '^TestSidebarTextFilterMeasurePassKeepsFocus$' ./internal/ui || rc=1
+          exit $rc
+
+  # slackc-sweep: a window's patched roots age by its own frames (one idle
+  # 5 s came back to every root unmounted and mounted again; the huddle
+  # window's frames swept the still main window's; a root two windows draw
+  # outlives one closing; a closed window's own roots go at once), and
+  # Message gets MessageWrapper's very msg. `only=patched-clicks` runs
+  # this job with the one above.
+  patched-clicks-roots:
+    if: ${{ !inputs.only || startsWith('patched-clicks-roots', inputs.only) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gio deps
+        run: sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" update -qq && sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" install -y -qq $GIO_DEPS
+      - name: "slackc: patched roots age by their own window's frames, COUNT runs"
+        run: go test -count=$COUNT -run '^(TestIdleWindowKeepsPatchedRoots|TestUndrawnPatchedRootsUnmount|TestOtherWindowsFramesKeepPatchedRoots|TestClosedSubWindowRootsUnmount|TestRootSharedByTwoWindowsOutlivesOneClosing)$' ./internal/ui/slackc
+      - name: "slackc: the same under the race detector, 3 runs (a closing window's sweep runs on a goroutine of its own)"
+        if: ${{ !cancelled() }}
+        run: go test -race -count=3 -run '^(TestClosedSubWindowRootsUnmount|TestRootSharedByTwoWindowsOutlivesOneClosing)$' ./internal/ui/slackc
+      - name: "messages: Message gets MessageWrapper's very msg, 3 runs"
+        if: ${{ !cancelled() }}
+        run: go test -count=3 -v -run '^TestMessagePatchGetsWrappersExactMsg$' ./internal/ui/messages
+
+  # plugin-escape: one overlay stack per window (slackc layers.go). The
+  # shell's overlays keep the shell's Escape (its binding closes the
+  # topmost; a menu or popover opened from Channel details or Preferences
+  # closes before them). Where a plugin's layer is involved Escape goes the
+  # way the DOM does a modal: the focused element first (a plugin input's
+  # keydown to JS, which can stop it; no answer in 300 ms and it goes on),
+  # then the layer it was aimed at as it was pressed (a plugin's layer
+  # still open takes every Escape aimed at it). A layer that closes
+  # gives the focus back in that frame to what had it (Gio patch 34's
+  # focus answers).
+  plugin-escape:
+    if: ${{ !inputs.only || startsWith('plugin-escape', inputs.only) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gio deps
+        run: sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" update -qq && sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" install -y -qq $GIO_DEPS
+      - name: "Gio patch 34: the focus answers, COUNT runs"
+        run: go test -count=$COUNT -run 'FocusTagCanFocusWithin' gioui.org/io/input
+      - name: "slackc: the overlay stack's Escape and focus, COUNT runs"
+        if: ${{ !cancelled() }}
+        run: go test -count=$COUNT -run '^(TestEscapeGoesToTheLayerHoldingTheFocus|TestNativeLayersKeepTheirEscape|TestPluginLayerOverNativeGetsEscapeFirst|TestLayerGivesFocusBack|TestLayerOpenedFromAClosedOneGivesItsFocusBack|TestClosedLayerFieldKeepsNoFocus|TestLayerGivesNoFocusWhileInert|TestPluginInputEscapeBubbles|TestTwoEscapesBeforeJSAnswers|TestStillOpenPopoverTakesEveryEscape|TestLateEscapeAnswerClosesNothingNew|TestEscapeWithoutAnswerGoesOn|TestEscapeAfterTheLastLayerWent|TestStackOnlyInItsWindow)$' ./internal/ui/slackc
+      - name: "kit: a Popover's Escape (top first, its field's listeners first) and focus, COUNT runs"
+        if: ${{ !cancelled() }}
+        run: go test -count=$COUNT -run '^(TestPopoverAutoFocusFieldKeepsCaret|TestFormTextInputFocusThroughMeasurePasses|TestPopoverEscapeCloses|TestNestedPopoversCloseTopFirst|TestConfirmInsidePopoverClosesFirst|TestPopoverGivesFocusBack|TestPopoverTakesFocusBackFromRemovedField|TestPopoverInputCanStopEscape|TestFormTextInputOnKeyDownCanStopEscape|TestRichTextInputPopoverGivesFocusBack)$' ./internal/ui/slackc/kit
+      - name: "ui: Escape and the focus in each stacking in the main window, 3 runs"
+        if: ${{ !cancelled() }}
+        run: go test -count=3 -v -timeout 30m -run '^(TestEscapeClosesPluginPopoverFirst|TestEscapeWithThePumpUp|TestPopoverInsideEditProfile|TestPopoverInViewsModal|TestDialogOverPopover|TestEscapeOwners|TestEscapeClosesWhatChannelDetailsOpenedFirst|TestEscapeClosesPreferencesColourPopoverFirst|TestEscapeClosesMenuOverEditProfileFirst|TestEscapeKeepsGuardedModal|TestHoverPeekGivesNoFocus|TestModalFromMenuGivesFocusBackToThreadComposer|TestReplayIntroClosesGuardedModal|TestEscapeKeepsDirtyEditProfile|TestW28NavigateFocusesComposer)$' ./internal/ui
+
+  # 2026-11-16: the jsrt release-burst tests counted the runtime's own
+  # garbage's frees too (20018 of 20000 once), and TestHuddlesLinkInvites
+  # timed the Huddles page's 600 ms from up to a frame after it started
+  # (526 ms once); both now count only what they test
+  flakes-1116:
+    if: ${{ !inputs.only || startsWith('flakes-1116', inputs.only) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gio deps
+        run: sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" update -qq && sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" install -y -qq $GIO_DEPS xvfb libgl1-mesa-dri libegl-mesa0
+      - name: "jsrt: release bursts count their own handles, COUNT runs"
+        run: go test -count=$COUNT -run '^(TestReleaseBurstIsOneTask|TestPostDuringReleaseBurst)$' ./internal/jsrt
+      - name: "jsrt: the same under the race detector, 5 runs"
+        if: ${{ !cancelled() }}
+        run: go test -race -count=5 -run '^(TestReleaseBurstIsOneTask|TestPostDuringReleaseBurst)$' ./internal/jsrt
+      - name: "ui: the Huddles link's invites (llvmpipe, as huddles-audit-shots), 5 runs"
+        if: ${{ !cancelled() }}
+        env:
+          GALLIUM_DRIVER: llvmpipe
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: xvfb-run -a go test -count=5 -v -timeout 40m -run '^TestHuddlesLinkInvites$' ./internal/ui/
+
+  # The DM badges (core rail.go DMsBadge; Karim's 2026-11-16 "ghost
+  # pings"): Slack's rHEx dmsBadgeCount leaves out the bot DMs the DMs page
+  # doesn't list (Slackbot's, the Slack system user's, an app's), and under
+  # the activity inbox the tab counts unread conversations (6Z4k Sm). The
+  # badges look up every unread IM's member (members.go readBadgePeople),
+  # and without the inbox the Activity tab and the app badge read
+  # channel_badges and the alerts (classic_badges.go). Dispatch with
+  # only=dm-badges.
+  dm-badges:
+    if: ${{ !inputs.only || startsWith('dm-badges', inputs.only) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gio deps
+        run: sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" update -qq && sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" install -y -qq $GIO_DEPS
+      - name: "core: the DM badges' rules, the DMs tab's rows, COUNT runs"
+        run: go test -count=$COUNT -v -run '^(TestDMBadgeSkips|TestDMsBadgeRule|TestSnapshotDMBadgeSkips|TestDMsTabFilters|TestHomeBadgeRule|TestBadgeReadersAskForUnreadIMMembers|TestCountsAnswerAsksForUnreadIMMember|TestMarkedUnreadAsksForIMMember|TestMembersPassKeepsBadgePeople|TestClassicActivityBadgeLikeSlack|TestClassicAppBadgeLikeSlack|TestClassicBadgesUpdatesLikeSlack|TestBotDMIsDUy0G|TestMembersPassThenSnapshotAsksNoClosedDMs|TestBootAsksOpenDMPartnersOnly|TestExperimentReadsListed|TestDefaultExperimentsMatchAccount|TestFakeslackExperimentsMatchAccount)$' ./internal/core
+      - name: "ui: the DM badges, the DMs page, the classic Activity and app badges over fakeslack's DMs, COUNT runs"
+        if: ${{ !cancelled() }}
+        run: go test -count=$COUNT -v -timeout 30m -run '^(TestDMsBadgeLikeSlack|TestDMBadgesClassicLikeSlack|TestDMBadgeMemberLoadsLate|TestTitleDockTaskbarAgreeLikeSlack|TestActivityRailBadgeLikeSlack)$' ./internal/ui
+
+  # plugin-render-2: a reply also sent to the channel, in the channel's list
+  # and its thread pane, gets a plugin root per pane (one shared root got
+  # each pane's props in turn and rendered every frame), and so does each
+  # composer of one thread; JS's own commits that change no host node send
+  # Go nothing (api.redux.refresh re-rendered every usePatchVersion patch,
+  # and each root sent its same tree again); a profile change, a renamed
+  # channel tab or a names pref converts again just the messages that name
+  # them, patched and unpatched, without counting as a view's read
+  plugin-render:
+    if: ${{ !inputs.only || startsWith('plugin-render', inputs.only) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gio deps
+        run: sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" update -qq && sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" install -y -qq $GIO_DEPS
+      - name: "slackc + jsrt + taut + core: panes, same-output commits, refresh, conversion refs, COUNT runs"
+        run: |
+          rc=0
+          go test -count=$COUNT -run '^TestPanesHaveRootsOfTheirOwn$' ./internal/ui/slackc || rc=1
+          go test -count=$COUNT -run '^(TestSameOutputSendsNoTree|TestPortalUnderHiddenNativeAnswers)$' ./internal/jsrt || rc=1
+          go test -count=$COUNT -run '^(TestRefreshSendsNoSameTree|TestUserEventsForUndrawnMembersCostNothing|TestChangeDuringFirstConversion)$' ./internal/taut || rc=1
+          go test -count=$COUNT -run '^(TestMessageRefs|TestStoredMessageReadsNoMember|TestEventsMarkDocChanges)$' ./internal/core || rc=1
+          exit $rc
+      - name: "messages + composer: the broadcast reply in every list, renames redraw rows, one thread's composers, 3 runs"
+        if: ${{ !cancelled() }}
+        run: |
+          rc=0
+          go test -count=3 -v -timeout 30m -run '^(TestBroadcastReplyInBothPanesIdle|TestRenamesRedrawRows|TestRenameDuringLoad|TestInjectedTakesEqualConversions)$' ./internal/ui/messages || rc=1
+          go test -count=3 -v -timeout 10m -run '^TestComposersForOneThreadSendTheirOwn$' ./internal/ui/composer || rc=1
+          exit $rc
+
+  # What one frame costs the GPU (branch gpu-frame-cost): Clack's window
+  # rendered by each backend (Mesa llvmpipe's GL on Linux, WARP's Direct3D
+  # 11 on Windows, the runner's Metal on macOS). The placement probe logs
+  # how exactly each one repeats a path's coverage when only its stencil
+  # region moves. Dispatch with only=gpu-cost.
+  gpu-cost:
+    if: ${{ !inputs.only || startsWith('gpu-cost', inputs.only) }}
+    name: "gpu-cost (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gio deps
+        if: ${{ runner.os == 'Linux' }}
+        run: sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" update -qq && sudo sh "$GITHUB_WORKSPACE/.github/apt.sh" install -y -qq $GIO_DEPS xvfb libgl1-mesa-dri libegl-mesa0
+      - name: placement probe (gioui.org/gpu/headless)
+        shell: bash
+        env:
+          CLACK_GPU_COST_PROBE: "1"
+          CLACK_PIXEL_TESTS: "1"
+          GALLIUM_DRIVER: llvmpipe
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then x=(xvfb-run -a); else x=(); fi
+          if [ "$RUNNER_OS" = Windows ]; then export CGO_ENABLED=0; fi
+          "${x[@]}" go test -count=1 -v -timeout 10m -run '^(TestClackPlacementNoise|TestClackAtlasShrinks|TestClackAtlasShrinksUsedNowAndThen|TestClackAtlasGrowKeepsSize|TestClackStateCacheIdentical|TestClackLayerPages|TestClackSubPixelCache|TestClackSplitsUnderTransform)$' gioui.org/gpu/headless
+      - name: the shadows and the panel's corners, old and new (internal/ui/theme TestFrameCostPixels)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CLACK_PIXEL_TESTS: "1"
+          GALLIUM_DRIVER: llvmpipe
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then x=(xvfb-run -a); else x=(); fi
+          if [ "$RUNNER_OS" = Windows ]; then export CGO_ENABLED=0; fi
+          "${x[@]}" go test -count=1 -v -timeout 25m -run '^(TestFrameCostPixels|TestFrameCostSeams)$' ./internal/ui/theme
+      - name: Clack's whole window over fakeslack, old and new (internal/ui TestFrameCostWindow)
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          CLACK_GPU_COST: "1"
+          CLACK_PIXEL_TESTS: "1"
+          CLACK_GPU_COST_SHOTS: ${{ runner.temp }}/gpu-cost-shots
+          GALLIUM_DRIVER: llvmpipe
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          mkdir -p "$CLACK_GPU_COST_SHOTS"
+          if [ "$RUNNER_OS" = Linux ]; then x=(xvfb-run -a); else x=(); fi
+          if [ "$RUNNER_OS" = Windows ]; then export CGO_ENABLED=0; fi
+          "${x[@]}" go test -count=1 -v -timeout 25m -run '^TestFrameCostWindow$' ./internal/ui
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ !cancelled() }}
+        with:
+          name: gpu-cost-shots-${{ runner.os }}
+          path: ${{ runner.temp }}/gpu-cost-shots

@@ -40,6 +40,10 @@ type ModalButton struct {
 	// Hidden, when it says so, leaves the button out of the footer (the
 	// Edit file dialog's Next on its last page, its Send before it).
 	Hidden func() bool
+	// Loading, when it says so, draws the button as Slack's LoadingButton
+	// (CEte) draws one loading, and it can't be pressed: Edit profile's
+	// Save and Yes, Remove Photo while their call runs (loading_button.go).
+	Loading func() bool
 	// Joined puts the button flush against the one before it, the two
 	// drawn as one group (Slack Kit's ButtonGroup, or the share dialog's
 	// legacy Forward with its schedule caret): the inner corners square.
@@ -67,6 +71,9 @@ func (b *ModalButton) Rect() image.Rectangle { return b.rect }
 func (b *ModalButton) draw(gtx layout.Context, th *theme.Theme, kind BtnKind, ring bool, grp grpSide) layout.Dimensions {
 	if b.Draw != nil {
 		return b.Draw(gtx, th, &b.click, kind, ring, grp)
+	}
+	if b.loading() {
+		return loadingButtonGrp(gtx, th, &b.click, BtnMedium, 80, grp)
 	}
 	if b.V2 != nil && b.V2() {
 		return buttonV2Grp(gtx, th, &b.click, kind, theme.ButtonV2Medium, b.Label, b.Icon, ring, grp)
@@ -220,6 +227,7 @@ type Modal struct {
 	// keyboard focus (focus.go)
 	ring   bool      // the focused button shows Slack's focus ring
 	prev   event.Tag // focused before the modal opened (refocus)
+	kept   bool      // CloseGuard kept it open at the last Dismiss
 	last   event.Tag // the stop that had the focus last
 	wasTop bool
 	ptr    int // pointer tag: a press anywhere hides the ring
@@ -239,7 +247,11 @@ func NewModal(h Host, o ModalOpts) *Modal {
 	return m
 }
 
-func (b *ModalButton) enabled() bool { return !b.hidden() && (b.Enabled == nil || b.Enabled()) }
+func (b *ModalButton) enabled() bool {
+	return !b.hidden() && !b.loading() && (b.Enabled == nil || b.Enabled())
+}
+
+func (b *ModalButton) loading() bool { return b.Loading != nil && b.Loading() }
 
 func (b *ModalButton) hidden() bool { return b.Hidden != nil && b.Hidden() }
 
@@ -274,11 +286,18 @@ func (m *Modal) Press(label string) bool {
 
 // Dismiss closes the modal, unless CloseGuard keeps it open.
 func (m *Modal) Dismiss() {
+	m.kept = false
 	if m.o.CloseGuard != nil && !m.done && !m.o.CloseGuard() {
+		m.kept = true
 		return
 	}
 	m.base.Dismiss()
 }
+
+// KeptOpen reports whether CloseGuard kept the modal open at the last
+// Dismiss (its speed bump is up over it): the window keeps it in its
+// stack, where an Escape that reached it leaves it.
+func (m *Modal) KeptOpen() bool { return m.kept && !m.Dismissed() }
 
 // Close closes the modal without asking CloseGuard (the owner's own
 // close: the speed bump's discard).

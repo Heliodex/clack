@@ -61,8 +61,9 @@ type window struct {
 	lounge    loungeUI        // HuddleLoungeMusicBanner (lounge.go)
 	tips      map[string]*popups.TipState
 
-	overlays []popups.Overlay // modals over the window (winHost.ShowOverlay; under mu)
-	posts    []func()         // winHost.post (under mu)
+	overlays []popups.Overlay             // modals over the window (winHost.ShowOverlay; under mu)
+	layers   map[popups.Overlay]*winLayer // the overlays' layers in the window's stack (window_menu.go)
+	posts    []func()                     // winHost.post (under mu)
 
 	shareAlert alertState // the screen share alert's link and close (share.go)
 	panel      panelState // the Captions side panel (captions_panel.go)
@@ -170,12 +171,15 @@ func (w *window) run() {
 	// going, the captions' fade), like Slack's, which draws nothing in a
 	// still call.
 	var ops op.Ops
-	var caption captionState // Windows: the caption takes the window's colour (caption.go)
+	var caption captionState    // Windows: the caption takes the window's colour (caption.go)
+	var patch slackc.SubWindow  // its plugin patch points' roots (slackc)
+	patch.SetWake(w.invalidate) // an Escape JS passed on to its overlay layers
 	for {
 		ev := ww.Event()
 		caption.sync(ev, ww, hudCaption)
 		switch e := ev.(type) {
 		case app.DestroyEvent:
+			patch.Close()
 			if w.popout != "" {
 				w.c.popoutGone(w)
 				return
@@ -193,7 +197,7 @@ func (w *window) run() {
 			// Slack's huddle components here are plugin patch points
 			// (slackc), shared with the main window: one frame at a time.
 			slackc.LockFrame()
-			restore := slackc.SubFrameBg(gtx, "p-multi_view_window p-huddle_window", hudWhite, hudFrame)
+			restore := patch.FrameBg(gtx, "p-multi_view_window p-huddle_window", hudWhite, hudFrame)
 			w.layout(gtx)
 			restore()
 			slackc.UnlockFrame()

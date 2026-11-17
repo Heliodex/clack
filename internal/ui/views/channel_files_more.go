@@ -119,8 +119,10 @@ func sugLocalMatch(it *fileItem, words []string) bool {
 	return true
 }
 
+// isMediaFile is the searcher's Photos and videos filter (JG8Q:
+// fileIsImage || fileIsPlayableVideo); an image without thumbs is a file.
 func isMediaFile(it *fileItem) bool {
-	return strings.HasPrefix(it.Mime, "image/") || strings.HasPrefix(it.Mime, "video/") || it.isImage()
+	return it.isImage() || strings.HasPrefix(it.Mime, "video/")
 }
 
 // sugKeep is searcherOptions' filter for the Attachment type.
@@ -182,7 +184,14 @@ func (v *ChannelFiles) buildSuggestions() {
 func (v *ChannelFiles) sugUpdate(gtx C) {
 	s := &v.sug
 	ed := &v.search.ed
-	focused := gtx.Focused(ed)
+	// the onBlur below only from a pass that delivers input: under a
+	// plugin patching a boundary above the view (ChatTabs'
+	// ClientPrimaryView) slackc also measures it with gtx.Disabled(),
+	// where nothing is focused, and every relayout closed the open list
+	focused := s.focused
+	if gtx.Source.Enabled() {
+		focused = gtx.Focused(ed)
+	}
 	if s.open {
 		fs := []event.Filter{
 			key.Filter{Focus: ed, Name: key.NameUpArrow}, key.Filter{Focus: ed, Name: key.NameDownArrow},

@@ -175,6 +175,9 @@ func convertFile(f *slack.File) *File {
 	mime := strings.ToLower(f.Mimetype)
 	switch {
 	case strings.HasPrefix(mime, "image/"):
+		if !slack.FileIsImage(f) {
+			break // getFileType "generic": a file card, no thumb (FileIsImage)
+		}
 		out.IsImage = true
 		out.Thumb = imageThumb(f)
 		if st := stillThumb(f); st != nil && (out.Thumb == nil || st.URL != out.Thumb.URL) {
@@ -237,9 +240,9 @@ func (c *builder) expandable(out *File) {
 // 720, 2HRR: thumb_480_gif, then thumb_360_gif); one without either draws
 // its static thumbs, as in Slack. Small images have no thumb past their
 // own size (a 223px screenshot stops at thumb_360, which is the
-// original's size), so the original (url_private) comes next and the
-// small thumbs last: Slack's fileIsImage draws any image/* file with an
-// image filetype or a thumb_360 inline, whatever its other thumbs.
+// original's size). Only files slack.FileIsImage takes get here: thumb_360 is
+// there, or a HEIC's thumb_800; the original (url_private) and the small
+// thumbs are left for a Salesforce file.
 func imageThumb(f *slack.File) *Image {
 	for _, g := range []struct {
 		u    string
@@ -265,6 +268,7 @@ func imageThumb(f *slack.File) *Image {
 		{f.Thumb720, f.Thumb720W, f.Thumb720H, 720},
 		{f.Thumb480, f.Thumb480W, f.Thumb480H, 480},
 		{f.Thumb360, f.Thumb360W, f.Thumb360H, 360},
+		{f.Thumb800, 0, 0, 800},
 		{f.URLPrivate, f.OriginalW, f.OriginalH, 0},
 		{f.Thumb160, 0, 0, 160},
 		{f.Thumb80, 0, 0, 80},

@@ -1005,13 +1005,24 @@ const actTypingTTL = 6 * time.Second
 type actTyping struct {
 	mu sync.Mutex
 	m  map[string]map[string]time.Time // channel + "/" + thread ts → user → until
+	// shown: the conversations the status column read in the latest frame
+	// it drew (at shownAt, gtx.Now; on). apply reports a change to another
+	// one's typers as none: nothing on screen draws them, and every typing
+	// event in a busy workspace redrew the window
+	shown   map[string]bool
+	shownAt time.Time
 }
 
-// apply takes a typing or message event; it reports a change.
+// apply takes a typing or message event; it reports a change the status
+// column draws.
 func (t *actTyping) apply(ev core.Event, self string) bool {
 	k := ev.Channel + "/" + ev.ThreadTS
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	return t.applyLocked(ev, self, k) && t.shown[k]
+}
+
+func (t *actTyping) applyLocked(ev core.Event, self, k string) bool {
 	switch ev.Type {
 	case "typing":
 		if ev.UserID == "" || ev.UserID == self || ev.Channel == "" {
@@ -1025,7 +1036,13 @@ func (t *actTyping) apply(ev core.Event, self string) bool {
 			us = map[string]time.Time{}
 			t.m[k] = us
 		}
-		us[ev.UserID] = time.Now().Add(actTypingTTL)
+		now := time.Now()
+		for id, until := range us { // the lapsed go: a channel's typers don't pile up
+			if !until.After(now) {
+				delete(us, id)
+			}
+		}
+		us[ev.UserID] = now.Add(actTypingTTL)
 		return true
 	case "message":
 		uid := ev.UserID
@@ -1047,6 +1064,14 @@ func (t *actTyping) apply(ev core.Event, self string) bool {
 func (t *actTyping) on(ch, thread string, now time.Time) (bool, time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.shown == nil {
+		t.shown = map[string]bool{}
+	}
+	if now.After(t.shownAt) { // a newer frame: what it reads replaces the last one's
+		clear(t.shown)
+		t.shownAt = now
+	}
+	t.shown[ch+"/"+thread] = true
 	var next time.Time
 	for _, until := range t.m[ch+"/"+thread] {
 		if until.After(now) && (next.IsZero() || until.Before(next)) {

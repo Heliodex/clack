@@ -40,6 +40,9 @@ import (
 //     icon (15px content-pry, padding-top 8, gap 8). Then, 20px down, the
 //     buttons (flex, gap 8): the main action (getAppPrimaryActions,
 //     8oqt TW: Message when the app supportsDmInteraction, else Open App;
+//     with flexpane_content_parity, Add to Channel when the app can join
+//     the conversation you're viewing and isn't in it, or from its own
+//     DM's Messages tab, and a skeleton while that membership is asked;
 //     flex 4) and AppDetailsOverflow's 36px ⋮.
 //   - AppDetailsSection: the Description section (sectionHeader 15/900,
 //     margin-bottom 8; long_desc clamped at 16 lines), each section ruled
@@ -63,6 +66,11 @@ type AppDetailsView struct {
 	closeBtn, backBtn, mainBtn, moreBtn widget.Clickable
 	moreBox                             image.Rectangle // the ⋮, pane coords
 	paneW                               int
+
+	// the app's membership of the current channel (sBq1 Sv), per channel
+	memCh    string
+	memState int
+	memAsked string
 }
 
 // OpenAppTab opens the app's DM on a tab ("home", "about" or "messages"):
@@ -209,16 +217,175 @@ func (v *AppDetailsView) clicks(gtx layout.Context) {
 // messages_tab_enabled, on unless the app turns it off).
 func adOffersMessage(c core.AppCard) bool { return c.AppUserID != "" && c.MessagesTab }
 
+// getAppPrimaryActions' main actions (8oqt Hy) that Clack draws: Connect
+// and VIP need the connection status and approval banners Clack doesn't
+// load, so they never come up.
+const (
+	adMainMessage = iota
+	adMainOpenApp
+	adMainAddToChannel
+	adMainLoading
+)
+
+// The app's membership of the current channel (8oqt C0).
+const (
+	adMemberNone      = iota // not read (no channel, no app user, not loaded)
+	adMemberUnknown          // asked, not answered
+	adMemberMember           // in it
+	adMemberNonMember        // not in it
+)
+
+// adFacts is useAppPrimaryActionFacts (boot-shared 3QxE O) with App
+// details' requiresInvitableChannel (flexpane_content_parity) and
+// readsChannelMembership (the profile loaded).
+type adFacts struct {
+	parity           bool   // flexpane_content_parity (HLQ9 X7)
+	current          string // currentChannelId: the primary view's conversation
+	ownDM            bool   // isViewingOwnDm: the app's own DM is the primary view
+	offersMessage    bool
+	offersAppHome    bool
+	canAdd           bool // canAddToChannel
+	canInviteCurrent bool // canInviteToCurrentChannel
+	membership       int  // currentChannelMembership
+}
+
+// prefill is addToChannelPrefillId: the current channel when the app isn't
+// in it and can be added there.
+func (f adFacts) prefill() string {
+	if f.membership == adMemberNonMember && f.canInviteCurrent {
+		return f.current
+	}
+	return ""
+}
+
+// adPrimary is getAppPrimaryActions' main (8oqt TW) under
+// flexpane_content_parity (no connection status, approval banner or
+// connect: Clack loads none of them; offersAddToChannelAnywhere false).
+// Off, App details has no primary actions and its button is Message or
+// Open App (a9).
+func adPrimary(f adFacts) int {
+	t := adMainOpenApp
+	if f.offersMessage {
+		t = adMainMessage
+	}
+	if !f.parity {
+		return t
+	}
+	if f.ownDM && !f.offersMessage {
+		if f.canAdd {
+			return adMainAddToChannel
+		}
+		return t
+	}
+	r := f.canAdd && f.canInviteCurrent
+	if r && f.membership == adMemberUnknown {
+		return adMainLoading
+	}
+	if r && f.membership == adMemberNonMember {
+		return adMainAddToChannel
+	}
+	return t
+}
+
+// facts reads useAppPrimaryActionFacts for card c.
+func (v *AppDetailsView) facts(c core.AppCard) adFacts {
+	h := v.h
+	ca := h.Core()
+	var f adFacts
+	if ca == nil {
+		return f
+	}
+	f.parity = ca.FlexpaneContentParity()
+	tab := ""
+	if CurrentView != nil {
+		f.current, tab = CurrentView()
+	}
+	app := c.AppUserID
+	// isViewingOwnDm: the primary view is a conversation (jh4t) whose DM
+	// user is the app's; offersMessage drops when that DM is on its
+	// Messages tab (PfM7 O: no tab, Channel or AppChat), offersAppHome
+	// when it's on Home (PfM7 x)
+	if f.current != "" && app != "" {
+		if cv, ok := ca.Conv(f.current); ok && cv.Kind == "im" && cv.User == app {
+			f.ownDM = true
+		}
+	}
+	f.offersMessage = adOffersMessage(c) && !(f.ownDM && (tab == "" || tab == "messages"))
+	f.offersAppHome = c.HomeTab && !(f.ownDM && tab == "home")
+	// canAddToChannel: isAppActive; an xoxa app needs a viewer who isn't a
+	// guest, any other a viewer who isn't a single-channel guest (QLH5 sV,
+	// AB); not an external app (SM2u x$); a bot user; not Salesforce's
+	// (ooKM y2 needs slackforce_seamless_block_app_membership, which the
+	// account isn't assigned); and with requiresInvitableChannel, a
+	// channel to add it to (bD9l U3)
+	selfRestricted, selfUltra := pfRestriction(h, ca.Self().ID)
+	blocked := selfUltra
+	if c.AppType == "xoxa" {
+		blocked = selfRestricted
+	}
+	f.canAdd = c.Active && !blocked && !c.External && app != "" && (!f.parity || ca.HasAppInvitableChannel(app))
+	if f.current != "" && app != "" {
+		f.canInviteCurrent = ca.CanInviteAppTo(f.current, app)
+		f.membership = v.membership(ca, f.current, app)
+	}
+	return f
+}
+
+// membership is sBq1 Sv: the cached membership of app in ch, asked for
+// (getChannelMembershipInfoForUsers: edge channels/membership) when
+// there's none. The DM with the app counts it a member
+// (getCachedChannelMembershipInfoForUser).
+func (v *AppDetailsView) membership(c *core.App, ch, app string) int {
+	if cv, ok := c.Conv(ch); ok && cv.Kind == "im" && cv.User == app {
+		return adMemberMember
+	}
+	key := ch + "/" + app
+	if v.memCh == key {
+		return v.memState
+	}
+	if v.memAsked == key {
+		return adMemberUnknown
+	}
+	v.memAsked = key
+	h := v.h
+	run(h, func(ctx context.Context) (map[string]bool, error) {
+		return c.ChannelMembership(ctx, ch, []string{app})
+	}, func(m map[string]bool, err error) {
+		if v.memAsked != key {
+			return
+		}
+		st := adMemberNonMember
+		if err != nil {
+			st = adMemberNone // no answer: the button falls back to Message / Open App
+		} else if m[app] {
+			st = adMemberMember
+		}
+		v.memCh, v.memState = key, st
+		h.Invalidate()
+	})
+	return adMemberUnknown
+}
+
 // mainAction is the main button's onClick (AppDetails aT): Message opens
 // the DM's Messages tab; Open App the App Home's Home tab, or About when
-// the app has no home tab (flexpane_content_parity).
+// the app has no home tab (flexpane_content_parity); Add to Channel
+// (flexpane_content_parity) opens AddAgentToChannelsModal with the
+// current channel picked.
 func (v *AppDetailsView) mainAction(c core.AppCard) {
 	if c.AppUserID == "" {
 		return
 	}
+	f := v.facts(c)
+	switch adPrimary(f) {
+	case adMainLoading:
+		return
+	case adMainAddToChannel: // aF: openAddAgentToChannelsDialog
+		OpenAddAgentToChannels(v.h, c.AppUserID, f.prefill())
+		return
+	}
 	tab := "home"
 	switch {
-	case adOffersMessage(c):
+	case f.offersMessage:
 		tab = "messages"
 	case !c.HomeTab:
 		tab = "about"
@@ -244,16 +411,20 @@ func (v *AppDetailsView) overflow(c core.AppCard) []MenuItem {
 	if h.Core() != nil {
 		self = h.Core().Self()
 	}
-	msg := adOffersMessage(c)
+	f := v.facts(c)
+	main := adPrimary(f)
 	var out []MenuItem
 	sep := func() {
 		if n := len(out); n > 0 && !out[n-1].Separator {
 			out = append(out, MenuItem{Separator: true})
 		}
 	}
-	// navigation: the main action is Message or Open App, so only App home
-	// is left over (offersAppHome: home_tab_enabled)
-	if msg && c.HomeTab {
+	// navigation: Message and App home unless the main button is that
+	// action (K && !ea.includes(Message); H && k && !ea.includes(OpenApp))
+	if f.offersMessage && main != adMainMessage {
+		out = append(out, MenuItem{Label: "Message", Icon: "message", Do: func() { v.openTab(c, "messages") }})
+	}
+	if f.offersAppHome && c.AppUserID != "" && main != adMainOpenApp {
 		out = append(out, MenuItem{Label: "App home", Icon: "home", Do: func() { v.openTab(c, "home") }})
 	}
 	sep()
@@ -274,8 +445,13 @@ func (v *AppDetailsView) overflow(c core.AppCard) []MenuItem {
 		out = append(out, MenuItem{Label: "Slash commands", Icon: "slash", Sub: sub})
 	}
 	sep()
-	if c.AppUserID != "" && c.Active && !c.External && !self.Guest && !c.Workflow {
-		app := c.AppUserID
+	switch app := c.AppUserID; {
+	case f.parity: // ez: canAddToChannel, not the main button; onAddToChannel
+		if f.canAdd && main != adMainAddToChannel {
+			prefill := f.prefill()
+			out = append(out, MenuItem{Label: "Add to channel", Icon: "channel", Do: func() { OpenAddAgentToChannels(h, app, prefill) }})
+		}
+	case app != "" && c.Active && !c.External && !self.Guest && !c.Workflow: // openInviteMemberToChannelDialog
 		out = append(out, MenuItem{Label: "Add to channel", Icon: "channel", Do: func() { pfOpenInviteToChannel(h, app) }})
 	}
 	if c.AppUserID != "" {
@@ -472,13 +648,21 @@ func (v *AppDetailsView) header(gtx layout.Context, th *theme.Theme, cl *Colors,
 	if len(items) > 0 {
 		moreW = bh36 + dp(gtx, 8)
 	}
+	main := adPrimary(v.facts(c))
 	label, ic := "Open App", "apps"
-	if adOffersMessage(c) {
+	switch main {
+	case adMainMessage:
 		label, ic = "Message", "message"
+	case adMainAddToChannel: // a8
+		label, ic = "Add to Channel", "plus"
 	}
 	if c.AppUserID != "" {
 		mw := maxInt(bh36, w-moreW)
 		at(gtx, image.Pt(0, y), func(gtx layout.Context) layout.Dimensions {
+			if main == adMainLoading { // ne: .buttonSkeleton (36px, radius 8), aria-busy
+				rrect(gtx, image.Rect(0, 0, mw, bh36), dp(gtx, 8), cl.Selected)
+				return layout.Dimensions{Size: image.Pt(mw, bh36)}
+			}
 			return pfBtn(gtx, th, BtnMedium, pfBtnSpec{c: &v.mainBtn, label: label, lead: ic}, mw)
 		})
 	}
@@ -531,11 +715,14 @@ func adGlass() (paint.ImageOp, bool) {
 // of the 128px image (the 100×68 SVG fit into it), the title and the
 // message.
 func (v *AppDetailsView) notFound(gtx layout.Context, th *theme.Theme, cl *Colors, w, h int) layout.Dimensions {
+	return notFoundBox(gtx, th, cl, w, h, "App not found", "The app may have been uninstalled or you do not have permission to view it.")
+}
+
+// notFoundBox lays AppNotFound's column out w×h.
+func notFoundBox(gtx layout.Context, th *theme.Theme, cl *Colors, w, h int, title, msg string) layout.Dimensions {
 	pad := dp(gtx, 16)
 	iw := maxInt(1, w-2*pad)
 	box := dp(gtx, 128)
-	title := "App not found"
-	msg := "The app may have been uninstalled or you do not have permission to view it."
 	tc, td := record(loose(gtx, image.Pt(iw, 1<<20)), func(gtx layout.Context) layout.Dimensions {
 		return paraCenteredW(gtx, th, 18, 24, theme.Black, cl.Fg, title, iw)
 	})

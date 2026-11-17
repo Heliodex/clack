@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/some-du6e/clack/internal/applog"
@@ -16,6 +19,7 @@ import (
 	"github.com/some-du6e/clack/internal/taut"
 	"github.com/some-du6e/clack/internal/ui/openurl"
 	"github.com/some-du6e/clack/internal/ui/popups"
+	"github.com/some-du6e/clack/internal/ui/uiguard"
 	"github.com/some-du6e/clack/internal/ui/uipref"
 )
 
@@ -33,6 +37,10 @@ type backend struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 	unsub   func()
+	// people: the viewer and the partners and members of the model's
+	// DMs, app DMs and group DMs (apply), the people handle's presence
+	// and profile changes can show; the event goroutine reads it (wants)
+	people atomic.Pointer[map[string]bool]
 
 	selfID string
 	domain string
@@ -44,6 +52,10 @@ type backend struct {
 	// extStale marks ext entries refreshExt wants looked up again (their
 	// copy shows meanwhile).
 	extStale map[string]bool
+	// extFailed marks conversations ResolveConv couldn't look up (offline,
+	// channel_not_found): their membership stays unknown, and footerFor
+	// stops holding the composer back for them.
+	extFailed map[string]bool
 
 	// unsent drafts (drafts.list, refreshed on "draft" events), UI goroutine
 	// only: Slack's "✎ N" on Drafts & sent and the pencil on channel rows.
@@ -56,7 +68,14 @@ type backend struct {
 	chanDrafts map[string][]core.Draft
 
 	tabCache map[string][]chTab
-	tabsDone map[string]bool // opened() finished for the channel (the header is complete; reveal.go)
+	tabsDone map[string]bool // the header shows what there is: opened() finished, or the header cache filled it (reveal.go)
+	// headerReads is what this session's header reads of each
+	// conversation brought (opened): whether one answered every part (the
+	// header cache can't be newer then), the last tabs read and the
+	// membership it saw. A read that failed or came back partial before
+	// the header cache loaded leaves the cache to fill the gaps when it
+	// does (headerFromCache). UI goroutine only.
+	headerReads map[string]headerRead
 	// pluginsReady closes when the plugins enabled at start have started
 	// (any goroutine may wait on it)
 	pluginsReady chan struct{}
@@ -76,10 +95,26 @@ type backend struct {
 
 	snapMu      sync.Mutex
 	snapPending bool
+	snapSeq     uint64 // the core.Snapshot.Seq applied last (apply skips older)
 
-	booted    time.Time
+	booted time.Time // Boot's answers are applied
+	// warmAt is when the boot data's sidebar was applied (a warm start:
+	// core.WarmSnapshot), before Boot answered; the boot placeholder lifts
+	// on it as on booted (reveal.go)
+	warmAt    time.Time
 	onSignOut func()
 	app       *App
+}
+
+// A core call that waits for Boot on the UI goroutine freezes the window
+// until Slack answers (a launch restored to Activity painted nothing for
+// 2.3 s, 2026-11-15): uiguard logs it and records it for the tests
+// (TestStartupStatesNeverBlock, TestUINeverWaitsForBoot). Core logs every
+// wait over 50 ms with its caller too (warmboot.go).
+func init() {
+	core.SetBootWaitHook(func(method, caller string) {
+		uiguard.OffUI("core." + method + " waiting for boot (" + caller + ")")
+	})
 }
 
 // NewBackend wraps a core service. cacheDir is unused: the account's cache
@@ -123,6 +158,9 @@ func (b *backend) start(a *App) {
 	b.unsub = unsub
 	go func() {
 		for ev := range ch {
+			if !b.wants(ev) {
+				continue
+			}
 			ev := ev
 			a.Post(func() { b.handle(a, ev) })
 		}
@@ -140,13 +178,44 @@ func (b *backend) start(a *App) {
 	// "booted"), Block Kit, the restored channel's header (tabs, bookmarks,
 	// member count and facepile) and the drafts' sidebar markers. The
 	// window stays covered until they're in (reveal.go).
-	b.startTautAsync(a)
+	if a.inert {
+		// the introduction's preview renderer: no plugin system at all (no
+		// Taut or Slick runtime, plugin config, storage or slots)
+		b.pluginsOnce.Do(func() { close(b.pluginsReady) })
+	} else {
+		b.startTautAsync(a)
+	}
 	b.startBlockkit(a)
-	go a.settlePluginSlots(b) // release reserved plugin slots, save the learned ones
+	if !a.inert {
+		go a.settlePluginSlots(b) // release reserved plugin slots, save the learned ones
+	}
 	if ch := a.router.Current().Channel(); ch != "" {
 		b.opened(ch)
 	}
 	b.loadDrafts(a)
+	// A warm start renders from the boot data, as Slack renders from its
+	// persisted store, while Boot's calls are still out (core
+	// warmboot.go): the sidebar, and the restored channel's header from
+	// the header cache. Boot's answers replace them below.
+	go func() {
+		snap, warm := b.core.WarmSnapshot() // the disk reads only
+		a.Post(func() {
+			if a.data != b || b.ctx.Err() != nil {
+				return // signed out or switched meanwhile
+			}
+			if warm && b.booted.IsZero() {
+				b.apply(a, snap)
+				b.warmAt = time.Now()
+				applog.Mark("sidebar-cached", fmt.Sprintf("%d convs", len(snap.Convs)))
+				if a.router.Current() == "" {
+					a.openDefault()
+				}
+			}
+			if ch := a.router.Current().Channel(); ch != "" {
+				b.headerFromCache(ch)
+			}
+		})
+	}()
 	go func() {
 		t0 := time.Now()
 		if err := b.core.Boot(b.ctx); err != nil {
@@ -173,6 +242,7 @@ func (b *backend) start(a *App) {
 				a.slickRoute(a.router.Current())
 			}
 			b.maybePresencePrompt(a)
+			b.a11yNewUserDefaults(a) // a11y_defaults.go
 		})
 	}()
 }
@@ -289,6 +359,9 @@ func (b *backend) stop() <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		// the next warm start's sidebar and headers first: the window's
+		// close waits only so long, and plugins' stop hooks can be slow
+		b.core.SaveWarm()
 		// a section collapse still in its 3 s debounce goes out now
 		// (flushPendingChannelSectionCollapsedSync on teardown)
 		b.core.FlushSectionCollapsed()
@@ -301,6 +374,7 @@ func (b *backend) stop() <-chan struct{} {
 // resnapshot rebuilds the model off the UI goroutine (sidebar_changed,
 // resync), coalescing bursts.
 func (b *backend) resnapshot(a *App) {
+	b.core.InvalidateSnapshot() // RecentSnapshot's readers (the huddle channels, a draft) see it too
 	b.snapMu.Lock()
 	if b.snapPending {
 		b.snapMu.Unlock()
@@ -313,13 +387,25 @@ func (b *backend) resnapshot(a *App) {
 		b.snapMu.Lock()
 		b.snapPending = false
 		b.snapMu.Unlock()
-		snap := b.core.Snapshot()
+		// before the sidebar's data is in there is nothing to show (a cold
+		// start's Boot applies its own snapshot when it ends); from then on
+		// (a warm start's boot data) what the store holds now, so a change
+		// made before Boot finished shows at once
+		<-b.core.DataReady()
+		snap := b.core.SnapshotNow()
 		a.Post(func() { b.apply(a, snap) })
 	}()
 }
 
-// apply replaces the model from a snapshot.
+// apply replaces the model from a snapshot, unless it is older than the
+// one applied last (core.Snapshot.Seq: snapshots built on several
+// goroutines, the boot's, a resnapshot's, a warm start's, can land out of
+// order).
 func (b *backend) apply(a *App, s core.Snapshot) {
+	if s.Seq != 0 && s.Seq < b.snapSeq {
+		return
+	}
+	b.snapSeq = max(b.snapSeq, s.Seq)
 	m := &b.m
 	a.applyAccountPrefs(s.Prefs)
 	uipref.Set(b.core.Prefs())
@@ -342,6 +428,7 @@ func (b *backend) apply(a *App, s core.Snapshot) {
 			continue
 		}
 		ci := &convInfo{ID: c.ID, Name: c.Name, Kind: c.Kind, User: c.User, Topic: c.Topic,
+			NoDMsBadge: c.NoDMsBadge, NoDMsCount: c.NoDMsCount, BotDM: c.BotDM,
 			NumMembers: c.NumMembers, Members: c.Members, Muted: c.Muted, TopicSpans: firstSpans(c.TopicDoc),
 			Archived: c.IsArchived, Preview: c.Preview, Purpose: c.Purpose,
 			Code: c.Code, CodeStatus: c.CodeStatus, AgentName: c.AgentName,
@@ -379,7 +466,10 @@ func (b *backend) apply(a *App, s core.Snapshot) {
 			}
 		}
 		if c.Kind == "mpim" {
-			ci.Name = b.mpimName(c, s.Self.ID)
+			// raw (no hit, nothing asked for): every group DM is here,
+			// closed ones too; core's snapshot read the members of those
+			// the sidebar lists through getMemberById (sidebarUsers)
+			ci.Name = b.mpimNameBy(c, s.Self.ID, b.core.RawUser)
 		}
 		if cnt, ok := s.Counts[c.ID]; ok {
 			ci.Unread, ci.Mentions, ci.LastRead, ci.Latest = cnt.Unread, cnt.Mentions, cnt.LastRead, cnt.Latest
@@ -387,6 +477,7 @@ func (b *backend) apply(a *App, s core.Snapshot) {
 		convs[c.ID] = ci
 	}
 	m.Convs = convs
+	b.notePeople()
 	m.FilterNames = s.FilterNames
 	m.Sections = m.Sections[:0]
 	for _, sec := range s.Sections {
@@ -456,6 +547,11 @@ func defaultSectionName(t string) string {
 }
 
 func (b *backend) mpimName(c *core.Conv, self string) string {
+	return b.mpimNameBy(c, self, b.core.User)
+}
+
+// mpimNameBy is mpimName reading the members with user.
+func (b *backend) mpimNameBy(c *core.Conv, self string, user func(string) (core.User, bool)) string {
 	if n, ok := b.core.MpdmCustomName(c.ID); ok { // mpdm_naming (core/mpdm_name.go)
 		return n
 	}
@@ -464,7 +560,7 @@ func (b *backend) mpimName(c *core.Conv, self string) string {
 		if id == self {
 			continue
 		}
-		if u, ok := b.core.User(id); ok && u.Name != "" {
+		if u, ok := user(id); ok && u.Name != "" {
 			names = append(names, u.Name)
 		}
 	}
@@ -474,16 +570,42 @@ func (b *backend) mpimName(c *core.Conv, self string) string {
 	return strings.Join(names, ", ")
 }
 
-// activityBadgeMoved reports whether core's Activity badge differs from
-// the rail's (recount then picks it up).
+// activityBadgeMoved reports whether a badge core keeps moved without any
+// conversation's count changing (recount then picks it up): the Activity
+// badge and its dot (activity_v2 under the inbox, channel_badges and the
+// alerts without it), Home's activity_v2 dm count and the channel_badges'
+// part of the app badge.
 func (b *backend) activityBadgeMoved() bool {
-	return b.m.Rail.ActivityInbox && b.core != nil && b.core.ActivityBadgeCount() != b.m.ActivityCount
+	if b.core == nil {
+		return false
+	}
+	m := &b.m
+	c, _ := b.core.ActivityTabCounts()
+	return b.core.ActivityBadgeCount() != m.ActivityCount || b.core.ActivityDot() != m.ActivityDot ||
+		b.core.ChannelBadgeHighlights() != m.ChannelHighlights || c[1] != m.ActivityDMs
 }
 
-// recount derives the rail badges from conv counts.
+// recount derives the rail badges from conv counts and core's badges.
+//
+// The DMs tab's are Slack's (core rail.go DMsBadge): muted conversations
+// count nowhere (siMV), an unread DM is its mention count or 1 (ZdmU), and
+// the IMs the DMs page leaves out stay out of the tab's highlights (rHEx
+// dmsBadgeCount) and, a bot's, out of its unread conversations (6Z4k Sm).
+// Clack summed every unread DM into the tab, so the Slack system user's
+// DM (USLACK, "Slack") and Slackbot's drew a count the DMs page had no
+// row for (Karim, 2026-11-16). They still make something unread
+// (DMUnread). The app badge's own highlights (HomeCount) leave the bot
+// DMs out too (ZVw+ getTotalUnreadHighlights skips DUy0 G's; an app's DM
+// comes back only through the server's channel_badges app_dms, which core
+// adds without the inbox: AppBadgeCount).
+//
+// The Activity tab's count is core's (ActivityBadgeCount): activity_v2
+// under the inbox, channel_badges and the alerts without it (3x6A
+// getActivityBadgeCount), not the channels' mentions.
 func (b *backend) recount() {
 	m := &b.m
-	m.DMCount, m.DMUnread, m.HomeCount, m.HomeUnread, m.ActivityCount = 0, false, 0, false, 0
+	m.DMUnread, m.DMHighlights, m.DMUnreadConvs, m.HomeCount, m.HomeUnread = false, 0, 0, 0, false
+	m.ActivityCount, m.ActivityDot, m.ActivityDMs, m.ChannelHighlights = 0, false, 0, 0
 	for _, c := range m.Convs {
 		if c.Muted {
 			continue
@@ -491,23 +613,30 @@ func (b *backend) recount() {
 		switch c.Kind {
 		case "im", "mpim", "app":
 			if c.Unread || c.Mentions > 0 {
+				n := max(c.Mentions, 1)
 				m.DMUnread = true
-				m.DMCount += max(c.Mentions, 1)
+				if !c.BotDM {
+					m.HomeCount += n
+				}
+				if !c.NoDMsBadge {
+					m.DMHighlights += n
+				}
+				if !c.NoDMsCount {
+					m.DMUnreadConvs++
+				}
 			}
 		default:
-			m.HomeCount += c.Mentions
-			m.ActivityCount += c.Mentions
 			if c.Unread {
 				m.HomeUnread = true
 			}
 		}
 	}
-	m.HomeCount += m.DMCount
-	if m.Rail.ActivityInbox && b.core != nil {
-		// Slack's rail reads activity_v2 under activity_inbox, not the
-		// channels' mentions: thread replies and @channel count there too
-		// (core ActivityBadgeCount)
+	if b.core != nil {
 		m.ActivityCount = b.core.ActivityBadgeCount()
+		m.ActivityDot = b.core.ActivityDot()
+		m.ChannelHighlights = b.core.ChannelBadgeHighlights()
+		c, _ := b.core.ActivityTabCounts()
+		m.ActivityDMs = c[1]
 	}
 	if b.app != nil {
 		b.app.updateDock()
@@ -607,21 +736,38 @@ func (b *backend) handle(a *App, ev core.Event) {
 		if ev.User != nil {
 			if ev.User.ID == b.selfID {
 				m.SelfName, m.SelfAvatar = ev.User.Name, ev.User.Avatar
+				changed = true
 			}
 			for _, c := range m.Convs {
-				if c.Kind == "im" || c.Kind == "app" {
-					if c.User == ev.User.ID {
-						c.Avatar, c.Name, c.StatusEmoji = ev.User.Avatar, ev.User.Name, ev.User.StatusEmojiURL
-					}
+				switch {
+				case (c.Kind == "im" || c.Kind == "app") && c.User == ev.User.ID:
+					c.Avatar, c.Name, c.StatusEmoji = ev.User.Avatar, ev.User.Name, ev.User.StatusEmojiURL
+					changed = true
+				case c.Kind == "mpim" && contains(c.Members, ev.User.ID):
+					changed = true // its name lists its members
 				}
 			}
-			changed = true
 		}
 	case "conv", "conv_removed", "sidebar_changed", "resync", "team": // "prefs" is handled above (it resnapshots too)
 		if ev.Type == "conv_removed" && ev.Channel != "" {
 			b.forgetExt(ev.Channel) // left: a preview again, not the member it resolved as
 		}
+		if ev.Type == "conv" && ev.Channel != "" {
+			b.refreshExt(ev.Channel) // a non-member channel looked up again (renamed, unarchived): its header and footer
+		}
 		b.resnapshot(a)
+	case "member_count":
+		// users/counts answered after the page showed (core History's side
+		// read): the header draws the count from the row, so set it there
+		// (no snapshot, and no sidebar rebuild, for one number)
+		if ev.Conv != nil && ev.Conv.NumMembers > 0 {
+			for _, c := range []*convInfo{m.Convs[ev.Channel], b.ext[ev.Channel]} {
+				if c != nil && c.NumMembers != ev.Conv.NumMembers {
+					c.NumMembers = ev.Conv.NumMembers
+					a.Invalidate()
+				}
+			}
+		}
 	case "auth_failed":
 		// core stopped all traffic on a dead session: back to sign-in
 		a.sessionEnded()
@@ -668,6 +814,71 @@ func (b *backend) handle(a *App, ev core.Event) {
 		m.version++
 		a.Invalidate()
 	}
+}
+
+// wants reports whether handle does anything with ev (the event
+// goroutine). Each Post draws a frame, and a busy workspace's socket
+// brings typing, reactions, new emoji, presence and profile changes about
+// conversations and people the window doesn't show, many a second (Karim
+// 2026-11-14: Hack Club's, while Clack sat idle): handle only logs typing,
+// leaves updates other than a settled stream to the message lists, never
+// reads new emoji, and changes the model for presence and profiles of the
+// viewer and DM people only. The lists' hub, the composer and the views
+// follow the events they draw on their own.
+func (b *backend) wants(ev core.Event) bool {
+	switch ev.Type {
+	case "typing":
+		return os.Getenv("CLACK_TYPINGLOG") != ""
+	case "update":
+		return ev.StreamDone
+	case "emoji_changed", "hydrated": // hydrated: start's WarmSnapshot goroutine applies the boot data
+		return false
+	case "presence":
+		return b.shows(ev.UserID) || b.shows(ev.Users...)
+	case "user":
+		id := ev.UserID
+		if ev.User != nil {
+			id = ev.User.ID
+		}
+		return b.shows(id)
+	}
+	return true
+}
+
+// shows reports whether any of ids is in people (any goroutine); before
+// the first model, everyone is.
+func (b *backend) shows(ids ...string) bool {
+	p := b.people.Load()
+	if p == nil {
+		return true
+	}
+	for _, id := range ids {
+		if id != "" && (*p)[id] {
+			return true
+		}
+	}
+	return false
+}
+
+// notePeople rebuilds people from the model (UI goroutine).
+func (b *backend) notePeople() {
+	p := map[string]bool{}
+	if b.selfID != "" {
+		p[b.selfID] = true
+	}
+	for _, c := range b.m.Convs {
+		switch c.Kind {
+		case "im", "app":
+			if c.User != "" {
+				p[c.User] = true
+			}
+		case "mpim":
+			for _, u := range c.Members {
+				p[u] = true
+			}
+		}
+	}
+	b.people.Store(&p)
 }
 
 // maybeNotify is maybeShowNotification for a message (or a settled
@@ -787,20 +998,22 @@ func contains(s []string, v string) bool {
 
 // ---- per-channel side data (tabs, facepile) ----
 
-// opened is called when a conversation becomes current: fetch its
-// bookmarks/pins (tabs) and member facepile in the background.
+// opened is called when a conversation becomes current: its header's
+// reads (the tab bar with the folder tabs' bookmarks, the member facepile
+// and count) go out in the background. A header this session hasn't read
+// shows the header cache's copy at once (core header_cache.go, kept on
+// disk across starts) while the reads revalidate it, and reads that bring
+// the same header change nothing on screen.
 func (b *backend) opened(ch string) {
 	if t, ok := b.fetched[ch]; ok && time.Since(t) < 2*time.Minute {
 		return
 	}
 	b.fetched[ch] = time.Now()
+	b.headerFromCache(ch)
 	a := b.app
 	go func() {
 		ctx, cancel := context.WithTimeout(b.ctx, 20*time.Second)
 		defer cancel()
-		// Slack's tab bar (core.Tabs: canvases, lists, bookmarks, files…).
-		var tabs []chTab
-		var bms []core.Bookmark
 		// The header's three reads at once (they used to go one after
 		// another: three round trips before the header was complete).
 		// Members needs the kind: the sidebar's, else the id's.
@@ -834,26 +1047,15 @@ func (b *backend) opened(ch string) {
 		if err != nil {
 			log.Printf("ui: tabs %s: %v", ch, err)
 		}
-		for _, t := range ts {
-			if t.Type == "messages" {
-				continue
-			}
-			label := t.Title
-			if label == "" {
-				label = t.Label
-			}
-			icon := tabIcon(t.Type)
-			if t.Deleted {
-				icon = "trash"
-			}
-			if label == "" {
-				continue
-			}
-			tabs = append(tabs, chTab{key: "tab:" + t.ID, label: label, icon: icon, typ: t.Type, fileID: t.FileID, unread: t.Unread,
-				folder: t.FolderBookmarkID, appID: t.AppID,
-				spans: tabLabelSpans(label, b.core.Emoji), defaultView: t.DefaultView, viewName: t.ViewName, labeled: t.Label != "", rawLabel: t.Label})
-			bms = append(bms, t.Bookmarks...)
+		// Slack's tab bar (core.Tabs: canvases, lists, bookmarks, files…).
+		// A tab whose file or bookmarks read failed keeps what the last
+		// good read had (the header cache: this session's or the disk's).
+		if prev, ok := b.core.CachedHeader(ch); ok && err == nil {
+			ts = mergeTabReads(ts, prev.Tabs)
 		}
+		complete := err == nil && tabsComplete(ts)
+		notMember := ierr == nil && !info.IsMember
+		tabs, bms := b.tabsOf(ts, notMember)
 		var members []string
 		if tried {
 			log.Printf("ui: members %s: %d err=%v", ch, len(us), merr)
@@ -872,25 +1074,49 @@ func (b *backend) opened(ch string) {
 		if a == nil {
 			return
 		}
-		if ierr == nil && !info.IsMember {
-			// Slack's tab bar marks no canvas unread in a channel you
-			// aren't in (C08E083LZ9A's "Untitled", 2026-11-08).
-			for i := range tabs {
-				tabs[i].unread = false
-			}
-		}
 		a.Post(func() {
-			a.keepTabSelection(ch, func() { b.tabCache[ch] = tabs })
-			b.bookmarks[ch] = bms
 			if b.tabsDone == nil {
 				b.tabsDone = map[string]bool{}
 			}
+			if b.headerReads == nil {
+				b.headerReads = map[string]headerRead{}
+			}
+			hr := b.headerReads[ch]
+			if err == nil {
+				hr.tabs = ts
+			}
+			if ierr == nil {
+				hr.notMember, hr.memberKnown = notMember, true
+			}
+			hr.complete = hr.complete || complete && ierr == nil
+			b.headerReads[ch] = hr
+			// a failed tab read keeps the bar shown (this session's or the
+			// cache's, the cache's also when it loads later); one that
+			// brings the same bar changes nothing
+			changed := !b.tabsDone[ch]
+			switch {
+			case err == nil:
+				if !reflect.DeepEqual(b.tabCache[ch], tabs) {
+					a.keepTabSelection(ch, func() { b.tabCache[ch] = tabs })
+					changed = true
+				}
+				if !reflect.DeepEqual(b.bookmarks[ch], bms) {
+					b.bookmarks[ch] = bms
+					changed = true
+				}
+			case !b.tabsDone[ch] && !b.headerFromCache(ch):
+				a.keepTabSelection(ch, func() { b.tabCache[ch] = nil })
+				b.bookmarks[ch] = nil
+			}
 			b.tabsDone[ch] = true
+			// the facepile, count and topic reach the screen through the
+			// conversation's row (applySide, below): a change there is
+			// what redraws
 			sd := b.sideOf(ch)
 			if ierr == nil && info.Conv.NumMembers > 0 {
 				sd.num = info.Conv.NumMembers
 			}
-			if ierr == nil && info.Conv.Topic != "" {
+			if ierr == nil && info.Conv.Topic != "" && sd.topic != info.Conv.Topic {
 				sd.topic, sd.spans = info.Conv.Topic, firstSpans(info.Conv.TopicDoc)
 			}
 			if len(members) > 0 {
@@ -905,11 +1131,163 @@ func (b *backend) opened(ch string) {
 			} else {
 				sd.fails = 0
 			}
-			b.applySide(b.m.conv(ch), false)
-			b.applySide(b.ext[ch], false)
-			a.Invalidate()
+			if complete && ierr == nil { // the next start's header (and this session's next open); never a partial read
+				b.core.SetCachedHeader(ch, core.ChannelHeader{Tabs: ts, NotMember: notMember, Members: sd.members, Num: sd.num})
+			}
+			// the read wins over a snapshot's count and topic (applySide),
+			// as before; only a change draws
+			for _, c := range []*convInfo{b.m.conv(ch), b.ext[ch]} {
+				if c == nil {
+					continue
+				}
+				n, ms, tp := c.NumMembers, c.Members, c.Topic
+				b.applySide(c, false)
+				if c.NumMembers != n || !slices.Equal(c.Members, ms) || c.Topic != tp {
+					changed = true
+				}
+			}
+			if changed {
+				a.Invalidate()
+			}
 		})
 	}()
+}
+
+// tabsOf is the tab bar a channel's core.Tabs read makes, and the folder
+// tabs' bookmarks. notMember: Slack's tab bar marks no canvas unread in a
+// channel you aren't in (C08E083LZ9A's "Untitled", 2026-11-08). Any
+// goroutine.
+func (b *backend) tabsOf(ts []core.Tab, notMember bool) ([]chTab, []core.Bookmark) {
+	var tabs []chTab
+	var bms []core.Bookmark
+	viewNames := b.core.Experiment("list_channel_tab_show_view_name_fe") == "on"
+	for _, t := range ts {
+		if t.Type == "messages" {
+			continue
+		}
+		label := t.Title
+		if label == "" {
+			label = t.Label
+		}
+		icon := tabIcon(t.Type)
+		if t.Deleted {
+			icon = "trash"
+		}
+		if label == "" {
+			continue
+		}
+		doc, emo, label, spans := docTab(t, label, tabSpans(t, label, b.core.Emoji), viewNames, b.core.Emoji) // tab_emoji_icon.go
+		tabs = append(tabs, chTab{key: "tab:" + t.ID, label: label, icon: icon, typ: t.Type, fileID: t.FileID, unread: t.Unread && !notMember,
+			folder: t.FolderBookmarkID, appID: t.AppID, doc: doc, emojiIcon: emo,
+			spans: spans, defaultView: t.DefaultView, viewName: t.ViewName, labeled: t.Label != "", rawLabel: t.Label})
+		bms = append(bms, t.Bookmarks...)
+	}
+	return tabs, bms
+}
+
+// mergeTabReads fills the parts of a tab read that failed (a file's title
+// and state, a folder's bookmarks: core.Tab's TitleUnknown and
+// BookmarksUnknown) from an earlier read of the same tab, where that read
+// had them.
+func mergeTabReads(ts, prev []core.Tab) []core.Tab {
+	var out []core.Tab
+	for i, t := range ts {
+		if !t.TitleUnknown && !t.BookmarksUnknown {
+			continue
+		}
+		for _, p := range prev {
+			if p.ID != t.ID {
+				continue
+			}
+			if out == nil {
+				out = append([]core.Tab(nil), ts...)
+			}
+			m := &out[i]
+			if t.TitleUnknown && !p.TitleUnknown && p.FileID == t.FileID {
+				m.Title, m.TitleSpans, m.FileTitle, m.Deleted, m.Unread, m.ViewName = p.Title, p.TitleSpans, p.FileTitle, p.Deleted, p.Unread, p.ViewName
+				m.TitleUnknown = false
+			}
+			if t.BookmarksUnknown && !p.BookmarksUnknown {
+				m.Bookmarks, m.BookmarksUnknown = p.Bookmarks, false
+			}
+			break
+		}
+	}
+	if out == nil {
+		return ts
+	}
+	return out
+}
+
+// tabsComplete reports whether every part of a tab read answered.
+func tabsComplete(ts []core.Tab) bool {
+	for _, t := range ts {
+		if t.TitleUnknown || t.BookmarksUnknown {
+			return false
+		}
+	}
+	return true
+}
+
+// headerFromCache shows ch's header as its last read left it (the header
+// cache: an earlier session's read on a warm start, or this session's)
+// until opened's reads revalidate it: the tab bar, the folder tabs'
+// bookmarks, the facepile and the member count. Not over a read of this
+// session that answered every part; over one that failed, or filling the
+// parts a partial one couldn't read (a read that ran before the header
+// cache loaded: an offline warm start). It reports whether it filled the
+// header. UI goroutine.
+func (b *backend) headerFromCache(ch string) bool {
+	hr := b.headerReads[ch]
+	if hr.complete || b.core == nil {
+		return false
+	}
+	h, ok := b.core.CachedHeader(ch)
+	if !ok {
+		return false
+	}
+	ts, notMember := h.Tabs, h.NotMember
+	if hr.tabs != nil { // this session's partial read: its known parts are newer
+		ts = mergeTabReads(hr.tabs, h.Tabs)
+	}
+	if hr.memberKnown {
+		notMember = hr.notMember
+	}
+	tabs, bms := b.tabsOf(ts, notMember)
+	if !reflect.DeepEqual(b.tabCache[ch], tabs) {
+		if b.app != nil {
+			b.app.keepTabSelection(ch, func() { b.tabCache[ch] = tabs })
+		} else {
+			b.tabCache[ch] = tabs
+		}
+	}
+	b.bookmarks[ch] = bms
+	if b.tabsDone == nil {
+		b.tabsDone = map[string]bool{}
+	}
+	b.tabsDone[ch] = true
+	sd := b.sideOf(ch)
+	if sd.num == 0 {
+		sd.num = h.Num
+	}
+	if len(sd.members) == 0 {
+		sd.members = h.Members
+	}
+	b.applySide(b.m.conv(ch), false)
+	b.applySide(b.ext[ch], false)
+	if b.app != nil {
+		b.app.Invalidate()
+	}
+	return true
+}
+
+// headerRead is what this session's header reads of a conversation
+// brought (backend.headerReads).
+type headerRead struct {
+	complete    bool       // a read answered every part
+	tabs        []core.Tab // the last tabs read that answered (nil: none did)
+	notMember   bool       // conversations.info: the viewer isn't in it (memberKnown)
+	memberKnown bool
 }
 
 // chSide is what opened() read for a conversation's header.
@@ -1038,7 +1416,20 @@ func (b *backend) resolved(ch string) *convInfo {
 		ctx, cancel := context.WithTimeout(b.ctx, 15*time.Second)
 		defer cancel()
 		c, ok := b.core.ResolveConv(ctx, ch)
-		if !ok || a == nil {
+		if a == nil {
+			return
+		}
+		if !ok {
+			a.Post(func() {
+				if b.extGen[ch] != gen {
+					return
+				}
+				if b.extFailed == nil {
+					b.extFailed = map[string]bool{}
+				}
+				b.extFailed[ch] = true // footerFor stops waiting on it (joinpane.go)
+				a.Invalidate()
+			})
 			return
 		}
 		ci := &convInfo{ID: c.ID, Name: c.Name, Kind: c.Kind, User: c.User, Topic: c.Topic, NumMembers: c.NumMembers,
@@ -1058,6 +1449,7 @@ func (b *backend) resolved(ch string) *convInfo {
 			}
 			b.applySide(ci, true) // opened()'s facepile, if it came first
 			b.ext[ch] = ci
+			delete(b.extFailed, ch)
 			a.Invalidate()
 		})
 	}()
@@ -1090,6 +1482,7 @@ func (b *backend) refreshExt(ch string) {
 func (b *backend) forgetExt(ch string) {
 	delete(b.ext, ch)
 	delete(b.extStale, ch)
+	delete(b.extFailed, ch)
 	if b.extGen == nil {
 		b.extGen = map[string]int{}
 	}

@@ -92,11 +92,22 @@ func TestFilesViewSectionsSidebar(t *testing.T) {
 	if got := menuLabels(sortBy.Sub); got != "Last viewed|Last updated|A-Z|Date added" || !sortBy.Sub[3].Checked {
 		t.Errorf("Sort by %q (Date added checked %v)", got, len(sortBy.Sub) == 4 && sortBy.Sub[3].Checked)
 	}
-	// Sort by A-Z: files.collections.update {collection, sort}
+	// Sort by A-Z: files.collections.update {collection, sort}. The client
+	// sets core's sort optimistically, so wait for the call to be *recorded*
+	// (not just core's sort) before reading it — under load the recording
+	// lagged the optimistic update and calls[len-1] indexed an empty slice.
 	sortBy.Sub[2].Do()
 	e.until(t, "the sort", func() bool { c, _ := h.Core().FileCollection(id); return c.Sort == core.CollectionSortAlpha })
-	calls := fs.FilesViewCalls()
-	if last := calls[len(calls)-1]; last.Method != "files.collections.update" || last.Args.Get("sort") != "alpha" || last.Args.Get("collection") != id {
+	var last fakeslack.FilesViewCall
+	e.until(t, "files.collections.update", func() bool {
+		calls := fs.FilesViewCalls()
+		if len(calls) == 0 {
+			return false
+		}
+		last = calls[len(calls)-1]
+		return last.Method == "files.collections.update"
+	})
+	if last.Args.Get("sort") != "alpha" || last.Args.Get("collection") != id {
 		t.Errorf("last call %+v", last)
 	}
 	// a header click collapses it (the client store only)

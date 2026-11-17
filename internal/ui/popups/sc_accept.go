@@ -109,8 +109,8 @@ func NewSCAcceptModal(h Host, o SCAcceptOpts) *SCAcceptModal {
 	c.ed.Submit = true
 	if a := h.Core(); a != nil {
 		select {
-		case <-a.Ready():
-			snap := a.Snapshot()
+		case <-a.DataReady():
+			snap := a.RecentSnapshot()
 			c.workspace = strings.TrimSpace(snap.Team.Name)
 			c.enterprise = snap.Self.EnterpriseID != ""
 		default:
@@ -147,6 +147,13 @@ func (c *SCAcceptModal) Dismissed() bool                             { return c.
 
 // Dismiss closes it.
 func (c *SCAcceptModal) Dismiss() { c.modal.Dismiss() }
+
+// KeptOpen, FocusHome and Close are its modal's: kept open while it
+// accepts, the window's layers give the focus back into it, a close past
+// that (Replay introduction).
+func (c *SCAcceptModal) KeptOpen() bool       { return c.modal.KeptOpen() }
+func (c *SCAcceptModal) FocusHome() event.Tag { return c.modal.FocusHome() }
+func (c *SCAcceptModal) Close()               { c.modal.Close() }
 
 // Step is the pane shown: "workspace", "name" or "privacy".
 func (c *SCAcceptModal) Step() string { return [...]string{"workspace", "name", "privacy"}[c.step] }
@@ -714,8 +721,8 @@ func scPlansURL(h Host, inviteID string) string {
 	host := "app.slack.com"
 	if a := h.Core(); a != nil {
 		select {
-		case <-a.Ready():
-			if d := a.Snapshot().Team.Domain; d != "" {
+		case <-a.DataReady():
+			if d := a.RecentSnapshot().Team.Domain; d != "" {
 				host = d + ".slack.com"
 			}
 		default:

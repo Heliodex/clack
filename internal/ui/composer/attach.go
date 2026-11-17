@@ -37,11 +37,10 @@ import (
 	"gioui.org/widget"
 	"gioui.org/x/explorer"
 	_ "golang.org/x/image/bmp"
-	xdraw "golang.org/x/image/draw"
-	_ "golang.org/x/image/webp"
 
 	"github.com/some-du6e/clack/internal/core"
 	"github.com/some-du6e/clack/internal/i18n"
+	"github.com/some-du6e/clack/internal/imgcache" // registers WebP for image.DecodeConfig
 	"github.com/some-du6e/clack/internal/localimg"
 	"github.com/some-du6e/clack/internal/ui/icons"
 	"github.com/some-du6e/clack/internal/ui/popups"
@@ -62,13 +61,18 @@ import (
 // file from a file manager onto the window can't be supported yet.
 
 const (
-	attMaxFileSize  = 1 << 30  // Slack's per-file upload limit (1 GB)
-	attMaxTotalSize = 1 << 30  // what one message may hold in memory
-	attMaxFiles     = 10       // Slack attaches at most 10 files to a message
-	attMaxPixels    = 80 << 20 // don't decode thumbnails of images above 80 MP
-	attChipH        = 62       // dp, chip height (and image thumbnail side)
-	attCardW        = 240      // dp, file card width
-	attRadius       = 12       // dp, chip corner radius
+	attMaxFileSize  = 1 << 30 // Slack's per-file upload limit (1 GB)
+	attMaxTotalSize = 1 << 30 // what one message may hold in memory
+	attMaxFiles     = 10      // Slack attaches at most 10 files to a message
+	// attMaxPixels: a thumbnail isn't decoded for an image claiming more
+	// than 80 MP. Under it the decode is still bounded by imgcache's
+	// decode memory (MaxDecode): a thumbnail that doesn't fit (an RGBA PNG
+	// past ~58 MP, a big progressive JPEG) degrades to the file chip, as an
+	// undecodable one does (makeThumb); the upload itself is unchanged.
+	attMaxPixels = 80 << 20
+	attChipH     = 62  // dp, chip height (and image thumbnail side)
+	attCardW     = 240 // dp, file card width
+	attRadius    = 12  // dp, chip corner radius
 )
 
 var (
@@ -620,18 +624,40 @@ func attThumbnail(data []byte, px int) (*image.RGBA, error) {
 	if cfg.Width <= 0 || cfg.Height <= 0 || int64(cfg.Width)*int64(cfg.Height) > attMaxPixels {
 		return nil, fmt.Errorf("image is %dx%d", cfg.Width, cfg.Height)
 	}
-	img, _, err := image.Decode(bytes.NewReader(data))
+	// The decode and the crop's scale charge what they allocate to a
+	// budget from imgcache's process-wide decode memory (a 1×1 WebP meta
+	// bomb passes the pixel check above; a progressive JPEG's coefficients
+	// don't show in it), with attMaxPixels as this surface's own thumbnail
+	// ceiling; one the decode memory is too busy for now is tried again
+	// until ctx is done.
+	ctx, cancel := context.WithTimeout(context.Background(), attThumbWait)
+	defer cancel()
+	var dst *image.RGBA
+	err = imgcache.WithBudget(ctx, func(bg *imgcache.Budget) error {
+		img, err := imgcache.DecodeBudget(data, attMaxPixels, attMaxPixels, bg)
+		if err != nil {
+			return err
+		}
+		b := img.Bounds()
+		s := min(b.Dx(), b.Dy())
+		sr := image.Rect(b.Min.X+(b.Dx()-s)/2, b.Min.Y+(b.Dy()-s)/2, 0, 0)
+		sr.Max = sr.Min.Add(image.Pt(s, s))
+		if err := imgcache.ChargeFunc(bg)(4 * int64(px) * int64(px)); err != nil {
+			return err
+		}
+		dst = image.NewRGBA(image.Rect(0, 0, px, px))
+		// x/image/draw's CatmullRom.Scale's pixels, a band at a time
+		return imgcache.ScaleInto(dst, img, sr, bg)
+	})
 	if err != nil {
 		return nil, err
 	}
-	b := img.Bounds()
-	s := min(b.Dx(), b.Dy())
-	sr := image.Rect(b.Min.X+(b.Dx()-s)/2, b.Min.Y+(b.Dy()-s)/2, 0, 0)
-	sr.Max = sr.Min.Add(image.Pt(s, s))
-	dst := image.NewRGBA(image.Rect(0, 0, px, px))
-	xdraw.CatmullRom.Scale(dst, dst.Bounds(), img, sr, xdraw.Src, nil)
 	return dst, nil
 }
+
+// attThumbWait is how long a thumbnail tries again while the decode memory
+// is busy (imgcache.ErrBusy) before the chip shows as a file card.
+const attThumbWait = time.Minute
 
 func (a *attachments) makeThumb(c *attChip, px int) {
 	img, err := attThumbnail(a.thumbBytes(c), px)
@@ -1002,20 +1028,25 @@ var (
 // PasteClipboardImage probes the system clipboard for an image (async) and
 // attaches it as "image.png", like Slack. Called on every Ctrl+V; it skips
 // office-app copies (rich text plus a rendered picture of it). Files copied
-// in Explorer (Windows) attach as those files.
-func (a *attachments) PasteClipboardImage() { a.pasteImage(false) }
+// in Explorer (Windows) and Finder (macOS) attach as those files. The
+// result says whether they did (nil when a paste's probe is still
+// running): then the paste inserts no text (filePaste).
+func (a *attachments) PasteClipboardImage() *filePaste { return a.pasteImage(false) }
 
-func (a *attachments) pasteImage(explicit bool) {
+func (a *attachments) pasteImage(explicit bool) *filePaste {
 	if !a.pasting.CompareAndSwap(false, true) {
-		return
+		return nil
 	}
+	fp := newFilePaste()
 	go func() {
 		defer a.pasting.Store(false)
+		defer fp.decide(false)
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		// Files copied in a file manager attach as themselves (Chromium
 		// hands them to the page as the paste's files).
 		if paths, err := attClipboardFiles(ctx); err == nil && len(paths) > 0 {
+			fp.decide(true)
 			a.addPaths(paths)
 			return
 		}
@@ -1023,6 +1054,9 @@ func (a *attachments) pasteImage(explicit bool) {
 		if err == nil && !strings.HasPrefix(http.DetectContentType(data), "image/") {
 			err = errAttNoClipImage
 		}
+		// a file too big to upload is still the paste's file (Slack
+		// rejects it after preventDefault)
+		fp.decide(err == nil || errors.Is(err, errAttTooBig))
 		if err != nil {
 			switch {
 			case errors.Is(err, errAttTooBig):
@@ -1034,6 +1068,7 @@ func (a *attachments) pasteImage(explicit bool) {
 		}
 		a.add(attPastedName(mime), data)
 	}()
+	return fp
 }
 
 // attClipImageTypes are the image targets we fetch, best first.

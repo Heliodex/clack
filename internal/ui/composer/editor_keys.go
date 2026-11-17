@@ -12,6 +12,7 @@ import (
 	"gioui.org/io/transfer"
 	"gioui.org/layout"
 
+	"github.com/some-du6e/clack/internal/ui/slackc"
 	"github.com/some-du6e/clack/internal/ui/uipref"
 )
 
@@ -109,6 +110,10 @@ func (e *Editor) command(gtx layout.Context, k key.Event) {
 			return
 		}
 		e.emit(EvCancel)
+		// in a plugin's layer the Escape goes on to it, as a DOM keydown
+		// bubbles on: a Popover's RichTextInput closes the Popover (the
+		// editor's Escape stays its own anywhere else)
+		slackc.PassEscape(gtx)
 	case key.NameTab:
 		e.tab(shift)
 	case key.NameDeleteBackward:
@@ -242,12 +247,12 @@ func (e *Editor) shortcut(gtx layout.Context, name key.Name, shift, alt bool) bo
 	case "V":
 		// Shift: paste and match style (plain text), like Slack.
 		e.plainPaste = shift
-		e.richRead = nil
+		e.richRead, e.filesRead = nil, nil
 		if !shift {
 			e.richRead = startClipHTML()
 		}
 		gtx.Execute(clipboard.ReadCmd{Tag: e})
-		e.emit(EvPasted)
+		e.emit(EvPasted) // the composer sets filesRead
 	case "Z":
 		switch {
 		case shift:

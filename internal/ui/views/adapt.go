@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gioui.org/op"
@@ -87,6 +88,7 @@ func (b *base) user(id string) (core.User, bool) {
 	} else if b.rec != nil && core.LooksLikeMemberID(id) && c.MissingMember(id) == core.MemberUnknown {
 		b.noteWait(id)
 	}
+	b.noteRead(id) // missing_member.go
 	return u, ok
 }
 
@@ -239,6 +241,33 @@ func (w *watcher) watch(h Host, match func(ev core.Event) bool) {
 			}
 		}
 	}()
+}
+
+// shownTracker tells a view's event goroutine whether the view is on
+// screen: the view marks the host's frame count as it draws (a host
+// without one counts as always on screen). A view's subscription outlives
+// its page, and one left behind redrew the window for every event about
+// it while another page showed (a busy workspace's socket: many a second).
+type shownTracker struct{ seen atomic.Uint64 }
+
+type frameCounter interface{ FrameSeq() uint64 }
+
+// mark notes that the view draws in the host's current frame (UI
+// goroutine, from Layout).
+func (s *shownTracker) mark(h Host) {
+	if fc, ok := h.(frameCounter); ok {
+		s.seen.Store(fc.FrameSeq())
+	}
+}
+
+// shown reports whether the view drew in the latest frame (or the one being
+// laid out); any goroutine.
+func (s *shownTracker) shown(h Host) bool {
+	fc, ok := h.(frameCounter)
+	if !ok {
+		return true
+	}
+	return s.seen.Load()+1 >= fc.FrameSeq()
 }
 
 // due reports (and clears) staleness at most once per minGap.

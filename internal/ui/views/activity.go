@@ -165,6 +165,9 @@ type actDesc struct {
 	// DM's member left out of its title. "names" listing one describes
 	// the row again (membersIn).
 	waits []string
+	// reads are all the members the description looked up: a "user"
+	// event for one describes the row again (activity_settle.go)
+	reads []string
 }
 
 type actRow struct {
@@ -236,6 +239,21 @@ type actRow struct {
 	actTag  struct{}
 	// where the hover bar went last (its top on the row, its right inset)
 	barY, barRight int
+	// The super narrow Dense row's borders this frame (the container's
+	// border-top unless --follows-divider; border-bottom unless --selected
+	// or --precedes-header), the Dense content box's middle (the hover
+	// bar's top 50%) and the parts' last layout.
+	snTop, snBottom bool
+	denseMid        int
+	dn              actDenseBox
+}
+
+// actDenseBox is a Dense row's last layout in px: the leading block's
+// width, the sender's room, the status and type icon, the message, the
+// location and the time (the "·" included on the super narrow second
+// line), the lines and the row's height.
+type actDenseBox struct {
+	lead, name, status, typeIcon, msg, loc, time, lines, h int
 }
 
 // Activity is the Activity view.
@@ -249,7 +267,13 @@ type Activity struct {
 	plusX int
 	seg   [2]widget.Clickable
 	dense bool
-	kebab widget.Clickable
+	// superNarrow is ActivityList's isSuperNarrowDense this frame (eH: the
+	// list's width under 625px; never in the peek, which has no column
+	// width): the list's --super_narrow_dense, the Dense row on two lines.
+	// denseLoc is --activity_single_line_location_width (actDenseLoc).
+	superNarrow bool
+	denseLoc    int
+	kebab       widget.Clickable
 
 	// Bulk selection (ActivityFilterBulkAction, activity_bulk.go): picked
 	// holds the selected item keys (P0K2 bulkItems), bulkMode is Custom
@@ -335,13 +359,14 @@ type Activity struct {
 	rows     map[string]*actRow
 	override map[string]bool // local read state: true = read, false = unread
 	cleared  map[string]bool
-	// hideRead holds the items already read when an Unreads load started:
-	// Slack's Unreads filter keeps items you read while it's on (until the
-	// filters change or the feed reloads) but doesn't bring back ones read
-	// before.
-	hideRead map[string]bool
-	notes    actNotes
-	patchOn  bool
+	// visSel is the opened row the latest rebuild kept under Unreads
+	// (actUnreadsHides): a new selection or none rebuilds the list.
+	visSel  string
+	notes   actNotes
+	patchOn bool
+	// shown: whether the page or its peek drew in the latest frame; its
+	// realtime watcher redraws only then (watchItems)
+	shown    shownTracker
 	wmu      sync.Mutex      // serializes core activity writes
 	listsReq map[string]bool // lists asked for so list rows can name their item
 	// densityReq: the saved layout was asked for (activity.views);
@@ -383,6 +408,7 @@ type Activity struct {
 
 	mode         actLoad
 	wasBusy      bool
+	loadedFrom   core.ActivityPage // the page the last load started from (settle)
 	paging       bool
 	pageCursor   string
 	failedCursor string
@@ -449,19 +475,40 @@ func (v *Activity) watchItems() {
 	go func() {
 		for ev := range ch {
 			if ev.Type == "typing" || ev.Type == "message" {
-				// the status column's typing indicator (rZx3 z8)
-				if v.typing.apply(ev, v.h.Core().Self().ID) {
+				// the status column's typing indicator (rZx3 z8), for the
+				// rows on screen
+				if v.typing.apply(ev, v.h.Core().Self().ID) && v.shown.shown(v.h) {
 					v.h.Invalidate()
 				}
+				continue
+			}
+			// Off screen the page takes realtime changes for its next
+			// draw without drawing now, one pending pass of each kind
+			// however many come (a busy workspace's socket)
+			shown := v.shown.shown(v.h)
+			if v.noteStale(ev) && shown { // a profile, conversation or team change (activity_settle.go)
+				v.h.Invalidate()
+			}
+			if ev.Type == "user" || ev.Type == "team" {
 				continue
 			}
 			if ev.Type == "conv" {
 				// channel_updated: an agent session's status (the rows'
 				// agent status) may have changed
 				v.notes.mu.Lock()
-				v.notes.fns = append(v.notes.fns, func() { v.dirty = true })
+				if !v.notes.dirtyQueued {
+					v.notes.dirtyQueued = true
+					v.notes.fns = append(v.notes.fns, func() {
+						v.notes.mu.Lock()
+						v.notes.dirtyQueued = false
+						v.notes.mu.Unlock()
+						v.dirty = true
+					})
+				}
 				v.notes.mu.Unlock()
-				v.h.Invalidate()
+				if shown {
+					v.h.Invalidate()
+				}
 				continue
 			}
 			if ev.Type == "names" {
@@ -475,12 +522,37 @@ func (v *Activity) watchItems() {
 				if len(ids) > 0 {
 					conv := actConvIDs(ids)
 					v.notes.mu.Lock()
-					if conv {
-						v.notes.fns = append(v.notes.fns, v.namesIn)
+					if conv && !v.notes.namesQueued {
+						v.notes.namesQueued = true
+						v.notes.fns = append(v.notes.fns, func() {
+							v.notes.mu.Lock()
+							v.notes.namesQueued = false
+							v.notes.mu.Unlock()
+							v.namesIn()
+						})
 					}
-					v.notes.fns = append(v.notes.fns, func() { v.membersIn(ids) })
+					if v.notes.members == nil {
+						v.notes.members = map[string]bool{}
+					}
+					if len(v.notes.members) == 0 {
+						v.notes.fns = append(v.notes.fns, func() {
+							v.notes.mu.Lock()
+							ids := make([]string, 0, len(v.notes.members))
+							for id := range v.notes.members {
+								ids = append(ids, id)
+							}
+							clear(v.notes.members)
+							v.notes.mu.Unlock()
+							v.membersIn(ids)
+						})
+					}
+					for _, id := range ids {
+						v.notes.members[id] = true
+					}
 					v.notes.mu.Unlock()
-					v.h.Invalidate()
+					if shown {
+						v.h.Invalidate()
+					}
 				}
 				continue
 			}
@@ -585,6 +657,7 @@ func (v *Activity) applyPatches() {
 
 // Layout draws the view.
 func (v *Activity) Layout(gtx C) D {
+	v.shown.mark(v.h)
 	v.frame()
 	v.watchItems()
 	v.loadDensity()
@@ -832,18 +905,18 @@ func actIntersect(a, b string) string {
 	return strings.Join(out, ",")
 }
 
-// settle runs once after each load finishes: rebuilds cached row text
-// and records a failed pagination cursor so it is not retried in a loop.
+// settle runs once after each load finishes: rebuilds the cached text of
+// the rows the answer changed (activity_settle.go) and records a failed
+// pagination cursor so it is not retried in a loop.
 func (v *Activity) settle() {
 	if !v.wasBusy || v.data.busy() {
 		return
 	}
 	v.wasBusy = false
-	for _, r := range v.rows {
-		r.built = false
-	}
+	page, _, err := v.data.get()
+	v.unbuildChanged(v.loadedFrom, page)
+	v.loadedFrom = core.ActivityPage{}
 	v.dirty = true
-	_, _, err := v.data.get()
 	v.offline = err != nil && actOffline(err)
 	if v.paging {
 		v.paging = false
@@ -859,7 +932,16 @@ func (v *Activity) load(mode actLoad) {
 	opts := core.ActivityOpts{View: "all", Types: types, Unread: v.unread.Value, Archived: v.showCleared, Limit: actLimit,
 		Priority: v.vip, SectionIDs: v.sections, ChannelIDs: v.channels, Mode: v.feedMode(),
 		ExcludeAutomations: v.exclAuto, AutomationsOnly: v.autoOnly}
+	// An earlier load whose answer landed but no frame has settled (the
+	// peek opened again off screen, an activity_invalidated reload that
+	// notes.drain runs before settle) is settled first, so the rows built
+	// before it see what it changed; one still out (this load cancels it)
+	// leaves loadedFrom as it was, the page the rows were built from.
+	v.settle()
 	old, _, _ := v.data.get()
+	if !v.wasBusy {
+		v.loadedFrom = old // settle compares the answer with it
+	}
 	if mode == actMore {
 		opts.Cursor = old.Next
 		v.pageCursor = old.Next
@@ -870,17 +952,14 @@ func (v *Activity) load(mode actLoad) {
 		v.failedCursor = ""
 		v.vis = v.vis[:0]
 		v.dirty = true
-		v.hideRead = nil
-		if opts.Unread {
-			v.hideRead = map[string]bool{}
-			for k, read := range v.override {
-				if read {
-					v.hideRead[k] = true
-				}
-			}
-		}
 	}
 	sticky := opts.Unread
+	unreadMarks := map[string]bool{} // pendingUnreadMarkKeys: rows you marked unread here
+	for k, read := range v.override {
+		if !read {
+			unreadMarks[k] = true
+		}
+	}
 	v.mode, v.paging, v.wasBusy = mode, mode == actMore, true
 	v.data.load(v.h, mode != actFresh, func(ctx context.Context) (core.ActivityPage, error) {
 		if none {
@@ -895,10 +974,11 @@ func (v *Activity) load(mode actLoad) {
 			return actAppend(old, p), nil
 		case actRefresh:
 			if sticky {
-				// Unreads: rows already shown stay until the filters change.
-				return actSticky(p, old), nil
+				// Unreads: the fresh unread page, plus the rows Slack keeps
+				// on a refresh (getItemsRetainedOnRefresh)
+				return actRetained(p, old, unreadMarks), nil
 			}
-			return actMerge(p, old), nil
+			return actMerge(p, old, opts.Mode == ""), nil // "": chrono_v1, newest first; the VIP sort isn't in time order
 		}
 		return p, nil
 	})
@@ -921,9 +1001,35 @@ func actAppend(old, p core.ActivityPage) core.ActivityPage {
 }
 
 // actMerge replaces the first page with fresh and keeps the older pages
-// already loaded, so a realtime refresh doesn't lose the scroll position.
-func actMerge(fresh, old core.ActivityPage) core.ActivityPage {
+// already loaded, so a refresh (realtime, the peek's) doesn't lose the
+// scroll position: the old rows after the one fresh ends with, in the old
+// list's order, and the old cursor. Where fresh ends is found by key, not
+// by time: the feed isn't always in time order (the VIP sort lists VIP
+// unreads first, then the rest by time), and a time cutoff dropped later
+// pages' rows while keeping the cursor past them. When the old list
+// doesn't hold fresh's last row (more new rows than a page), the later
+// pages go and the cursor is fresh's, so the next page continues right
+// after fresh with nothing skipped.
+//
+// In time order a row of the old first page that fresh doesn't hold is
+// gone (deleted, cleared): a row only moves up, with newer activity. Out
+// of it (timeOrder false: the VIP sort) a row can move down too: one the
+// viewer just read leaves the VIP unreads for the rest, a page further on,
+// possibly past the cursor. Then the later pages go and the cursor is
+// fresh's, so paging brings it back where it now belongs.
+func actMerge(fresh, old core.ActivityPage, timeOrder bool) core.ActivityPage {
 	if len(fresh.Items) == 0 || len(old.Items) <= len(fresh.Items) {
+		return fresh
+	}
+	lastKey := actKey(&fresh.Items[len(fresh.Items)-1])
+	end := -1
+	for i := range old.Items {
+		if actKey(&old.Items[i]) == lastKey {
+			end = i
+			break
+		}
+	}
+	if end < 0 {
 		return fresh
 	}
 	seen := make(map[string]bool, len(fresh.Items))
@@ -932,36 +1038,54 @@ func actMerge(fresh, old core.ActivityPage) core.ActivityPage {
 		seen[actKey(&fresh.Items[i])] = true
 		items = append(items, fresh.Items[i])
 	}
-	last := tsTime(fresh.Items[len(fresh.Items)-1].FeedTS)
-	for i := range old.Items {
-		it := &old.Items[i]
-		if !seen[actKey(it)] && tsTime(it.FeedTS).Before(last) {
+	if !timeOrder {
+		for i := 0; i < end; i++ {
+			if !seen[actKey(&old.Items[i])] { // moved down (or gone): page again from fresh
+				return fresh
+			}
+		}
+	}
+	for i := end + 1; i < len(old.Items); i++ {
+		if it := &old.Items[i]; !seen[actKey(it)] {
 			items = append(items, *it)
 		}
 	}
 	return core.ActivityPage{Items: items, Next: old.Next, Convs: actRefs(old.Convs, fresh.Convs)}
 }
 
-// actSticky is the Unreads refresh: the fresh unread page plus every row
-// already loaded (now read or not), newest first.
-func actSticky(fresh, old core.ActivityPage) core.ActivityPage {
+// actRetained is the Unreads refresh, P0K2's refreshItems upsert
+// (build c07ab895506f): the fresh unread page, then the rows loaded
+// before that getItemsRetainedOnRefresh keeps: newer than the page's
+// newest row, or marked unread here (pendingUnreadMarkKeys) and still
+// unread. The rest, read rows included, goes with the old list; its
+// cursor is the fresh page's.
+func actRetained(fresh, old core.ActivityPage, unreadMarks map[string]bool) core.ActivityPage {
+	newest := ""
+	for i := range fresh.Items {
+		if ts := fresh.Items[i].FeedTS; newest == "" || actTSLess(newest, ts) {
+			newest = ts
+		}
+	}
 	seen := make(map[string]bool, len(fresh.Items))
-	items := make([]core.ActivityItem, 0, len(old.Items)+len(fresh.Items))
+	items := make([]core.ActivityItem, 0, len(fresh.Items))
 	for i := range fresh.Items {
 		seen[actKey(&fresh.Items[i])] = true
 		items = append(items, fresh.Items[i])
 	}
 	for i := range old.Items {
-		if !seen[actKey(&old.Items[i])] {
-			items = append(items, old.Items[i])
+		it := &old.Items[i]
+		k := actKey(it)
+		if seen[k] {
+			continue
+		}
+		// unreadMarks holds the rows whose local state is unread (the
+		// store's isUnread after the optimistic mark)
+		if unreadMarks[k] || newest != "" && actTSLess(newest, it.FeedTS) {
+			items = append(items, *it)
 		}
 	}
 	sort.SliceStable(items, func(i, j int) bool { return actTSLess(items[j].FeedTS, items[i].FeedTS) })
-	next := fresh.Next
-	if len(old.Items) > len(fresh.Items) {
-		next = old.Next
-	}
-	return core.ActivityPage{Items: items, Next: next, Convs: actRefs(old.Convs, fresh.Convs)}
+	return core.ActivityPage{Items: items, Next: fresh.Next, Convs: actRefs(old.Convs, fresh.Convs)}
 }
 
 // actTSLess compares Slack timestamps ("1730000000.123456") numerically.
@@ -1088,8 +1212,8 @@ func (v *Activity) isUnread(it *core.ActivityItem, key string) bool {
 // yet (waits): the row is described again when "names" lists one.
 func (v *Activity) describe(it *core.ActivityItem, refs map[string]core.ConvRef) actDesc {
 	var d actDesc
-	waits := v.recording(func() { d = v.describeItem(it, refs) })
-	d.waits = waits
+	waits, reads := v.recordingReads(func() { d = v.describeItem(it, refs) })
+	d.waits, d.reads = waits, reads
 	return d
 }
 
@@ -1335,14 +1459,26 @@ func (v *Activity) rebuild(page *core.ActivityPage) {
 		order, split = v.actVIPOrder(page)
 	}
 	shown := 0
+	// Unreads (ActivityList selector Q): only the unread rows and the
+	// opened one; "Everything else" heads the first of its rows shown
+	v.visSel = v.unreadsSel()
+	elseAt := split
 	for n := range page.Items {
 		i := n
 		if order != nil {
 			i = order[n]
+		}
+		if v.actUnreadsHides(&page.Items[i]) {
+			if n == elseAt {
+				elseAt++
+			}
+			continue
+		}
+		if order != nil {
 			switch {
 			case split > 0 && n == 0:
 				v.vis = append(v.vis, actVisVIP)
-			case split > 0 && n == split:
+			case split > 0 && n == elseAt:
 				if xi {
 					// e0: a section_spacer before every header but the
 					// first (16px in the bordered-separators list)
@@ -1370,9 +1506,6 @@ func (v *Activity) rebuild(page *core.ActivityPage) {
 		if c, ok := v.cleared[key]; ok && c != v.showCleared {
 			continue
 		}
-		if v.unread.Value && v.hideRead[key] {
-			continue
-		}
 		if dm && !r.d.dm {
 			continue
 		}
@@ -1387,7 +1520,7 @@ func (v *Activity) rebuild(page *core.ActivityPage) {
 		// the first row at all (v).
 		if t := tsTime(it.FeedTS); !t.IsZero() && (lastDay.IsZero() || !sameDay(t, lastDay)) {
 			today, first := sameDay(t, now), shown == 0
-			boundary := split > 0 && n == split
+			boundary := split > 0 && n == elseAt
 			f := inbox && first && today
 			g := inVIP || boundary && (today || xi)
 			vv := xi && first && len(v.vis) == 0 && !today
@@ -1403,6 +1536,28 @@ func (v *Activity) rebuild(page *core.ActivityPage) {
 		v.vis = v.vis[:0]
 	}
 	v.visN, v.dirty = len(page.Items), false
+}
+
+// unreadsSel is the opened row's key while Unreads is on ("" otherwise),
+// the one read row its list keeps.
+func (v *Activity) unreadsSel() string {
+	if v.unread.Value && v.selOK {
+		return v.selKey
+	}
+	return ""
+}
+
+// actUnreadsHides reports whether the Unreads filter leaves it out: the
+// ActivityList selector Q (3x6A, build c07ab895506f) keeps, with
+// filterUnreadsSelected, only `selected?.key === e.key || e.isUnread`.
+// A row read here or elsewhere leaves Unreads at once unless it's the
+// one opened; the All list keeps every row.
+func (v *Activity) actUnreadsHides(it *core.ActivityItem) bool {
+	if !v.unread.Value {
+		return false
+	}
+	key := actKey(it)
+	return key != v.visSel && !v.isUnread(it, key)
 }
 
 // actVisVIP and actVisElse mark ActivitySectionHeader's "VIP unreads" and
@@ -1526,10 +1681,27 @@ func actAt(gtx C, x int, w W) D {
 	return w(g)
 }
 
+// actAtAs is actAt for the part of the bar Slack draws as component
+// name, marked so for the inspect tool (slackc.InspectAs).
+func actAtAs(gtx C, x int, name string, w W) D {
+	defer op.Offset(image.Pt(x, 0)).Push(gtx.Ops).Pop()
+	g := gtx
+	g.Constraints.Min = image.Point{}
+	g.Constraints.Max.X = max(0, g.Constraints.Max.X-x)
+	mk := slackc.InspectAs(name)
+	d := w(g)
+	mk.End(g, d.Size)
+	return d
+}
+
+// filterBar is ActivityFilterBar; its parts are marked with Slack's
+// component names for the inspect tool (docs/PLUGINS-props-live.md's
+// ActivityFilter* rows).
 func (v *Activity) filterBar(gtx C) D {
+	defer slackc.InspectAs("ActivityFilterBar").End(gtx, image.Pt(gtx.Constraints.Max.X, gtx.Dp(actBarH)))
 	gap := gtx.Dp(8)
 	x := gtx.Dp(16)
-	x += actAt(gtx, x, v.selAllGroup).Size.X
+	x += actAtAs(gtx, x, "ActivityFilterBulkAction", v.selAllGroup).Size.X
 	if v.triage() {
 		// triage mode: ActivityFilterBulkAction alone (the bulk buttons
 		// after the select group, margin-left 8px each)
@@ -1537,16 +1709,16 @@ func (v *Activity) filterBar(gtx C) D {
 		return D{Size: image.Pt(gtx.Constraints.Max.X, gtx.Dp(actBarH))}
 	}
 	x += gap
-	x += actAt(gtx, x, v.unreadsBtn).Size.X + gap
+	x += actAtAs(gtx, x, "ActivityFilterUnreadsButton", v.unreadsBtn).Size.X + gap
 	v.filterX = x
-	x += actAt(gtx, x, v.filterMenuBtn).Size.X + gap
+	x += actAtAs(gtx, x, "ActivityFilterByMenu", v.filterMenuBtn).Size.X + gap
 	if v.showIn {
 		// ActivityFilterBySpecific after the menu (m+ho tC: es &&), 8px on
-		x += actAt(gtx, x, v.inPill).Size.X + gap
+		x += actAtAs(gtx, x, "ActivityFilterBySpecific", v.inPill).Size.X + gap
 	}
-	x += actAt(gtx, x, func(gtx C) D { return v.outlineIcon(gtx, &v.searchBtn, "search", false) }).Size.X + gap
+	x += actAtAs(gtx, x, "ActivityFilterSearch", func(gtx C) D { return v.outlineIcon(gtx, &v.searchBtn, "search", false) }).Size.X + gap
 	if v.searchOn {
-		x += actAt(gtx, x, func(gtx C) D {
+		x += actAtAs(gtx, x, "ActivityFilterSearch", func(gtx C) D {
 			gtx.Constraints.Max.X = min(gtx.Constraints.Max.X, gtx.Dp(260))
 			return v.searchBox(gtx, v.query, actBarH)
 		}).Size.X + gap
@@ -1554,6 +1726,7 @@ func (v *Activity) filterBar(gtx C) D {
 	if !v.globalSettings() {
 		// p-activity_ia4_page__filter_bar_right: the layout toggle
 		// (entry point FILTER_BAR) at the bar's end, 16px in.
+		mk := slackc.InspectAs("ActivityFilterLayoutToggle")
 		m := op.Record(gtx.Ops)
 		g := gtx
 		g.Constraints.Min = image.Point{}
@@ -1562,6 +1735,7 @@ func (v *Activity) filterBar(gtx C) D {
 		at := image.Pt(max(x, gtx.Constraints.Max.X-gtx.Dp(16)-d.Size.X), (gtx.Dp(actBarH)-d.Size.Y)/2)
 		st := op.Offset(at).Push(gtx.Ops)
 		call.Add(gtx.Ops)
+		mk.End(gtx, d.Size)
 		st.Pop()
 	}
 	return D{Size: image.Pt(gtx.Constraints.Max.X, gtx.Dp(actBarH))}
@@ -1803,6 +1977,9 @@ func (v *Activity) items(gtx C) D {
 	if g := i18n.Gen(); g != v.locGen {
 		v.locGen, v.dirty = g, true // row text in the new locale
 	}
+	if v.unreadsSel() != v.visSel {
+		v.dirty = true // Unreads keeps the opened row only while it's open
+	}
 	if v.dirty || v.visN != len(page.Items) {
 		v.rebuild(&page)
 	}
@@ -1826,6 +2003,10 @@ func (v *Activity) items(gtx C) D {
 		return v.actEmpty(gtx)
 	}
 	gtx.Constraints.Min.X = gtx.Constraints.Max.X
+	// ActivityList's eH (isSuperNarrowDense): the column's width under
+	// 625px; the peek has no column layout, so never there
+	v.superNarrow = v.dense && !v.pk.peeking && gtx.Constraints.Max.X < gtx.Dp(625)
+	v.denseLoc = v.actDenseLoc(gtx)
 	// the list is the keyboard's focus target (activity_keys.go), the rows
 	// inside its area
 	v.listFocusEvents(gtx)
@@ -2097,6 +2278,21 @@ func (v *Activity) row(gtx C, it *core.ActivityItem, i int) D {
 	sel := v.selOK && v.selKey == key
 	focused := v.kbFocused && v.focusKey == key
 	r.v, r.it, r.key, r.unread = v, it, key, unread
+	if v.superNarrow {
+		// ActivityRowContentSingleLine's --follows-divider (the item
+		// before is a date divider or a section header) and
+		// --precedes-header (the next, past a spacer, is a header)
+		prev, next := -1, i+1
+		if i > 0 {
+			prev = v.vis[i-1]
+		}
+		if next < len(v.vis) && v.vis[next] == actVisSpacer {
+			next++
+		}
+		r.snTop = !(i > 0 && prev < 0 && prev != actVisSpacer)
+		r.snBottom = !sel && !v.isHeader(next)
+	}
+	r.denseMid = -1 // denseContent's, unless a plugin drew the row
 	var d D
 	if v.triage() {
 		// activity_multi_line_row_triage_container: 22px, the 16px
@@ -2140,8 +2336,14 @@ func (v *Activity) row(gtx C, it *core.ActivityItem, i int) D {
 		switch {
 		case v.dense:
 			// activity_single_line_row_content__actions_toggle: centred on
-			// the row (top 50%, translateY(-50%)), right -4px
-			y = (d.Size.Y - gtx.Dp(40)) / 2
+			// the content box (top 50%, translateY(-50%)), right -4px,
+			// over the text (no space kept for it but the wide row's
+			// location padding)
+			mid := r.denseMid
+			if mid < 0 {
+				mid = d.Size.Y / 2
+			}
+			y = mid - gtx.Dp(40)/2
 		case v.pk.peeking:
 			y, right = gtx.Dp(12-4), gtx.Dp(20)
 		case i == 0:
@@ -2273,6 +2475,18 @@ func (r *actRow) itemBody(gtx C, st slackc.Styled, sel bool) D {
 		pass.Pop()
 		cl.Pop()
 		h := max(1, gtx.Dp(1))
+		if v.dense && v.superNarrow {
+			// --super_narrow_dense: border-top 1px otl-ter, border-bottom
+			// none, which the later bordered separators' rule puts back on
+			// rows neither selected nor before a header
+			if r.snTop {
+				fill(gtx, image.Rect(0, 0, dims.Size.X, h), v.p.Border)
+			}
+			if r.snBottom {
+				fill(gtx, image.Rect(0, dims.Size.Y-h, dims.Size.X, dims.Size.Y), v.p.Border)
+			}
+			return dims
+		}
 		fill(gtx, image.Rect(0, dims.Size.Y-h, dims.Size.X, dims.Size.Y), v.p.Border)
 		return dims
 	})
@@ -2427,6 +2641,7 @@ func (v *Activity) choose(it *core.ActivityItem, key string, r *actRow) {
 		}
 	}
 	v.openSecondary() // activity_panel.go: beside the inbox, in the app's column
+	v.jumpPane()      // or in the view's own pane, at the message
 	v.prevList.Position = layout.Position{}
 	v.dirty = true
 }
@@ -2634,6 +2849,14 @@ type actNotes struct {
 	fns   []func()            // reverts of failed writes (Activity)
 	items []core.ActivityItem // realtime activity items (Activity)
 	gone  []string            // keys of realtime activity_deleted items
+	// the realtime watcher's pending passes (Activity): one each in fns
+	// however many events come before a draw
+	dirtyQueued, namesQueued bool
+	members                  map[string]bool // the people "names" named since the last draw
+	// what changed under the rows' descriptions since the last draw
+	// (Activity.noteStale): members, conversations, or everything
+	staleQueued, staleAll  bool
+	staleUsers, staleConvs map[string]bool
 }
 
 func (n *actNotes) add(h Host, s string) {
@@ -2783,85 +3006,62 @@ func (v *Activity) detailedContent(gtx C, r *actRow) D {
 
 // actDenseH is the Dense row's height: activity_row_content_container
 // --dense --design-v3, 50px (padding 10px 12px; the grouped container's
-// sides 20px), its bottom border included.
+// sides 20px), its bottom border included. --super_narrow_dense makes it
+// height auto with a min-height of 50px (denseNarrow).
 const actDenseH unit.Dp = 50
+
+// actDenseLoc is --activity_single_line_location_width: clamp(100px,
+// --activity_single_line_dm_location_width, 150px), the DM width being
+// what ActivitySingleLineLocationSizer measures, ActivityDirectMessageLabel
+// in bold 13px rounded up (ActivityList puts it on the list's style).
+func (v *Activity) actDenseLoc(gtx C) int {
+	return min(max(v.th.Measure(gtx, 13, wBold, nsActivity.T("Direct message")), gtx.Dp(100)), gtx.Dp(150))
+}
 
 // denseContent is ActivityRowContentSingleLine (gantry boot-render U5s4,
 // CSS activity_single_line_row_content*), one line, 8px gaps: the leading
-// block (200px; 100px in a container 300px or narrower) with the 20px
-// avatar, the sender (15px, flexible, ellipsis) and the status (the unread
-// badge, then the 20px type icon); then the centre (gaps 16px, 4px at
-// 625px or narrower): the message (15px, one line), the location (13px,
-// 100px wide, 224px from 800px) and the time (13px, 54px, right-aligned,
-// hidden while the row is hovered).
+// block (flex-shrink 0, calc(200px - the location width + 100px): 200px
+// unless the DM label is wider than 100px; 100px in a container 300px or
+// narrower, 200px from 800px) with the 20px avatar, the sender (15px,
+// flex 1, min-width 0: what gives way, with an ellipsis) and the status
+// (flex-shrink 0: the unread badge or mark, then the 20px type icon); then
+// the centre (flex 1, min-width 0; gaps 16px, 4px at 625px or narrower):
+// the message (15px, one line, flex 1: what gives way there), the
+// location (13px, flex-shrink 0, the location width, 224px from 800px)
+// and the time (13px, 54px, flex-shrink 0, right-aligned, hidden while
+// the row is hovered). In a list under 625px it's denseNarrow.
 func (v *Activity) denseContent(gtx C, r *actRow) D {
+	if v.superNarrow {
+		return v.denseNarrow(gtx, r)
+	}
 	d, unread := r.cur, r.unread
 	// the 54px timestamp is its own container: the narrow variant
 	bodyCol, when := r.bodyCol, v.rowWhen(gtx, d, true)
 	hov := r.click.Hovered() || r.bar.Hovered()
 	g := gtx
 	g.Constraints = layout.Exact(image.Pt(gtx.Constraints.Max.X, gtx.Dp(actDenseH))) // the bottom border is drawn inside
+	r.dn = actDenseBox{lines: 1, h: g.Constraints.Max.Y}
+	r.denseMid = g.Constraints.Max.Y / 2
 	return layout.Inset{Left: 20, Right: 20}.Layout(g, func(gtx C) D {
 		cw := gtx.Constraints.Max.X
-		lead, locW, centreGap := gtx.Dp(200), gtx.Dp(100), unit.Dp(16)
+		locW := v.denseLoc
+		lead, centreGap := gtx.Dp(200)-locW+gtx.Dp(100), unit.Dp(16)
 		switch {
 		case cw <= gtx.Dp(300):
 			lead = gtx.Dp(100)
 		case cw >= gtx.Dp(800):
-			locW = gtx.Dp(224)
+			lead, locW = gtx.Dp(200), gtx.Dp(224)
 		}
 		if cw <= gtx.Dp(625) {
 			centreGap = 4
 		}
+		r.dn.lead = lead
 		return layout.W.Layout(gtx, func(gtx C) D {
 			gtx.Constraints.Min.X = gtx.Constraints.Max.X
 			return row(gtx, layout.Middle,
 				layout.Rigid(func(gtx C) D {
 					gtx.Constraints = layout.Exact(image.Pt(lead, gtx.Dp(30)))
-					return row(gtx, layout.Middle,
-						layout.Flexed(1, func(gtx C) D {
-							// __user: flex 1, so the status sits at the leading block's end
-							gtx.Constraints.Min.X = gtx.Constraints.Max.X
-							return row(gtx, layout.Middle,
-								layout.Rigid(func(gtx C) D {
-									return slackc.Component(gtx, "ActivityRowContentSenderAvatarLayout", r, (*actRow).avatarProps, (*actRow).layoutAvatar)
-								}),
-								hgap(8),
-								layout.Flexed(1, func(gtx C) D {
-									gtx.Constraints.Min.X = 0
-									r.nameMax = gtx.Constraints.Max.X
-									if d.teamIcon != "" {
-										r.nameMax = max(0, r.nameMax-gtx.Dp(20))
-									}
-									return row(gtx, layout.Middle,
-										layout.Rigid(func(gtx C) D {
-											return slackc.Component(gtx, "ActivityPrivacyBlurredName", r, (*actRow).nameProps, (*actRow).layoutName)
-										}),
-										layout.Rigid(func(gtx C) D { return v.teamIcon(gtx, d) }),
-									)
-								}),
-							)
-						}),
-						layout.Rigid(func(gtx C) D {
-							switch {
-							case r.agentOn(gtx):
-								return layout.Inset{Left: 8}.Layout(gtx, func(gtx C) D { return v.agentStatus(gtx, r) })
-							case v.typingOn(gtx, r.it):
-								return layout.Inset{Left: 8}.Layout(gtx, func(gtx C) D { return v.typingStatus(gtx, r) })
-							case unread:
-								return layout.Inset{Left: 8}.Layout(gtx, func(gtx C) D { return v.actStatus(gtx, r.count, unread) })
-							case r.markOK:
-								return layout.Inset{Left: 8}.Layout(gtx, func(gtx C) D { return v.markIcon(gtx, r) })
-							}
-							return D{}
-						}),
-						layout.Rigid(func(gtx C) D {
-							if d.typeIcon == "" {
-								return D{}
-							}
-							return layout.Inset{Left: 8}.Layout(gtx, func(gtx C) D { return v.actTypeIcon(gtx, d) })
-						}),
-					)
+					return v.denseLeading(gtx, r)
 				}),
 				hgap(8),
 				layout.Flexed(1, func(gtx C) D {
@@ -2869,49 +3069,31 @@ func (v *Activity) denseContent(gtx C, r *actRow) D {
 					return row(gtx, layout.Middle,
 						layout.Flexed(1, func(gtx C) D {
 							gtx.Constraints.Min.X = gtx.Constraints.Max.X
-							if m := r.msg(); m != nil && !d.invite && len(m.Doc.Blocks) > 0 {
-								// __message: one 15px/22px line
-								gtx.Constraints.Min.Y, gtx.Constraints.Max.Y = gtx.Dp(22), gtx.Dp(22)
-								defer clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops).Pop()
-								return v.actBody(gtx, r, 1, bodyCol)
-							}
-							return layout.W.Layout(gtx, func(gtx C) D { return v.label(gtx, 15, wReg, bodyCol, d.prev) })
+							r.dn.msg = gtx.Constraints.Max.X
+							return v.denseMessage(gtx, r, bodyCol)
 						}),
 						layout.Rigid(func(gtx C) D {
 							if !d.locOn {
 								return D{}
 							}
 							return layout.Inset{Left: centreGap}.Layout(gtx, func(gtx C) D {
-								gtx.Constraints = layout.Exact(image.Pt(locW, gtx.Dp(18)))
+								box := image.Pt(locW, gtx.Dp(18))
+								gtx.Constraints = layout.Exact(box)
 								if hov || r.key == v.focusKey && v.kbFocused {
 									// __locationReserved (hovered or focused):
-									// padding-inline-end 32px under the actions
+									// border-box, padding-inline-end 32px under
+									// the actions; the box keeps its width
 									gtx.Constraints.Max.X = max(0, locW-gtx.Dp(32))
-									gtx.Constraints.Min.X = gtx.Constraints.Max.X
 								}
-								w := wReg
-								if unread {
-									w = wBold
-								}
-								if d.locEnt { // the channel's InlineChannelEntity
-									return layout.W.Layout(gtx, func(gtx C) D { return v.chanEntity(gtx, d.ent, 13, w, v.p.Muted) })
-								}
-								return row(gtx, layout.Middle,
-									layout.Rigid(func(gtx C) D {
-										if d.locIcon == "" {
-											return D{}
-										}
-										return layout.Inset{Right: 4}.Layout(gtx, func(gtx C) D { return v.icon(gtx, icons.Slack(d.locIcon), 13, v.p.Muted) })
-									}),
-									layout.Flexed(1, func(gtx C) D {
-										gtx.Constraints.Min.X = 0
-										return v.para(gtx, 13, 18, w, v.p.Muted, 1, d.loc)
-									}),
-								)
+								gtx.Constraints.Min.X = 0
+								layout.W.Layout(gtx, func(gtx C) D { return v.denseLocation(gtx, d, unread) })
+								r.dn.loc = box.X
+								return D{Size: box}
 							})
 						}),
 						layout.Rigid(func(gtx C) D {
 							return layout.Inset{Left: centreGap}.Layout(gtx, func(gtx C) D {
+								r.dn.time = gtx.Dp(54)
 								if hov {
 									return D{Size: image.Pt(gtx.Dp(54), gtx.Dp(18))}
 								}
@@ -2923,6 +3105,202 @@ func (v *Activity) denseContent(gtx C, r *actRow) D {
 			)
 		})
 	})
+}
+
+// denseNarrow is ActivityRowContentSingleLine in a list under 625px
+// (--super_narrow_dense): the container is height auto, min-height 50px,
+// with border-top 1px (itemBody draws the borders); the row aligns its
+// parts to the top; the leading block is 152px (__leadingSuperNarrow, but
+// 100px in a container 300px or narrower: that container query comes
+// later in the sheet and wins); the centre wraps (padding-top 1px, row-gap
+// 2px): the message across the first line (flex-basis 100%), then __meta
+// (flex, baseline): the location (width auto, min-width 0, at most 175px,
+// flex-shrink 1: what gives way, with an ellipsis) and the timestamp
+// (flex-shrink 0, width auto, start-aligned, no container of its own)
+// after a "·" with 4px either side. The timestamp stays while the row is
+// hovered and the location keeps no room for the actions, which sit over
+// the text.
+func (v *Activity) denseNarrow(gtx C, r *actRow) D {
+	d, unread := r.cur, r.unread
+	px := max(1, gtx.Dp(1))
+	top, bottom := 0, 0
+	if r.snTop {
+		top = px
+	}
+	if r.snBottom {
+		bottom = px
+	}
+	w := gtx.Constraints.Max.X
+	cw := max(0, w-gtx.Dp(40))
+	lead := gtx.Dp(152)
+	if cw <= gtx.Dp(300) {
+		lead = gtx.Dp(100)
+	}
+	// the timestamp's variant follows the row's container
+	// (timestamp_variant_narrow at 285px or narrower)
+	when := v.rowWhen(gtx, d, cw <= gtx.Dp(285))
+	r.dn = actDenseBox{lead: lead, lines: 2}
+	pad := gtx.Dp(10)
+	var ch int
+	func() {
+		defer op.Offset(image.Pt(gtx.Dp(20), top+pad)).Push(gtx.Ops).Pop()
+		g := gtx
+		g.Constraints = layout.Constraints{Min: image.Pt(cw, 0), Max: image.Pt(cw, max(gtx.Constraints.Max.Y, gtx.Dp(200)))}
+		ch = row(g, layout.Start,
+			layout.Rigid(func(gtx C) D {
+				// __leading: the 22px line of the sender, its parts centred
+				gtx.Constraints = layout.Constraints{Min: image.Pt(lead, gtx.Dp(22)), Max: image.Pt(lead, gtx.Constraints.Max.Y)}
+				return v.denseLeading(gtx, r)
+			}),
+			hgap(8),
+			layout.Flexed(1, func(gtx C) D {
+				gtx.Constraints.Min.X = 0
+				r.dn.msg = gtx.Constraints.Max.X
+				return layout.Inset{Top: 1}.Layout(gtx, func(gtx C) D {
+					return col(gtx,
+						layout.Rigid(func(gtx C) D {
+							gtx.Constraints.Min.X = gtx.Constraints.Max.X
+							gtx.Constraints.Min.Y = gtx.Dp(22)
+							return v.denseMessage(gtx, r, r.bodyCol)
+						}),
+						vgap(2),
+						layout.Rigid(func(gtx C) D { return v.denseMeta(gtx, r, when, unread) }),
+					)
+				})
+			}),
+		).Size.Y
+	}()
+	h := max(gtx.Dp(actDenseH), top+pad+ch+pad+bottom)
+	// the content box (height 100%) and its middle, the actions' top 50%
+	r.denseMid = top + pad + (h-top-bottom-2*pad)/2
+	r.dn.h = h
+	return D{Size: image.Pt(w, h)}
+}
+
+// denseMeta is the super narrow row's second line, __meta: the location
+// (at most 175px, giving way to the timestamp) and the timestamp with its
+// "·" (:before, margin 0 4px), 13px content-ter.
+func (v *Activity) denseMeta(gtx C, r *actRow, when string, unread bool) D {
+	d := r.cur
+	avail, h := gtx.Constraints.Max.X, gtx.Dp(18)
+	tm := op.Record(gtx.Ops)
+	lg := gtx
+	lg.Constraints = layout.Constraints{Max: image.Pt(1<<20, h)}
+	td := row(lg, layout.Middle,
+		layout.Rigid(func(gtx C) D {
+			return layout.Inset{Left: 4, Right: 4}.Layout(gtx, func(gtx C) D { return v.label(gtx, 13, wReg, v.p.Muted, "·") })
+		}),
+		layout.Rigid(func(gtx C) D { return v.label(gtx, 13, wReg, v.p.Muted, when) }),
+	)
+	tcall := tm.Stop()
+	x := 0
+	if d.locOn {
+		g := gtx
+		g.Constraints = layout.Constraints{Min: image.Pt(0, h), Max: image.Pt(max(0, min(gtx.Dp(175), avail-td.Size.X)), h)}
+		x = layout.W.Layout(g, func(gtx C) D { return v.denseLocation(gtx, d, unread) }).Size.X
+	}
+	func() {
+		defer op.Offset(image.Pt(x, max(0, h-td.Size.Y)/2)).Push(gtx.Ops).Pop()
+		tcall.Add(gtx.Ops)
+	}()
+	r.dn.loc, r.dn.time = x, td.Size.X
+	return D{Size: image.Pt(min(avail, x+td.Size.X), h)}
+}
+
+// denseLeading is __leading's inside, in gtx's box: __user (flex 1,
+// min-width 0: the 20px avatar, 8px, the sender, which gives way with an
+// ellipsis) and __status (flex-shrink 0, 8px after it: the status
+// indicator, then the 20px type icon, 8px apart).
+func (v *Activity) denseLeading(gtx C, r *actRow) D {
+	d, unread := r.cur, r.unread
+	r.dn.status, r.dn.typeIcon = 0, 0
+	return row(gtx, layout.Middle,
+		layout.Flexed(1, func(gtx C) D {
+			// __user: flex 1, so the status sits at the leading block's end
+			gtx.Constraints.Min.X = gtx.Constraints.Max.X
+			return row(gtx, layout.Middle,
+				layout.Rigid(func(gtx C) D {
+					return slackc.Component(gtx, "ActivityRowContentSenderAvatarLayout", r, (*actRow).avatarProps, (*actRow).layoutAvatar)
+				}),
+				hgap(8),
+				layout.Flexed(1, func(gtx C) D {
+					gtx.Constraints.Min.X = 0
+					r.nameMax = gtx.Constraints.Max.X
+					if d.teamIcon != "" {
+						r.nameMax = max(0, r.nameMax-gtx.Dp(20))
+					}
+					r.dn.name = r.nameMax
+					return row(gtx, layout.Middle,
+						layout.Rigid(func(gtx C) D {
+							return slackc.Component(gtx, "ActivityPrivacyBlurredName", r, (*actRow).nameProps, (*actRow).layoutName)
+						}),
+						layout.Rigid(func(gtx C) D { return v.teamIcon(gtx, d) }),
+					)
+				}),
+			)
+		}),
+		layout.Rigid(func(gtx C) D {
+			var s D
+			switch {
+			case r.agentOn(gtx):
+				s = layout.Inset{Left: 8}.Layout(gtx, func(gtx C) D { return v.agentStatus(gtx, r) })
+			case v.typingOn(gtx, r.it):
+				s = layout.Inset{Left: 8}.Layout(gtx, func(gtx C) D { return v.typingStatus(gtx, r) })
+			case unread:
+				s = layout.Inset{Left: 8}.Layout(gtx, func(gtx C) D { return v.actStatus(gtx, r.count, unread) })
+			case r.markOK:
+				s = layout.Inset{Left: 8}.Layout(gtx, func(gtx C) D { return v.markIcon(gtx, r) })
+			}
+			r.dn.status = s.Size.X
+			return s
+		}),
+		layout.Rigid(func(gtx C) D {
+			if d.typeIcon == "" {
+				return D{}
+			}
+			s := layout.Inset{Left: 8}.Layout(gtx, func(gtx C) D { return v.actTypeIcon(gtx, d) })
+			r.dn.typeIcon = s.Size.X
+			return s
+		}),
+	)
+}
+
+// denseMessage is __message: the body on one 15px/22px line (clamped to
+// it) or the row's preview text.
+func (v *Activity) denseMessage(gtx C, r *actRow, bodyCol color.NRGBA) D {
+	d := r.cur
+	if m := r.msg(); m != nil && !d.invite && len(m.Doc.Blocks) > 0 {
+		gtx.Constraints.Min.Y, gtx.Constraints.Max.Y = gtx.Dp(22), gtx.Dp(22)
+		defer clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops).Pop()
+		return v.actBody(gtx, r, 1, bodyCol)
+	}
+	return layout.W.Layout(gtx, func(gtx C) D { return v.label(gtx, 15, wReg, bodyCol, d.prev) })
+}
+
+// denseLocation is __location's content at its own width within gtx's
+// (white-space nowrap, an ellipsis): the channel's InlineChannelEntity, or
+// the location's icon and text; bold on unread rows.
+func (v *Activity) denseLocation(gtx C, d *actDesc, unread bool) D {
+	w := wReg
+	if unread {
+		w = wBold
+	}
+	gtx.Constraints.Min.X = 0
+	if d.locEnt {
+		return v.chanEntity(gtx, d.ent, 13, w, v.p.Muted)
+	}
+	return row(gtx, layout.Middle,
+		layout.Rigid(func(gtx C) D {
+			if d.locIcon == "" {
+				return D{}
+			}
+			return layout.Inset{Right: 4}.Layout(gtx, func(gtx C) D { return v.icon(gtx, icons.Slack(d.locIcon), 13, v.p.Muted) })
+		}),
+		layout.Rigid(func(gtx C) D {
+			gtx.Constraints.Min.X = 0
+			return v.para(gtx, 13, 18, w, v.p.Muted, 1, d.loc)
+		}),
+	)
 }
 
 // actTypeIcon is the Dense row's ActivityDecoupledTypeIcon: a 20px box,

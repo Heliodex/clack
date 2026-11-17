@@ -386,21 +386,47 @@ func uploadErrClass(err error) string {
 	return "network error"
 }
 
-// Pin / Unpin a message.
+// Pin is the message menu's pin (Slack's pinMessage, boot-shared fBOF):
+// the Pins tab's row (prependPinnedItem) and the message's pin
+// (upsertMessagePinnedStatus: pinned_to and pinned_info {pinned_by: the
+// viewer}, "Pinned by you") change at once, then pins.add {channel,
+// timestamp, reason "pin-message"} (htKN pinsAdd). A failure other than
+// already_pinned takes both back (removePinnedItem, the pin cleared);
+// the caller toasts too_many_pins (PinErrorToast). The pin_added that
+// follows a success finds both done.
 func (a *App) Pin(ctx context.Context, ch, ts string) error {
-	err := a.C.Call(ctx, "pins.add", url.Values{"channel": {ch}, "timestamp": {ts}}, nil)
-	if isCode(err, "already_pinned") {
+	self := a.S.SelfID()
+	it := PinsTabItem{Type: "message", Channel: ch, TS: ts, Created: time.Now().Unix(), CreatedBy: self}
+	if m, ok := a.S.SetPin(ch, ts, true, &slack.PinnedInfo{Channel: ch, PinnedBy: self}); ok {
+		it.Msg = a.messagePtr(ch, &m)
+		a.emitUpdate(ch, &m)
+	}
+	a.pinsTabPrepend(ch, it)
+	err := a.C.Call(ctx, "pins.add", url.Values{"channel": {ch}, "timestamp": {ts}, "reason": {"pin-message"}}, nil)
+	if err == nil || isCode(err, "already_pinned") {
 		return nil
+	}
+	a.pinsTabRemove(ch, it)
+	if m, ok := a.S.SetPin(ch, ts, false, nil); ok {
+		a.emitUpdate(ch, &m)
 	}
 	return err
 }
 
+// IsTooManyPins reports a pins.add refused for a channel at its pin limit
+// (too_many_pins: Slack's TooManyPins, PinErrorToast).
+func IsTooManyPins(err error) bool { return isCode(err, "too_many_pins") }
+
+// Unpin is the message menu's unpin (Slack's unpinMessage, boot-shared
+// 4mNC): the row and the message's pin go at once, pins.remove {channel,
+// timestamp, reason "unpin-message"}, both back on a failure; no_pin
+// counts as done. The Pins tab's Remove pin runs the same (UnpinFromTab).
 func (a *App) Unpin(ctx context.Context, ch, ts string) error {
-	err := a.C.Call(ctx, "pins.remove", url.Values{"channel": {ch}, "timestamp": {ts}}, nil)
-	if isCode(err, "no_pin") {
-		return nil
+	it := PinsTabItem{Type: "message", Channel: ch, TS: ts}
+	if row, ok := a.pinsTabRow(ch, it); ok {
+		it = row // its place and pin time come back on a failure
 	}
-	return err
+	return a.UnpinFromTab(ctx, it)
 }
 
 func savedParams(ch, ts string) url.Values {
@@ -476,9 +502,10 @@ func (a *App) SubscribeThread(ctx context.Context, ch, threadTS string, follow b
 	}
 	err := a.C.Call(ctx, m, url.Values{"channel": {ch}, "thread_ts": {threadTS}}, nil)
 	if err == nil {
-		// The root's subscribed flag now, as the thread_subscribed event
+		// The thread's subscribed flag now, as the thread_subscribed event
 		// would set it (it may come late or, on some workspaces, not at all).
-		if msg, ok := a.S.Mutate(ch, threadTS, func(m *slack.Message) { m.Subscribed = follow }); ok {
+		a.S.SetThreadSub(ch, threadTS, func(s *store.ThreadSub) { s.Subscribed = follow })
+		if msg, ok := a.S.Find(ch, threadTS); ok {
 			a.emitUpdate(ch, &msg)
 		}
 		a.refreshCountsSoon()
@@ -515,7 +542,7 @@ func (a *App) join(ctx context.Context, ch string, exp int64) (Conv, error) {
 	if full, err := a.C.ConversationInfo(ctx, ch); err == nil {
 		c = *full
 	}
-	a.S.PutConv(c)
+	a.S.PutConvLocal(c)
 	v := a.conv(&c)
 	a.emit(Event{Type: "conv", Channel: ch, Conv: &v})
 	return v, nil
@@ -561,7 +588,7 @@ func (a *App) OpenDM(ctx context.Context, users ...string) (Conv, error) {
 		c.IsIM, c.User = true, users[0]
 	}
 	a.EnsureUsers(ctx, append(users, c.User))
-	a.S.PutConv(c)
+	a.S.PutConvLocal(c)
 	a.openDM(c.ID)
 	v := a.conv(&c)
 	a.emit(Event{Type: "conv", Channel: c.ID, Conv: &v})

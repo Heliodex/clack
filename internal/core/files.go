@@ -47,13 +47,13 @@ func (a *App) Fetch(ctx context.Context, rawURL string) ([]byte, string, error) 
 			}
 			defer resp.Body.Close()
 			if resp.StatusCode != http.StatusOK {
-				return fmt.Errorf("core: Fetch: http %d", resp.StatusCode)
+				return slack.NewHTTPError(resp.StatusCode, fmt.Sprintf("core: Fetch: http %d", resp.StatusCode))
 			}
 			if b, err = io.ReadAll(io.LimitReader(resp.Body, MaxFetch+1)); err != nil {
 				return err
 			}
 			if len(b) > MaxFetch {
-				return errors.New("core: Fetch: file too large")
+				return fmt.Errorf("core: Fetch: file over %d MB: %w", MaxFetch>>20, slack.ErrTooLarge)
 			}
 			mime = resp.Header.Get("Content-Type")
 		} else {

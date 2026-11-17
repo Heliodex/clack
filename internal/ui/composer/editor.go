@@ -175,7 +175,8 @@ type Editor struct {
 	slugs      edSlugs // pasted Slack links being resolved (slugs.go)
 	plainPaste bool
 	richRead   *clipRead     // HTML read started by Ctrl/Cmd+V
-	pendPaste  *pendingPaste // plain text waiting for richRead
+	pendPaste  *pendingPaste // plain text waiting for richRead and filesRead
+	filesRead  *filePaste    // the composer's file probe for that paste
 
 	events  []EditorEvent
 	filters []event.Filter
@@ -472,6 +473,18 @@ func (e *Editor) ToggleStyle(s Style) {
 		return
 	}
 	e.begin(edOther, false)
+	if s == Code && !e.doc.HasStyle(lo, hi, Code) {
+		// emoji and truncated links become text first (codeText); the
+		// selection stays over the new text, as Quill's does
+		if n := e.doc.codeText(lo, hi); n != hi {
+			if e.anchor <= e.caret {
+				e.caret = n
+			} else {
+				e.anchor = n
+			}
+			hi = n
+		}
+	}
 	e.doc.ToggleStyle(lo, hi, s)
 	e.commit()
 }

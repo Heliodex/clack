@@ -22,7 +22,6 @@ package core
 //     "in:<#C> query", count 10, search_context search_in_channel.
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"log"
@@ -209,17 +208,82 @@ func messageSearchParams(o SearchOpts, excludeBots, onlyMine bool) url.Values {
 // inRef matches in:<#C…> / in:<@U…> modifiers.
 var inRef = regexp.MustCompile(`(?i)in:<[@#][A-Z0-9]+?[^>]*?>\s*`)
 
-// highlight markers search.modules adds with highlight=1 (U+E000/U+E001),
-// raw or JSON-escaped.
-var hlRaw = [][]byte{[]byte(""), []byte(""), []byte(``), []byte(``), []byte(``), []byte(``)}
+// highlight markers search.modules / search.inline add with highlight=1:
+// U+E000 opens a match, U+E001 closes it (Slack's KxSc getHighlightRegex
+// /[\ue000\ue001]/g, MmVP findAndStripSearchHighlightMarkers). They come
+// raw or JSON-escaped (\ue000, any hex case); a \\ before the u is an
+// escaped backslash, not an escape, and stays. stripHighlightJSON drops
+// them all before decoding; the UI marks the query's words itself
+// (srHighlight).
 
-func stripHighlightJSON(b []byte) []byte {
-	for _, m := range hlRaw {
-		if bytes.Contains(b, m) {
-			b = bytes.ReplaceAll(b, m, nil)
+// hlEscape reports whether b[i:] (just past a backslash) is u e000 /
+// e001 in any case, and which.
+func hlEscape(b []byte, i int) (open, ok bool) {
+	if i+5 > len(b) || b[i] != 'u' || (b[i+1]|0x20) != 'e' || b[i+2] != '0' || b[i+3] != '0' {
+		return false, false
+	}
+	switch b[i+4] {
+	case '0':
+		return true, true
+	case '1':
+		return false, true
+	}
+	return false, false
+}
+
+// hlRawLen is the length of a raw U+E000 / U+E001 at b[i:] (0 when none).
+func hlRawLen(b []byte, i int) (open bool, n int) {
+	if i+3 <= len(b) && b[i] == 0xee && b[i+1] == 0x80 && (b[i+2] == 0x80 || b[i+2] == 0x81) {
+		return b[i+2] == 0x80, 3
+	}
+	return false, 0
+}
+
+// hasHighlightMarker reports whether b holds an opening marker (only
+// open) or either marker.
+func hasHighlightMarker(b []byte, onlyOpen bool) bool {
+	for i := 0; i < len(b); i++ {
+		switch b[i] {
+		case '\\':
+			if open, ok := hlEscape(b, i+1); ok && (open || !onlyOpen) {
+				return true
+			}
+			i++ // the escaped byte
+		case 0xee:
+			if open, n := hlRawLen(b, i); n > 0 && (open || !onlyOpen) {
+				return true
+			}
 		}
 	}
-	return b
+	return false
+}
+
+func stripHighlightJSON(b []byte) []byte {
+	if !hasHighlightMarker(b, false) {
+		return b
+	}
+	out := make([]byte, 0, len(b))
+	for i := 0; i < len(b); i++ {
+		switch b[i] {
+		case '\\':
+			if _, ok := hlEscape(b, i+1); ok {
+				i += 5
+				continue
+			}
+			if i+1 < len(b) {
+				out = append(out, b[i], b[i+1])
+				i++
+				continue
+			}
+		case 0xee:
+			if _, n := hlRawLen(b, i); n > 0 {
+				i += n - 1
+				continue
+			}
+		}
+		out = append(out, b[i])
+	}
+	return out
 }
 
 // searchItemRaw is one search.modules.messages / dms item.
@@ -308,6 +372,9 @@ func (a *App) SearchMessages(ctx context.Context, o SearchOpts) (SearchResult, e
 		UnfilteredFilter   map[string]json.RawMessage `json:"unfiltered_result_filter"`
 		SortForcedToRecent json.RawMessage            `json:"sort_forced_to_recent"`
 	}
+	// the markers, before they go: compactCardBlocks' first highlighted
+	// block (exp_wave7.go)
+	marked := searchHitBlocks(raw)
 	if err := json.Unmarshal(stripHighlightJSON(raw), &res); err != nil {
 		return SearchResult{}, err
 	}
@@ -326,13 +393,15 @@ func (a *App) SearchMessages(ctx context.Context, o SearchOpts) (SearchResult, e
 	}
 	var msgs []slack.Message
 	type hit struct {
-		ch   string
-		m    slack.Message
-		link string
+		ch      string
+		m       slack.Message
+		link    string
+		replied bool
+		hitAt   int
 	}
 	var hits []hit
 	chans := map[string]bool{}
-	for _, it := range res.Items {
+	for i, it := range res.Items {
 		ch := it.Channel.ID
 		if ch == "" {
 			continue
@@ -341,23 +410,25 @@ func (a *App) SearchMessages(ctx context.Context, o SearchOpts) (SearchResult, e
 		if it.Channel.Name != "" && !it.Channel.IsIM && !it.Channel.IsMPIM {
 			a.S.PutName(ch, it.Channel.Name) // names of channels we are not in (metadata)
 		}
-		for _, mr := range it.Messages {
+		for j, mr := range it.Messages {
 			var m slack.Message
 			if json.Unmarshal(mr, &m) != nil || m.TS == "" {
 				continue
 			}
 			var aux struct {
-				Permalink string `json:"permalink"`
+				Permalink        string `json:"permalink"`
+				RequestorReplied bool   `json:"requestor_replied"`
 			}
 			_ = json.Unmarshal(mr, &aux)
 			msgs = append(msgs, m)
-			hits = append(hits, hit{ch, m, aux.Permalink})
+			hits = append(hits, hit{ch, m, aux.Permalink, aux.RequestorReplied, marked[[2]int{i, j}]})
 		}
 	}
 	// the results' people are asked for as their rows draw (lazy_users.go)
 	for i := range hits {
 		v := a.message(hits[i].ch, &hits[i].m)
 		v.Permalink = hits[i].link
+		v.RequestorReplied, v.SearchHitBlock = hits[i].replied, hits[i].hitAt
 		out.Messages = append(out.Messages, v)
 	}
 	out.Convs = a.convRefs(chans)

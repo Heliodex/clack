@@ -48,6 +48,9 @@ type ugSelect struct {
 	search      func(ctx context.Context, q string) ([]ugOption, error)
 	// changed runs after the picked options change (onSelectedItemsChange).
 	changed func(ids []string)
+	// canPick, when set, is asked before a pick (shouldOptionBeSelected):
+	// false refuses it.
+	canPick func() bool
 
 	ed       widget.Editor
 	picked   []ugOption
@@ -98,6 +101,9 @@ func (s *ugSelect) SetPicked(os []ugOption) { s.picked, s.sel = append([]ugOptio
 
 // Pick adds o (once) and clears the filter.
 func (s *ugSelect) Pick(o ugOption) {
+	if s.canPick != nil && !s.canPick() {
+		return
+	}
 	if !slices.ContainsFunc(s.picked, func(p ugOption) bool { return p.ID == o.ID }) {
 		s.picked = append(s.picked, o)
 	}

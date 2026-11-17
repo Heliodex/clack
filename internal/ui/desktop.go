@@ -97,6 +97,12 @@ type UpdateInfo struct {
 // system's installer for the user to finish; Clack keeps running.
 var ErrUpdateManual = errors.New("update opened in the system installer")
 
+// ErrUpdatePending (from Options.CheckUpdate, wrapped): a newer release
+// is out but its files are still uploading. Not offered or downloaded
+// yet; the loop checks again in a few minutes, and only a manual check
+// says anything (gently: it's a race with the release, not a failure).
+var ErrUpdatePending = errors.New("a newer version is still being published")
+
 // updatePhase is where an update is. Slack's updateStatus (app.asar,
 // dist/main.bundle.cjs: nt) has the same steps: update-available,
 // downloading-update, update-downloaded, restart-to-apply.

@@ -46,6 +46,7 @@ var colorTokens = []struct {
 	{func(c *colors) *color.NRGBA { return &c.FindBorder }, theme.Both("var(--dt_color-otl-ter)")},
 	{func(c *colors) *color.NRGBA { return &c.Missing }, theme.Both("var(--dt_color-base-ter)")},
 	{func(c *colors) *color.NRGBA { return &c.MissingLine }, theme.Both("rgb(var(--sk_foreground_low_solid))")},
+	{func(c *colors) *color.NRGBA { return &c.NoImage }, theme.Both("rgb(var(--sk_foreground_low_solid))")},
 }
 
 var (

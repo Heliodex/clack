@@ -10,6 +10,7 @@ type Message struct {
 	TS             string          `json:"ts"`
 	User           string          `json:"user,omitempty"`
 	BotID          string          `json:"bot_id,omitempty"`
+	AppID          string          `json:"app_id,omitempty"` // the app a bot message came from (getBotByMsg passes it to bots.info)
 	Username       string          `json:"username,omitempty"`
 	Text           string          `json:"text"`
 	ThreadTS       string          `json:"thread_ts,omitempty"`
@@ -21,6 +22,11 @@ type Message struct {
 	LatestReply    string          `json:"latest_reply,omitempty"`
 	Subscribed     bool            `json:"subscribed,omitempty"`
 	LastRead       string          `json:"last_read,omitempty"` // a followed thread's root (conversations.replies): the viewer's last read reply
+	// SubscribedSet: the copy had a "subscribed" field of its own (history
+	// and replies roots do; the socket's message_changed doesn't), which
+	// is what Slack's slurpThreadSubscriptions takes a thread's
+	// subscription from (store/thread_subs.go). Decoding sets it.
+	SubscribedSet  bool            `json:"-"`
 	Edited         *Edited         `json:"edited,omitempty"`
 	Reactions      []Reaction      `json:"reactions,omitempty"`
 	Files          []File          `json:"files,omitempty"`
@@ -226,6 +232,7 @@ type File struct {
 	Thumb720           string          `json:"thumb_720"`
 	Thumb960           string          `json:"thumb_960"`
 	Thumb1024          string          `json:"thumb_1024"`
+	Thumb800           string          `json:"thumb_800,omitempty"` // HEIC/HEIF: fileIsImage takes it in thumb_360's place
 	ThumbVideo         string          `json:"thumb_video"`
 	ThumbPDF           string          `json:"thumb_pdf"`
 	ThumbPDFW          int             `json:"thumb_pdf_w"`
@@ -265,6 +272,9 @@ type File struct {
 	// upload is still being processed). Slack's web client doesn't draw by
 	// it; Clack only reads it to spot unprocessed uploads.
 	MediaDisplayType string `json:"media_display_type,omitempty"`
+	// IsSalesforceFile: Slack's fileIsImage takes a Salesforce image
+	// without thumbs (9NKl).
+	IsSalesforceFile bool `json:"is_salesforce_file,omitempty"`
 	// An animated GIF's animated thumbs (thumb_360_w/h and thumb_480_w/h
 	// are their sizes too; FileImageThumbnail plays them in messages) and
 	// its first frame as a still at the original's size (deanimate is
@@ -399,6 +409,7 @@ type User struct {
 	AgentStatus       string  `json:"agent_status,omitempty"`      // not_an_agent | consistently_an_agent | check_required (bot users)
 	IsWorkflowBot     bool    `json:"is_workflow_bot,omitempty"`   // Workflow Builder's bot user: badged WORKFLOW
 	IsAgentforceBot   bool    `json:"is_agentforce_bot,omitempty"` // a Salesforce Agentforce agent: badged AGENTFORCE
+	IsSidekickBot     bool    `json:"is_sidekick_bot,omitempty"`   // 7jev isSidekickMember (bD9l keeps it out of Slack Connect channels)
 	Updated           int64   `json:"updated,omitempty"`
 	Profile           Profile `json:"profile"`
 	Presence          string  `json:"presence,omitempty"`
@@ -593,16 +604,21 @@ type Counts struct {
 	// ActivityV2 is the Activity inbox's unread badge count by entry type
 	// (Slack's transformClientCountsOutput activityV2).
 	ActivityV2 map[string]int `json:"activity_v2"`
+	// Alerts is the unread count by user alert type (Slack's userAlerts;
+	// the classic Activity badge sums some: core classic_badges.go).
+	Alerts map[string]int `json:"alerts"`
 }
 
 // UnmarshalJSON decodes a message and keeps the raw attachments JSON (for
 // plugins that need fields the typed Attachment drops). Malformed
-// attachments no longer fail the whole message.
+// attachments no longer fail the whole message. SubscribedSet records
+// whether "subscribed" was there at all.
 func (m *Message) UnmarshalJSON(b []byte) error {
 	type plain Message
 	aux := struct {
 		*plain
 		RawAtt json.RawMessage `json:"attachments,omitempty"`
+		RawSub json.RawMessage `json:"subscribed,omitempty"`
 	}{plain: (*plain)(m)}
 	if err := json.Unmarshal(b, &aux); err != nil {
 		return err
@@ -612,6 +628,10 @@ func (m *Message) UnmarshalJSON(b []byte) error {
 	if len(aux.RawAtt) > 0 && string(aux.RawAtt) != "null" {
 		m.RawAttachments = append(json.RawMessage(nil), aux.RawAtt...)
 		_ = json.Unmarshal(aux.RawAtt, &m.Attachments)
+	}
+	m.Subscribed, m.SubscribedSet = false, false
+	if len(aux.RawSub) > 0 && string(aux.RawSub) != "null" {
+		m.SubscribedSet = json.Unmarshal(aux.RawSub, &m.Subscribed) == nil
 	}
 	return nil
 }

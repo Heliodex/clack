@@ -13,6 +13,7 @@ import (
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
+	"github.com/tetratelabs/wazero/experimental"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 )
 
@@ -113,13 +114,29 @@ func newEngine(r *Runtime) (*engine, error) {
 	hb := wrt.NewHostModuleBuilder("jr")
 	hb.NewFunctionBuilder().WithGoModuleFunction(api.GoModuleFunc(e.hostCall), []api.ValueType{i32, i32, i32, i32, i32}, []api.ValueType{i32}).Export("host_call")
 	hb.NewFunctionBuilder().WithGoModuleFunction(api.GoModuleFunc(func(_ context.Context, _ api.Module, st []uint64) {
-		if r.interrupted() {
+		now := monoNow()
+		r.lastExit.Store(now)
+		if d := r.deadline.Load(); d != 0 && now > d {
 			r.interrupts.Add(1)
 			st[0] = 1
 		} else {
 			st[0] = 0
 		}
 	}), nil, []api.ValueType{i32}).Export("host_interrupt")
+	// QuickJS's C loops call host_yield every ~10k steps
+	// (csrc/quickjs-yield.patch). Go can't stop a goroutine inside wasm
+	// code, so a stop-the-world (every GC cycle, ReadMemStats,
+	// runtime.Stack) waits for this call; it does nothing else.
+	hb.NewFunctionBuilder().WithGoModuleFunction(api.GoModuleFunc(func(_ context.Context, _ api.Module, _ []uint64) {
+		r.yields.Add(1)
+		r.lastExit.Store(monoNow())
+	}), nil, nil).Export("host_yield")
+	hb.NewFunctionBuilder().WithGoModuleFunction(api.GoModuleFunc(func(_ context.Context, _ api.Module, st []uint64) {
+		// QuickJS's cycle collector started (phase 0) or ended (1): objects
+		// scanned, heap bytes. Called from inside the collector: must not
+		// re-enter JS.
+		r.gcEvent(int32(st[0]), uint32(st[1]), uint32(st[2]))
+	}), []api.ValueType{i32, i32, i32}, nil).Export("host_gc")
 	hb.NewFunctionBuilder().WithGoModuleFunction(api.GoModuleFunc(e.hostModule), []api.ValueType{i32, i32}, []api.ValueType{i64}).Export("host_module")
 	hb.NewFunctionBuilder().WithGoModuleFunction(api.GoModuleFunc(e.hostRejection), []api.ValueType{i32, i32, i32}, nil).Export("host_rejection")
 	hb.NewFunctionBuilder().WithGoModuleFunction(api.GoModuleFunc(func(_ context.Context, _ api.Module, st []uint64) {
@@ -140,9 +157,25 @@ func newEngine(r *Runtime) (*engine, error) {
 		WithStartFunctions("_initialize").
 		WithSysWalltime().WithSysNanotime().WithSysNanosleep().
 		WithRandSource(cryptoRand{})
-	mod, err := wrt.InstantiateModule(ctx, cm, mc)
+	// the linear memory in address space reserved outside the Go heap,
+	// grown in place (wasmmem.go); wazero reads the allocator from the
+	// instantiation's context only. CLACK_JSRT_HEAP_MEMORY=1 puts it back
+	// in a Go slice (for comparing; logged once).
+	heap := r.opts.heapWasmMemory
+	if heapMemoryWanted() {
+		heap = true
+		heapMemoryLogged.Do(func() {
+			r.opts.Log("warn", "jsrt: CLACK_JSRT_HEAP_MEMORY is set: the engines' wasm memory is a Go slice, and growing it copies all of it (as before wasmmem.go)")
+		})
+	}
+	alloc := &wasmAllocator{stats: &r.wasmMem, heap: heap}
+	mod, err := wrt.InstantiateModule(experimental.WithMemoryAllocator(ctx, alloc), cm, mc)
 	if err != nil {
+		alloc.free() // a failed instantiation leaves wazero nothing to free it with
 		return nil, fmt.Errorf("jsrt: instantiate engine: %w", err)
+	}
+	if alloc.err != nil {
+		r.opts.Log("warn", fmt.Sprintf("jsrt: the engine's wasm memory is on the Go heap (growing it copies all of it): %v", alloc.err))
 	}
 	e.mod = mod
 	e.mem = mod.Memory()
@@ -161,7 +194,7 @@ func newEngine(r *Runtime) (*engine, error) {
 		e.fns[name] = f
 	}
 	// optional exports (older engine builds lack them)
-	for _, name := range []string{"jr_compile", "jr_free_js", "jr_eval_bytecode", "jr_set_gc_threshold", "jr_gc_threshold"} {
+	for _, name := range []string{"jr_compile", "jr_free_js", "jr_eval_bytecode", "jr_set_gc_threshold", "jr_gc_threshold", "jr_heap", "jr_set_yield"} {
 		if f := mod.ExportedFunction(name); f != nil {
 			e.fns[name] = f
 		}
@@ -187,6 +220,10 @@ func memoryLimitPages(heap int) uint32 {
 	return uint32(n)
 }
 
+// close frees the engine, its wasm memory's reservation included (JS
+// thread, once it has left the wasm for good). Nothing may read the memory
+// afterwards: wazero's api.Memory still holds a slice of the released
+// address space, so e.mem goes too.
 func (e *engine) close() {
 	if e.mod != nil {
 		_ = e.mod.Close(e.ctx)
@@ -196,6 +233,7 @@ func (e *engine) close() {
 		_ = e.wrt.Close(e.ctx)
 		e.wrt = nil
 	}
+	e.mem = nil
 }
 
 // call invokes an export. Panics from wazero (traps) become Go panics with

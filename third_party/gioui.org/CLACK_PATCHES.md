@@ -22,12 +22,28 @@ It should show only `gpu/gpu.go`, `widget/index.go`, `widget/editor.go`,
 `app/clack_bounds*.go`, `app/internal/windows/clack_bounds.go`,
 `app/cocoatest/`, `app/clack_cursors/`, `app/os_unix.go`, `app/os_darwin.go`, `app/os_android.go`,
 `app/os_js.go`, `gesture/clack_autoscroll.go`, `io/input/clack_values.go`,
-`internal/ops/clack_size.go`, `op/clack_size.go`, `op/clip/clack_size.go`,
+`internal/ops/clack_size.go`, `op/clack_size.go`, `op/clip/clack_size.go`, `op/clack_whole.go`,
 `io/input/clack_hover.go`, `io/input/clack_hover_test.go`,
 `font/opentype/opentype.go`, `io/input/pointer.go`, `io/input/key.go`,
 `io/input/clack_release_test.go`, `gpu/clack_release_test.go`,
 `text/clack_release_test.go`, `io/input/clack_keylog.go`,
-`io/input/clack_keylog_test.go`, `app/clack_keys_darwin_test.go` and
+`io/input/clack_keylog_test.go`, `app/clack_keys_darwin_test.go`,
+`app/metal_darwin.go`, `app/clack_wake_darwin_test.go`,
+`gpu/clack_stats.go`, `gpu/caches.go`, `gpu/path.go`,
+`gpu/headless/clack_stats.go`, `gpu/headless/clack_cost_test.go`,
+`gpu/internal/driver/clack_calls.go`, `gpu/internal/metal/metal_darwin.go`,
+`gpu/internal/d3d11/d3d11_windows.go`, `gpu/internal/opengl/opengl.go`,
+`internal/gl/gl_unix.go`, `internal/gl/gl_windows.go`,
+`internal/gl/gl_js.go`, `op/clip/clip.go`, `op/clip/shapes.go`,
+`op/clip/clack_interior_test.go`, `op/clip/clack_hole_test.go`,
+`gpu/clack_regions_test.go`, `gpu/clack_split_test.go`,
+`gpu/headless/clack_identity_test.go`, `gpu/headless/clack_helpers_test.go`,
+`gpu/internal/opengl/clack_attrib_test.go`,
+`app/metal_macos.go`,
+`app/app.go`, `app/clack_asked_test.go`, `app/clack_asked_x11_test.go`, `op/paint/clack_live.go`,
+`io/input/clack_replay.go`, `io/input/clack_replay_test.go`,
+`op/paint/clack_live_test.go`, `gpu/clack_live_test.go`,
+`gpu/headless/clack_live_test.go` and
 these two files (`CLACK_PATCHES.md`, `UPSTREAM.patch`).
 
 ## 1. gpu: drop opacity layers covered by a full-window opaque paint
@@ -1043,9 +1059,10 @@ window first leaves full screen and is ordered out once
 so an option given meanwhile doesn't send it back). The toggle waits for
 the run loop's default mode, outside the close button's click and
 `windowShouldClose:`, as Slack's handler leaves full screen after the close
-event returned. A hidden window draws no frames (Gio's
-Metal layer waits for a drawable without a timeout) and keeps its display
-link stopped; the app still gets its wake-ups. `ActionRaise` shows it, and
+event returned. A hidden window draws no frames (a frame would wait for a
+drawable nothing shows; until §32 Gio's Metal layer waited without a
+timeout) and keeps its display link stopped; the app still gets its
+wake-ups. `ActionRaise` shows it, and
 so does any other order-front (the occlusion change that follows): it
 draws again.
 
@@ -1361,3 +1378,669 @@ or straight to the view). Tests: `app/clack_keys_darwin_test.go`
 once each; the log says which came through `doCommandBySelector:`, run
 43663715941 the list above) and `internal/ui` `TestMacInspectKeys`. Not
 in `UPSTREAM.patch`.
+## 30. app: no frame for a display link tick after the animation stopped (macOS)
+
+`app/os_macos.go` (`newOSWindow`'s display link callback). A fix.
+
+The display link's callback runs on CoreVideo's thread: it puts a token
+in `redraw` and asks the main thread for `setNeedsDisplay`. `draw` takes
+the token and then waits, on the main thread, for the client's frame;
+the frame's `updateAnimation` stops the animation when nothing is due
+now (a caret blink's next wake-up is 500 ms away), but the display link
+only stops 500 ms later, and `running` is still set until then. So a tick
+that came during a frame slower than a vsync (16.7 ms at 60 Hz, 8.3 ms at
+120 Hz) found the token free, and its `setNeedsDisplay` ran on the main
+queue after the frame returned: AppKit drew once more, a `FrameEvent`
+nobody asked for, after every such frame. Clack idle with its composer
+focused draws a frame per caret blink; on Karim's Mac (2026-11-14, 8 GB,
+swapping) every frame was slower than a vsync, so every blink drew twice.
+On the runner it showed as frames whose causes `idleprobe.Recorder`
+couldn't name, about 20 ms after three blinks out of four.
+
+The main thread's block now draws only while the window still animates
+(`w.anim`, which only the main thread writes); otherwise it gives the
+token back and draws nothing. An animation that goes on keeps
+`w.anim` set, so its next frame comes as before, and a later
+`Invalidate` starts the animation again before its tick.
+
+Test: `internal/ui` `TestMacIdleCPU` on ci's macos job
+(`CLACK_MACOS_WINDOW_TESTS`): its "frames slower than a vsync" period
+makes every frame take 30 ms (`OnWindowEvent`) and allows the caret's
+blinks and `idleOtherFrames` more. Not in `UPSTREAM.patch`.
+
+## 31. op: a finished Ops list as one CallOp
+
+`op/clack_whole.go` (`Ops.Whole`). An addition, not a fix: no upstream
+API changes behaviour.
+
+Clack's inspect tool (`internal/ui/inspect`) copies an image of the
+element a click picked. It used to read the frame back at the window's
+size and paste the whole window: every channel and message around the
+element came along, and Slack shrank the 2880 px wide paste (a Retina
+window) to fit a message, so the element came out soft. The tool now
+draws only the element and a margin, at about 4 px per dp whatever the
+display: the frame's ops once more, through a headless GPU context,
+under a transform that scales the crop up and moves it to the origin.
+Gio's paths and glyph outlines are vectors (`drawOps.buildVerts`
+transforms them), so the scaled frame is as sharp as one laid out at
+that density.
+
+That needs the frame's ops as something another `Ops` can call, and
+upstream only gives one for a `Record`ed macro: the window's frame isn't
+recorded, and recording it would cross the push/pop of every stack the
+layout opens and closes around the tool's own calls. `Whole` is a
+`CallOp` from the start of the list to its current end. The ops reader
+already reads a call into any `Ops` from any start: macro definitions in
+it are skipped as usual, and deferred macros are copied into the
+reader's deferred list and run after the caller's ops, with the state
+(transform included) saved when they were deferred, so the outer
+transform applies to them too.
+
+Test: `internal/ui` `TestInspectShots` (feel-shots, llvmpipe) renders the
+pick through it. Not in `UPSTREAM.patch`.
+
+## 32. app: no frames while a window is occluded or the screens sleep, and none waits long for a drawable (macOS)
+
+`app/metal_darwin.go` (`setupLayer`'s `allowsNextDrawableTimeout`,
+`RenderTarget`, `Present`, `slowWaits`), `app/os.go` (`errNoRenderTarget`),
+`app/window.go` (`validateAndProcess`), `app/os_macos.go` (`draw`,
+`SetAnimating`, `gio_onOcclusionChanged`, `drawPaused`, `resume`,
+`gio_onPowerEvent`, `setScreensAsleep`, `screensOn`, `gio_onScreensChanged`,
+`gio_onKeys`, `gio_onMouse`), `app/os_macos.m` (`occlusionChanged`,
+`setFullScreenTransition`, the delegate's occlusion and full-screen
+methods, `GioWorkspaceObserver`, `gio_eachView`, `gio_main`),
+`app/cocoatest/` (`Window.OcclusionVisible`, `Cover`, `PostWorkspace`,
+`DrawableTimeout`, `HoldDrawables`) and `app/clack_wake_darwin_test.go`.
+A fix.
+
+Karim's clack.log (2026-11-16): "frame submit (GPU, main thread)" freezes
+were the first lines after 330 s and 403 s of silence, next to the
+realtime socket's reset ("Socket URL has expired"): his Mac had just woken.
+While the screen slept the same stage reached 40.3 s and 6 min 40.8 s.
+That stage is the UI goroutine in `FrameEvent.Frame`, which on macOS waits
+for the main thread's `validateAndProcess`, and there for `RenderTarget`'s
+`-[CAMetalLayer nextDrawable]`. Gio set `allowsNextDrawableTimeout` to NO,
+so the call waited for as long as the compositor kept the layer's
+drawables: a sleeping display keeps them, a waking one hands them back
+late. And nothing stopped a window from drawing then: the app's
+Invalidates and animations (the caret's blink) drew covered windows and
+windows on sleeping screens, 60 frames a second for an animating one.
+
+What Chromium does (Slack's desktop app is Electron):
+
+- Its browser thread never waits for a drawable. The GPU process draws
+  into IOSurfaces, which the browser sets as CALayer contents; the only
+  `nextDrawable` in chromium/chromium (`components/metal_util/hdr_copier_layer.mm`,
+  HDR content) keeps CAMetalLayer's one-second timeout (no Chromium file
+  sets `allowsNextDrawableTimeout`) and presents as Gio does:
+  `presentsWithTransaction`, `commit`, `waitUntilScheduled`, `present`.
+  Dawn's Metal swap chain (`src/dawn/native/metal/SwapChainMTL.mm`) turns a
+  nil drawable into a `Timeout` status the caller skips; ANGLE's
+  `SurfaceMtl.mm` retries one with the timeout off ("this may wait forever
+  here"), but Chromium on macOS doesn't present through ANGLE window
+  surfaces.
+- `WindowOcclusionCheckerMac`
+  (`components/remote_cocoa/app_shim/window_occlusion_checker_mac.mm`)
+  counts a window occluded while its `occlusionState` lacks
+  `NSWindowOcclusionStateVisible`, and every window occluded between
+  `NSWorkspaceScreensDidSleepNotification` and
+  `NSWorkspaceScreensDidWakeNotification` (`_displaysAreAsleep`, on every
+  macOS but 13.0-13.2). It ignores occlusion changes during a full-screen
+  transition (crbug.com/1081229) and updates once it's over, on the next
+  turn of the run loop. `WebContentsViewCocoa`
+  (`content/app_shim_remote_cocoa/web_contents_view_cocoa.mm`) marks the
+  page occluded a second later and visible at once, and an occluded page's
+  renderer draws nothing. Electron's `windowDidChangeOcclusionState:`
+  (`shell/browser/ui/cocoa/electron_ns_window_delegate.mm`) also calls
+  `WasOccluded` and `WasShown` at once (`electron_api_browser_window.cc`
+  `OnWindowHide`, `OnWindowShow`); Slack's main bundle sets no
+  `backgroundThrottling`, so it applies.
+- The computer's own sleep and wake come from IOKit
+  (`base/power_monitor/power_monitor_device_source_mac.mm`,
+  `IORegisterForSystemPower`), and Slack logs them ("PowerMonitor: System
+  suspending", "System resuming" with the sleep's length).
+
+Now:
+
+- `allowsNextDrawableTimeout` is YES, CAMetalLayer's default: `nextDrawable`
+  waits a second at most. A nil drawable is `errNoRenderTarget`, which
+  `validateAndProcess` doesn't treat as a failure (that destroyed the
+  window): the frame's ops still go to the router (the client laid them
+  out, its handlers take the input), the window asks for the next frame
+  (`setNextFrame` now: the display link's next tick), and the client
+  continues. The first skipped frame of a run logs "gio: no Metal drawable
+  within 1s … frame skipped, the window tries again", the next drawable
+  "gio: Metal drawables again after N frames skipped in …". A
+  `nextDrawable` or a present (its `waitUntilScheduled`) of 250 ms or more
+  logs how long it held the main thread, at most a line a minute for each.
+- A window draws nothing while it's occluded. The delegate reports every
+  occlusion change (`gio_onOcclusionChanged`); a window whose last change
+  lacked `NSWindowOcclusionStateVisible`, and whose `occlusionState` still
+  lacks it, skips `draw` and keeps its display link stopped. Both are
+  needed, so a visible window never waits for a notification, and a new
+  window draws before AppKit has said anything. When AppKit says it's
+  visible it draws a frame and its animation goes on (`resume`), as
+  WebContentsViewCocoa shows a page at once. A full-screen transition
+  counts as visible, and its end reads the state again on the run loop's
+  next turn, as WindowOcclusionCheckerMac does. Unlike Chromium there is
+  no second's delay before a window stops: a paused Gio window throws
+  nothing away, and a frame for a covered window could wait the second.
+- The screens' sleep stops every window's frames until their wake, which
+  draws each window again (`gio_eachView`), as `_displaysAreAsleep` does.
+  The computer's own wake (`NSWorkspaceDidWakeNotification`) doesn't end it:
+  its screens may still be off. Unlike Chromium, a click, a scroll or a key
+  press in a Gio window ends it too (the screens are on), so a
+  ScreensDidWake that never comes can't freeze a window someone is using.
+- Each of `NSWorkspaceWillSleepNotification`, `NSWorkspaceDidWakeNotification`
+  (with the sleep's length), the screens' sleep and their wake (with its
+  length), and input that ended the screens' sleep, logs one line. The
+  lengths are wall clock: the monotonic clock stands still while the Mac
+  sleeps.
+- The app still gets its wake-ups while its windows draw nothing (an
+  Invalidate's, as a hidden window's, §24), so posted work and
+  notifications go on.
+
+Where Clack still differs: Gio draws on the main thread, so a frame that
+finds no drawable (a window AppKit hasn't yet reported occluded, a display
+waking up) holds it for the layer's second, where Chromium's browser thread
+never waits; and Clack doesn't do Chromium's own occlusion check of windows
+of the same size (macOS can miss that one covers another).
+
+Tests, on ci's macos job (`CLACK_MACOS_WINDOW_TESTS`; flake-check's
+`mac-wake` job runs each `$COUNT` times), `app/clack_wake_darwin_test.go`:
+`TestOccludedWindowPausesMac` (an opaque window over every screen,
+`cocoatest.Cover`, makes AppKit report the test window occluded within
+about 30 ms: an animating window draws nothing for 1.5 s of Invalidates
+and still gets its wake-ups, and draws again at once when uncovered; an
+idle one draws nothing for an Invalidate until it's visible, then a frame
+at once), `TestNoDrawableSkipsFrameMac` (the layer's
+`allowsNextDrawableTimeout` is YES; `cocoatest.HoldDrawables` has
+`nextDrawable` answer as CAMetalLayer documents for a pool with none free,
+a second's wait and nil with the timeout, a wait until the release
+without it: frames are skipped and tried again about once a second with
+the main thread running other work in between, none is presented, the
+window isn't destroyed, and once the drawables come back a frame is
+presented, with one log line for the run and one for its end; a test
+can't make the compositor keep drawables on a desktop that shows them,
+and holding them doesn't empty the pool: on the runner a layer gave 8
+unpresented drawables, their textures taken, without waiting, flake-check
+run 43822438092) and `TestScreensSleepWakeMac` (`cocoatest.PostWorkspace`: the
+computer's sleep and wake each log a line; between the screens' sleep and
+wake an animating window draws nothing, the computer's wake included, and
+its frames come back with the wake; a click while the screens are asleep
+brings them back too, and a late ScreensDidWake logs nothing more). Before
+the fix the occlusion test drew 90 frames while covered and the sleep test
+found no log line (flake-check run 43821390827), and the no-drawable test
+found the main thread running nothing for over 2.5 s, no frame skipped or
+tried again (run 43823092739). With it each passed 3 runs of 3 (run
+43823305380): the main thread's longest wait 0.9 s, 4 frames skipped in
+4 s, frames back about 75 ms after the window was visible or the screens
+woke. Not in `UPSTREAM.patch`.
+
+## 33. io/input: when a router was last given input
+
+`io/input/clack_inputidle.go` (new: `SinceInput`) and `io/input/router.go`
+(`Queue` notes each event). An addition: nothing upstream reads the
+clock.
+
+Clack holds work that would stall the window for a pause in the person's
+input: cmd/clack's forced collections (`debug.FreeOSMemory`), whose
+stop-the-world phases and scavenge of all free memory freeze whatever the
+UI goroutine is doing. A pause has to mean no input anywhere, and Clack
+code only ever sees the events its own handlers are routed: a focused
+widget's keys (the message list's arrow navigation, Block Kit's and
+plugins' text fields, list search, the link dialog), a drag another
+widget grabbed (the grab drops every other handler, the root's
+included), a popover drawn with `op.Defer` above the window's root
+handler, and the huddle windows' input never reach a handler at the
+root. Frames are no sign of input either: a focused editor's caret
+redraws the window twice a second for as long as it's focused.
+
+`Queue` notes every pointer event (not the router's or window's own
+`Cancel`), key event and `EditEvent` it's given, before routing, in a
+process-wide clock on the monotonic time (a wall-clock step moves
+nothing). `SinceInput` is how long ago the last one was (how long the
+process has run when there was none). Focus changes, snippets and
+selections aren't input. Clack reads it through `internal/ui/inputidle`,
+whose stockgio build (`.github/scripts/gio-layer-fix.sh`) has no clock.
+
+Tests: `io/input/clack_inputidle_test.go` (`TestSinceInput`: a cancel and
+a focus change don't count; a key, an edit and a scroll do) on ci's
+linux-gio job, `internal/ui` `TestInputIdleSeesFocusedWidgetKeys`,
+`TestInputIdleSeesScroll` and `TestInputIdleSeesGrabbedDrag`, and
+`cmd/clack` `TestWaitQuietOnInput`. Not in `UPSTREAM.patch`.
+
+## 34. io/input: where the key focus is
+
+`io/input/clack_focus.go` (new: `Source.FocusTag`, `Source.CanFocus`,
+`Source.AskedFocus`, `Source.Within`). An addition: nothing upstream
+behaves differently.
+
+A Source answers only "is this tag focused?". Clack's overlay layers
+(`internal/ui/slackc` layers.go: kit's Popover, Slack's modals, plugin
+dialogs, the shell's menus) work the way the DOM does a modal. Escape
+goes first to the focused element, then to the innermost layer whose
+content holds the focus, then to the topmost one. A layer records the
+element that had the focus when it opened (document.activeElement), and
+gives it back when it closes if that element is still there and
+focusable. That needs these answers about the last frame, and one about
+the frame in progress:
+
+- `FocusTag`: the focused tag, or nil.
+- `CanFocus(tag)`: whether a `key.FocusCmd` for tag would keep the
+  focus past the frame. In the last frame the tag was drawn (an
+  `event.Op`) and asked for focus events (`key.FocusFilter`), which is
+  what `keyQueue.Frame` keeps the focus on.
+- `AskedFocus(tag)`: whether tag asked for focus events in the frame in
+  progress (since the last `Frame`). A layer gives the focus back at the
+  end of the frame in which it stopped drawing, before that frame's
+  `Frame`; there `CanFocus` still passes a tag that went in this frame,
+  and a widget drawn now has asked.
+- `Within(tag, container)`: whether tag's `event.Op` was in container's
+  clip area or one nested in it (the pointer queue's area tree). Deferred
+  macros run from the root area, so a container whose content is
+  deferred draws its own op inside the macro.
+
+All four read the router's state and nothing else. A disabled Source
+answers nil and false.
+
+Test: `io/input/clack_focus_test.go` (`TestFocusTagCanFocusWithin`) on
+ci's linux-gio job. Stock Gio builds of `internal/ui/slackc` (the
+gio-layer-fix job's richview) use `gio_patch34_stock.go`. With no
+answers there, a layer neither records an opener nor sees the focus
+inside it. Not in `UPSTREAM.patch`.
+
+## 35. op/paint, gpu, app, io/input: live images, what a frame was asked for, and frames drawn again
+
+`op/paint/clack_live.go` (new: `LiveImage`, `NewLiveImageOp`),
+`gpu/gpu.go` (`resolveLive`, called by `texHandle`), `app/app.go`
+(`FrameEvent.Asked`, `FrameEvent.AskedAt`), `app/window.go` (`askFrame`,
+the `asked` and `askedAt` fields, `processEvent`'s `frameEvent`),
+`io/input/clack_replay.go` (new: `Source.Replay`) and `io/input/router.go`
+(`Frame`). Additions: nothing upstream behaves differently unless asked.
+
+Gio draws the whole window every frame, and Clack's layout of it takes
+17–23 ms on Karim's Mac with his plugins (2026-11-16). An animated custom
+emoji (`:explodes:`, 13 frames of 30–70 ms) asked for a frame every
+frame of its own, so every one of them cost the whole layout: the
+animation played slowly and the window lagged while it was on screen.
+Chromium repaints only the image's layer. Clack now shows the last frame's
+ops again when an animation is all that asked for the frame
+(`internal/ui` quiet.go), which needs three things from Gio:
+
+- A live image: `NewLiveImageOp(l)` is an `ImageOp` whose pixels are
+  `l.Image()` as it is when the GPU draws the frame, not when the ops
+  were written. Its handle is a `liveHandle`; `texHandle` asks it for the
+  image to draw (`resolveLive`) and keys the texture by that image's own
+  handle, so each of an animation's frames is its own texture, uploaded
+  when shown. The ask happens in `uploadImages`, after `collect` dropped
+  the paints outside the viewport and their clips: only the paints a frame
+  shows ask, once each. The image's size must stay the size the live op
+  was made with (the paint's bounds and texture coordinates come from it).
+  `internal/imgcache` (`SetLiveOps`) hands out its playing animations this
+  way: its `LiveImage` is the frame due at the GPU's ask, which also
+  counts as a draw for the player (it stays on screen, its next frame is
+  asked for).
+- What a frame was asked for: `FrameEvent.Asked` reports whether the
+  window's own frames asked for this one or a later one since the last
+  FrameEvent, and `FrameEvent.AskedAt` the earliest such time (the zero
+  time: at once). Every `setNextFrame` but one asks (`askFrame`, recorded
+  in `asked` and `askedAt`): `updateState`'s wake-up from the router
+  (`WakeupTime` after a frame: an `op.InvalidateCmd`, events pending),
+  input or a focus change a handler took, a key press the key log kept
+  (patch 28), `Option`, `ClickFocus`, and a frame that found nothing to
+  draw into (patch 32). The one that doesn't is `callbacks.Invalidate`,
+  where every `Window.Invalidate` comes back to the window from its
+  driver (the macOS and Windows event loops' `Wakeup`, X11's and
+  Wayland's dispatch): it sets `nextFrame` so the driver draws a frame,
+  and asks nothing, so a frame only Invalidates brought has `Asked`
+  false, and a client that knows why it invalidated can show its last
+  frame's ops again. The first version of this patch read `nextFrame`
+  itself, which every Invalidate sets: every frame said the window had
+  asked for it, and no real window ever drew a quiet frame (only the
+  tests that modelled one did). The frame takes the asks with it (they're
+  cleared at every `frameEvent`, as `hasNextFrame` is), so a client that
+  shows its last ops again executes `op.InvalidateCmd{At: AskedAt}` to
+  keep a wake-up that isn't due yet; one that lays out has its widgets
+  ask again. A wake-up's own timer brings its frame through `Invalidate`,
+  and that frame is asked for at its time. A frame that replaces one the
+  client wasn't handed yet (coalesced) keeps what that one was asked for.
+- Frames drawn again: the router builds each handler's event filters
+  from the `Event` calls of the frame's layout, and a frame that shows
+  the last frame's ops again makes none, so its `Frame` swapped in empty
+  filters. The focused editor then lost the focus (`keyQueue.Frame`
+  drops a focus whose tag asked for no focus events) and got it back from
+  Clack's KeepFocus at the next laid-out frame, a blur and a focus for the
+  plugins each time (Taut's patched MessagePaneInput rendered again on
+  every one: textyHasFocus false, true), and an event right after one had
+  no filter to be routed by. The key log (patch 28) stopped too: it logs
+  while a Source reads `KeyPresses` every frame, and a replayed frame
+  reads none, so the press after one was lost (the inspect tool's Konami
+  code couldn't be typed with an animation on screen). `Source.Replay()`
+  says the frame in progress is the last one's ops again: its `Frame`
+  keeps every handler's filters, the key filter and the key log as the
+  last laid-out frame left them.
+
+Tests, on ci's linux-gio job: `op/paint/clack_live_test.go`
+(`TestLiveImageOp`); `gpu/clack_live_test.go` (`TestDrawOpsLiveImage`:
+the renderer's own `uploadImages`/`texHandle` against a device that
+records the pixels each upload sends, the same ops uploading the live
+image's image at each frame, nothing when it's unchanged, and a paint
+outside the viewport never asking); `app/clack_asked_test.go`
+(`TestFrameEventAsked`: `Window.Invalidate` and `callbacks.Invalidate` as
+the drivers deliver them ask nothing, a router wake-up, a handled press
+and an `Option` do, an ask outlives an Invalidate but not its frame);
+`io/input/clack_replay_test.go` (`TestReplayKeepsFilters`,
+`TestReplayKeepsKeyLog`: a replayed frame keeps the focus, routes the
+next press and keeps logging keys; the same frames without Replay lose
+them); and under Xvfb, `app/clack_asked_x11_test.go`
+(`TestFrameEventAskedX11`, `CLACK_X11_ASKED_TESTS`: on a real X11 window
+an Invalidate's frames have `Asked` false, an `op.InvalidateCmd`'s next
+frame, every frame before a later wake-up and that wake-up's own frame are
+asked for, and so is the frame a real press (XTEST, python-xlib) brings)
+and `gpu/headless/clack_live_test.go` (`TestLiveImageFrames`: a real GPU
+context draws the same ops twice and shows each image). The client side
+on App.Run's real window: `internal/ui` `TestRealWindowQuietFrames`
+(linux-idle under Xvfb, macos on Metal, windows-idle on Direct3D).
+flake-check's emoji-anim job runs them all 20 times. Not in
+`UPSTREAM.patch`.
+
+## 36. gpu: what a frame costs (frame stats)
+
+`gpu/clack_stats.go` (new: `FrameStats`, the `ClackStats` interface),
+`gpu/gpu.go` (counts in `frame`, `stencilClips`, `intersect`,
+`drawLayers`, `drawOps`; `buildPaths` keeps quad bounds when asked),
+`gpu/caches.go` (`opCacheValue.quads`),
+`gpu/internal/driver/clack_calls.go` (new: `CallCounter`, `Calls`), the
+Metal, Direct3D 11 and OpenGL backends (`ClackCalls`), `internal/gl`
+(`Functions.Calls`, counted in every `gl_unix.go` call) and
+`gpu/headless/clack_stats.go` (new: `Window.ClackFrameStats`,
+`ClackStatsDetail`, `ClackSync`). Additions only.
+
+Karim saw Clack at 10% GPU in Windows Task Manager with nothing moving
+(2026-11-16), and his Mac's traces had ~11,400 Metal calls a frame.
+`FrameStats` says what the renderer did for the last frame: the ops by
+kind (blits, covers, intersections), the paths stenciled, draw calls,
+render passes, the calls into the graphics API and the ones the backend's
+state cache left out (patch 37), the paths whose vertices the frame
+built and uploaded (`PathsBuilt`, `PathBytes`: the path cache's misses,
+each a vertex buffer of its own; `buildPaths` returns them), and the
+pixels: stencil fragments (from
+each path's quads in its stencil region; `ClackStatsDetail` keeps the
+quads' bounds on the CPU for it), covered, blitted, intersected, cleared,
+the atlases' and the layer pages' size and the layer pages a frame drew
+into (`LayerPx`, `LayerPages`). `ClackSync` reads one pixel back, so a
+timed frame includes its rasterization. `ClackStateCaches` turns patch
+37's caches and batching off and on, for tests.
+
+Used by `gpu/headless`'s `TestClack*` (`clack_identity_test.go`: pixel
+checks that fail; `clack_cost_test.go`'s `TestClackPlacementNoise`, a
+probe that logs), `internal/ui/theme/framecost_test.go`
+(`TestFrameCostPixels`), both in ci's linux-gio (llvmpipe), macos
+(Metal) and windows-applog (Direct3D 11, WARP) jobs,
+`internal/ui/framecost_test.go` (`TestFrameCostWindow`, flake-check's
+gpu-cost job on all three), and the perf workflow's plugins job
+(`perf_gpustats_test.go`: the gpu passes' draw and API calls). Not in
+`UPSTREAM.patch`.
+
+## 37. gpu/internal: Metal, Direct3D 11 and OpenGL leave out state the API already has
+
+`gpu/internal/metal/metal_darwin.go`, `gpu/internal/d3d11/d3d11_windows.go`,
+`gpu/internal/opengl/opengl.go`, `gpu/internal/driver/clack_calls.go`
+(`ClackStateCache`). No change to what's drawn, and that is checked:
+with `driver.ClackStateCache` false (`gpu.ClackStateCaches(false)`, which
+also turns Metal's batching off) every backend makes every call Gio made,
+the same draws in the same order, and `TestClackStateCacheIdentical` and
+`TestFrameCostPixels` require the same pixels either way, on llvmpipe,
+Metal and WARP in ci. The state is kept either way, so the switch can
+change between any two frames.
+
+Gio's renderer binds the pipeline, the quad's vertices, the textures, the
+uniforms and the viewport again for every op. OpenGL's backend had a
+state cache for most of it; Metal's and Direct3D's had none:
+
+- Metal: one cgo call per command, each under its own autorelease pool.
+  The backend now keeps the open render encoder's state (`encState`):
+  the pipeline, the attribute buffer (a Metal buffer at an offset, or a
+  Go buffer's bytes as of its upload, `Buffer.gen`), the bytes each
+  stage was last sent at index 0, the fragment textures and samplers per
+  unit and the viewport, and leaves out a bind of what the encoder has. A
+  new encoder starts with nothing. `BindUniforms` sends a stage only the
+  uniforms it reads: shaders reading none (the stencil and intersection
+  fragment shaders, the texture materials') get no `setFragmentBytes`,
+  and a stage whose bytes in its range (`Shader.uniformRange`, from the
+  shader's reflection) are the ones it was last sent, at least as many
+  as now, isn't sent them again (text runs of one colour in a row; Metal
+  validation checks the bound length against the shader's whole argument
+  struct, which can reach past the last member it reads). Sampler states are one per
+  filter for all textures (`Backend.sampler`), so switching textures
+  keeps the sampler bound; `Texture.Release` leaves it to the backend.
+  A buffer bound again at another offset only gets
+  `setVertexBufferOffset`. And the render commands left go into a Go
+  buffer (`Backend.rec`: an opcode and 8-byte words, bytes copied in)
+  that `renderEncReplay` runs in one cgo call under one autorelease pool
+  when the pass ends (or at 1 MB): the same Metal calls in the same
+  order, one cgo crossing a pass instead of one a call.
+  `driver.ClackBatchCommands = false` calls them one at a time, for
+  tests that compare.
+- Direct3D 11: `prepareDraw` set the vertex and pixel shaders, input
+  layout, blend state, vertex buffer and topology for every draw, and
+  `BindUniforms`, `BindTexture` and `BindIndexBuffer` set theirs every
+  time, each a COM call through syscall. `ctxState` keeps what the
+  context was last set to; a set of the same is left out. The pixel
+  shader's constant buffer is bound only for shaders that read it, and a
+  constant buffer uploaded the bytes it has (`Buffer.last`) isn't
+  updated. `BeginFrame` forgets everything (the swap chain code sets
+  state too); `BeginRenderPass`, `BindImageTexture` and
+  `BindStorageBuffer` forget the bound shader resources (Direct3D unbinds
+  a resource from them when it's bound for output).
+- OpenGL: `vertexAttribPointer` was called for every attribute of every
+  draw, and every uniform was set before every draw. An attribute
+  already pointing at the same buffer, offset and format is left alone
+  (`glState.deleteBuffer` forgets attributes into a deleted buffer, whose
+  name can come back), and a program's uniform set to the bits it has
+  (`uniformLocation.last`) isn't set again. The skip trusts the buffer an
+  attribute points into, so `queryState` (a shared context, a context the
+  GPU is built again on) reads it from `VERTEX_ATTRIB_ARRAY_BUFFER_BINDING`
+  (`queryVertAttrib`); Gio read `VERTEX_ATTRIB_ARRAY_ENABLED` there, so an
+  enabled attribute seemed to point into buffer 1, the name the next
+  `glGenBuffers` hands out, and its first bind would have been left out
+  (`TestQueryVertAttribBinding`).
+
+Measured on flake-check's gpu-cost job with Clack's whole window
+(`TestFrameCostWindow`) and the scenes of `TestFrameCostPixels`, the
+calls these leave out are `FrameStats.Skipped`, and `Crossings` the
+calls from Go into C or the system they took: on a light window at 1x,
+Metal 10,506 calls before, 6,056 after the state cache alone; Direct3D
+11 (WARP) 22,929 and 5,559; OpenGL (llvmpipe) 15,157 and 10,154. Not in
+`UPSTREAM.patch` yet (a candidate).
+
+## 38. op/clip, gpu: a rounded clip is left off what's drawn inside its interior
+
+`op/clip/shapes.go` (`RRect.Interior`, set on the `PathSpec`),
+`op/clip/clip.go` (`PathSpec.interior`; `Op.add` writes it),
+`internal/ops/ops.go` (new op `TypeClipInterior`, `DecodeClipInterior`)
+and `gpu/gpu.go` (`pathOp.interior`, `pathOp.covers`, used by
+`expandPathOp`, `packIntersections` and `intersectPath`;
+`ClackLegacyClips`).
+
+Clack's primary panel is a `clip.RRect` around everything in it, so every
+text run, rounded image and icon inside was clipped by two paths: an
+intersection, with its own pass over both paths' coverage into another
+atlas (about 11 more GPU calls an op on Metal) and the panel's path
+stenciled over the whole panel every frame. Gio's coverage is exactly 1
+where a rectangle's straight edges are at least a pixel away: the
+`TypeClipInterior` op before an outline's `TypeClip` gives that
+rectangle (`RRect.Interior`: the columns between the corners' arcs, a
+pixel in from each edge; under an arc the coverage is a sum of slivers
+rounded to half floats). The renderer drops such a clip from the clip
+stack of every op whose bounds lie in its interior, under an integer
+offset only: the op is drawn as if the clip weren't there (same pixels:
+the coverage it multiplied by is 1.0), and the clip isn't stenciled for
+it. Strokes get no interior. The router ignores the new op. Patch 42
+splits a big colour op along the interior, so its inside is drawn this
+way.
+
+`ClackLegacyClips(true)` turns this and patches 39 and 42 off, for tests
+that compare the two ways (`ClackLegacyParts` each on its own). With every path stenciled at the same place, an op
+clipped through the RRect or with the clip dropped inside its interior
+is the same picture on all three backends (`TestClackPlacementNoise`,
+2026-11-16, before patch 39 moved the clip's regions). Since 39 the
+glyphs inside land elsewhere in the atlas, and their own coverage moves
+by a rounding as it does when one more path is drawn first. Not in
+`UPSTREAM.patch`.
+
+## 39. gpu: a clip path is stenciled in regions near the ops it clips
+
+`gpu/gpu.go` (`pathOp.more`, `pathRegion`, `addRegion`, `region`;
+`expandPathOp`, `packStencils`, `stencilClips`, `packIntersections`,
+`intersectPath`, `prepareIntersections`).
+
+Gio stenciled a path once over the box around all the ops it clips. A
+pixel's coverage only adds up the curves above it, so the same path can
+as well be stenciled in several regions: a panel clipping a hovered row,
+a divider, a scroll bar along its right edge and its corners isn't
+stenciled over the whole panel. `addRegion` puts an op's rectangle in the
+region it grows the least, unless that adds more than `regionSlack`
+(32K) pixels no op needs; then it gets a region of its own, up to
+`maxPathRegions` (8). Each region is packed and stenciled on its own,
+from the same vertices; an op reads the coverage from a region holding
+it. A path with one op, or ops close together, has one region as before.
+Rect clips have none (they never had a use for theirs).
+
+What can change: a path's coverage depends by a rounding on where its
+stencil lands in the atlas (the GPU interpolates from the atlas origin),
+so pixels on a region's edges can come out a level or two apart, as any
+change earlier in a frame already does. `TestFrameCostPixels` measures
+that floor in each scene and holds the new way to it. Not in
+`UPSTREAM.patch`.
+
+## 40. gpu: atlas pages shrink, idle ones go after a while, and layers of a depth share a page
+
+`gpu/path.go` (`FBO.idle`, `FBO.unused`, `fboSet.resize`) and
+`gpu/gpu.go` (`packLayers`, `ClackLegacyLayers`; `stencilClips`,
+`intersect` and `drawLayers` size their set before returning early).
+
+`fboSet.resize` meant to make a page's texture again when it wasted too
+much, but its test (needed over current size) is at most 1 whenever the
+page fits, so a coverage page kept its biggest size for good, and every
+frame cleared and stored all of it (on llvmpipe a memset of the whole R16
+texture; on Apple GPUs a store of every tile). A texture more than twice
+the size its page needs for `fboIdleFrames` (60) frames in a row is made
+again to size, and one the frame doesn't need at all goes after as many
+frames instead of at once (a page count going down and up, as an opacity
+layer fades in, made and released textures each time). `packLayers`
+meant layers of one depth to share a page but never updated its depth,
+so every nested opacity layer got a page, an FBO and a render pass of
+its own. A set is sized, and so aged, in every frame, also one that needs
+none of it (a frame with no opacity layer, intersection or path: the
+last fade's window-sized layer page stayed for good). A page counts its
+oversized frames and its unused ones, each rule waiting its 60 frames; since
+patch 44 a frame that doesn't use the page counts toward both. `ClackLegacyLayers(true)` gives every nested layer a page again,
+for tests: `TestClackLayerPages` draws the window's nested layers (a
+fade holding three siblings, one with a layer of its own, over a rounded
+clip) both ways and requires the same pixels in fewer pages;
+`TestClackAtlasShrinks` checks a page keeps its size for 59 small frames,
+is made to size on the 60th, grows back at once, and that a coverage
+page no frame needs and a layer page no frame draws into go after 60
+frames and not before. Not in `UPSTREAM.patch` yet (candidates).
+
+## 41. app: the macOS display link and layer aren't set again for nothing
+
+`app/os_darwin.go` (`displayLink.Start`), `app/metal_macos.go`
+(`resizeDrawable`) and `app/os_macos.m` (`displayLayer:`).
+
+A drawing window restarts its animation every frame (`draw` calls
+`SetAnimating`), and `displayLink.Start` sent on an unbuffered channel to
+the link's goroutine each time, which had to be scheduled to take it.
+Start now returns at once when the last state the main thread sent was a
+start (`displayLink.asked`; Start and Stop come from the main thread, and
+the goroutine handles states in order). A first version read the
+goroutine's `running` instead, which drops to 0 only after Stop has
+returned: a Start right after a Stop was skipped and the window stopped
+drawing (ci's macOS key tests, 2026-11-17). `resizeDrawable` set the layer's `drawableSize` every frame and
+`displayLayer:` its `contentsScale`; each is set only when it changes.
+The window's geometry is still read every frame (`updateWindowMode`):
+caching it would have to catch every resize, move, screen and scale
+change. Not in `UPSTREAM.patch`.
+
+## 42. op/clip, gpu: a stroked rounded rectangle has a hole, and a big colour op is drawn in whole-pixel parts around it or a rounded clip's interior
+
+`op/clip/shapes.go` (`RRect.StrokeHole`; `RRect.Path` records the
+rectangle on the `PathSpec`), `op/clip/clip.go` (`PathSpec.rrect`;
+`Op.add` writes a stroke's hole), `internal/ops/ops.go` (new op
+`TypeClipHole`, `DecodeClipHole`) and `gpu/gpu.go` (`pathOp.hole`;
+`splitOp`, `around`; `ClackLegacyParts`).
+
+The workspace's shadow is concentric strokes of rounded rectangles the
+size of the window, 8 at 1x and 16 at 2x in light mode, and its outline
+one in dark mode. Gio stenciled a stroke over its whole box (each curve's
+quad reaches down to the bottom of its contour) and covered the box
+again. A stroke of width w covers nothing more than w/2 and a pixel in
+from the straight sides, between the corners' arcs: `RRect.StrokeHole`,
+written as `TypeClipHole` before the stroke's `TypeClip` (an RRect's
+stroke only). Under an integer offset, the renderer draws a uniform
+colour op through such a stroke in the parts of its bounds around the
+hole (`around`: the rows above and below the width of the op, the
+columns beside the hole between them), leaving the hole out of the
+stencil and the cover; each part is an op of its own, and patch 39 gives
+the parts' stencil regions. The same split draws a big colour op in a
+rounded clip, as Clack's panel fill, in the edges around the clip's
+interior, through the clip, and the interior, which patch 38 then draws
+without it. A split must leave out or unclip `splitMin` (32K) pixels.
+
+The parts are whole pixels in window space and tile the op, so each
+pixel is drawn once with the coverage it had. Clack first split them in
+the theme, as abutting clips; under any transform but an integer offset
+(an inspect shot's scale, an animation) Gio makes each clip rectangle an
+antialiased path, and two parts meeting at a fractional edge blended the
+same colour twice, up to 25% of the background showing through the
+panel and notches in the dark outline. Only at an integer offset does a
+path have a hole or an interior, so under a transform every op is drawn
+whole, as Gio did: `TestClackSplitsUnderTransform` (gpu/headless) and
+`TestFrameCostPixels`' transformed scenes (internal/ui/theme) require the
+old way's pixels there. Not in `UPSTREAM.patch`.
+
+## 43. gpu: a path's sub-pixel offset is part of its cache key
+
+`gpu/gpu.go` (`opKey.ox`, `opKey.oy`; `opKey.SetTransform`).
+
+`transformOffset` takes an op's whole-pixel offset out of its transform
+and leaves the fraction, which `buildVerts` builds into the path's
+vertices, but the path cache's key kept only the linear part. A path
+cached at the origin (Clack's theme.RRect, Circle, the rounded image
+clip, borders, rings and icons) drawn at a new fraction of a pixel was
+then drawn from the vertices of the first fraction it was built at: the
+intro's sliding cards and the login card's shake moved in whole pixels
+with their rounded rects off their clips by up to a pixel, and inspect
+shots drew every same-sized avatar clip at the first one's fraction. The
+fraction is in the key now: whole-pixel offsets still share one entry,
+and a path at another fraction is built there (`TestCollectSubPixelKey`,
+`TestClackSubPixelCache`). Not in `UPSTREAM.patch` yet (a candidate).
+
+## 44. gpu: the path cache frees a slot without dropping another slot's entry
+
+`gpu/caches.go` (`opCache.frame`).
+
+`frame` frees every slot no frame used, and freed slots kept their key;
+`put` hands freed slots out again. A key that left the screen for a frame
+and came back into another slot then had its live index entry deleted by
+its old slot at every frame's end, so `get` missed and the path was
+tessellated, uploaded and released again every frame it stayed on screen
+(open and close a menu, then scroll: the hover toolbar's icons, pills,
+borders, avatar clips and text runs that come back). That gave back the
+saving of patch 36's origin caching wherever paths come and go. `frame`
+now deletes an entry only while it names the slot, and clears the slot
+(`TestClackOpCacheReturningPathHits`). Upstream Gio v0.10.3's own bug: a
+candidate for `UPSTREAM.patch`.
+
+Patch 40's page aging, with it (`fboSet.resize`):
+- a frame that doesn't use a page counts toward the page's oversized
+  frames, so a page whose set only some frames use shrinks too
+  (`TestClackAtlasShrinksUsedNowAndThen`); patch 40 reset the count in such
+  frames, and a page used every other frame kept its biggest size for good;
+- a grow keeps the dimension that still fits. Upstream makes the texture
+  just the new need (padded 5%), so a page whose needs alternate between
+  wide and tall was made again on every frame that used it, and the shrink
+  above let pages used now and then fall into that too
+  (`TestClackAtlasGrowKeepsSize`).

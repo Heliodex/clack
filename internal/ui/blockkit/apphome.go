@@ -37,6 +37,7 @@ type AppDM struct {
 	list    layout.List
 	about   *core.AppProfile
 	aboutV  *richview.View
+	page    *popups.AboutPage // the About page (agent_about_page)
 	loading bool
 	opened  map[string]bool
 }
@@ -229,8 +230,30 @@ func (d *AppDM) dispatchOpen(t string) {
 			_ = ix.HomeOpened(ctx, ch, tab, team)
 		}()
 	case "about":
-		d.loadAbout()
+		if !d.aboutPage() {
+			d.loadAbout()
+		}
 	}
+}
+
+// aboutPage is BaseAppSpace's choice (2Fle): with agent_about_page on and
+// the app's id, the About tab is Slack's About page
+// (popups.AboutPage); otherwise the older layout (layoutAbout).
+func (d *AppDM) aboutPage() bool {
+	c := d.h.Core()
+	return c != nil && c.AgentAboutPage() && d.home.AppID != ""
+}
+
+// AboutPage is the About tab's About page, nil when the tab draws the
+// older layout.
+func (d *AppDM) AboutPage() *popups.AboutPage {
+	if !d.aboutPage() {
+		return nil
+	}
+	if d.page == nil || d.page.AppID() != d.home.AppID {
+		d.page = popups.NewAboutPage(d.h, d.home.AppID, d.user.ID)
+	}
+	return d.page
 }
 
 var tabLabel = map[string]string{"home": "Home", "messages": "Messages", "about": "About"}
@@ -302,6 +325,12 @@ func (d *AppDM) LayoutBody(gtx C) D {
 			})
 		})
 	case "about":
+		if p := d.AboutPage(); p != nil {
+			return p.Layout(gtx)
+		}
+		if d.about == nil {
+			d.loadAbout() // the experiment turned off while About was open
+		}
 		return d.list.Layout(gtx, 1, func(gtx C, _ int) D { return d.layoutAbout(gtx, sz.X) })
 	}
 	return D{Size: sz}
