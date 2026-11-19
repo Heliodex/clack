@@ -1505,17 +1505,20 @@ jobs:
       - name: "slackc + jsrt + taut + core: panes, same-output commits, refresh, conversion refs, COUNT runs"
         run: |
           rc=0
-          go test -count=$COUNT -run '^TestPanesHaveRootsOfTheirOwn$' ./internal/ui/slackc || rc=1
+          go test -count=$COUNT -run '^(TestPanesHaveRootsOfTheirOwn|TestRemountKeyedInPane)$' ./internal/ui/slackc || rc=1
           go test -count=$COUNT -run '^(TestSameOutputSendsNoTree|TestPortalUnderHiddenNativeAnswers)$' ./internal/jsrt || rc=1
-          go test -count=$COUNT -run '^(TestRefreshSendsNoSameTree|TestUserEventsForUndrawnMembersCostNothing|TestChangeDuringFirstConversion)$' ./internal/taut || rc=1
-          go test -count=$COUNT -run '^(TestMessageRefs|TestStoredMessageReadsNoMember|TestEventsMarkDocChanges)$' ./internal/core || rc=1
+          go test -count=$COUNT -v -run '^(TestRefreshSendsNoSameTree|TestUserEventsForUndrawnMembersCostNothing|TestChangeDuringFirstConversion|TestIndexRefsStaleness|TestConvBumpRedraws|TestOffScreenViewsDrawNothing|TestMemberChangesOnlyForWhatJSHolds|TestInvalidationsJoinTheQueuedTask|TestRawEventsConvertNothing|TestUnconvertedMessagesKeepNoGeneration|TestRefetchDecodesOnlyWhatChanged|TestInjectedMessagesOneStorePass|TestRefreshRedrawsOnlyChanges)$' ./internal/taut || rc=1
+          go test -count=$COUNT -run '^(TestMessageRefs|TestMessageRefsBotsAndEmoji|TestDocFingerprints|TestStoredMessageReadsNoMember|TestEventsMarkDocChanges|TestUserEventAfterSilentRename|TestPrefsBaselineFollowsInstalls|TestRenamedCanvasTitle|TestEmojiRemovalNamesAndAliases)$' ./internal/core || rc=1
           exit $rc
-      - name: "messages + composer: the broadcast reply in every list, renames redraw rows, one thread's composers, 3 runs"
+      - name: "messages + blockkit + composer + ui: every list's roots, renames and prefs re-convert, loads, views under the throttle and with only the frames asked for, thread replies, a patched root's updates, the mirror's wait, a dropped model's reload, element hosts, composers' panes, COUNT runs"
         if: ${{ !cancelled() }}
         run: |
           rc=0
-          go test -count=3 -v -timeout 30m -run '^(TestBroadcastReplyInBothPanesIdle|TestRenamesRedrawRows|TestRenameDuringLoad|TestInjectedTakesEqualConversions)$' ./internal/ui/messages || rc=1
-          go test -count=3 -v -timeout 10m -run '^TestComposersForOneThreadSendTheirOwn$' ./internal/ui/composer || rc=1
+          go test -count=$COUNT -v -timeout 60m -run '^(TestBroadcastReplyInBothPanesIdle|TestRenamesRedrawRows|TestRenameDuringLoad|TestInjectedTakesEqualConversions|TestDocPrefsConvertLoadedMessages|TestPatchedRowTakesChangeWithoutAnotherFrame|TestBroadcastPreambleReadsMentionsAsItDraws|TestMessagePatchGetsWrappersExactMsg|TestPatchedRootSurvivesUpdates|TestVoteButtonsSurviveUpdates|TestViewedRowTakesUpdates|TestReconvertKeepsAnUpdate|TestBroadcastPreambleFollowsARename|TestUnviewedRowTakesUpdatesOnce|TestSenderRenameWhileDrawing|TestListsPastTheModelLimitTakeLiveMessages|TestVoteRootInBothPanesUnderASlicePatch|TestEditMaskedWhileTheChannelIsBusy|TestViewedRowGoesBackToItsSource|TestOverlayKeepsTheViewsMasks|TestMessageTextDropsFilesAndAttachments|TestPreviewMemberStatusRedrawsNothing|TestSenderRenameMidFrameDraws|TestDroppedModelTakesCoresWindow|TestDroppedModelPagesBackAfterItsReload|TestReadyViewDrawsWithOnlyInvalidateFrames|TestViewedRowGoesBackWithOnlyInvalidateFrames|TestFirstReadAfterARefreshDrawsTheView|TestRowWaitsForTheMirror|TestLoadOnlyChangeNeverDrawsTheOldCount|TestResyncClaimsOnlyWhatCameBefore|TestSwitchedListWaitsForTheNewRevision|TestKeepLiveTakesTheEventsEmitSeq|TestDroppedModelKeepsItsEditUnderAReaction)$' ./internal/ui/messages || rc=1
+          go test -count=$COUNT -v -timeout 20m -run '^(TestActivityLiveDroppedModel)$' ./internal/ui/views || rc=1
+          go test -count=$COUNT -v -timeout 20m -run '^(TestGalleryElementPayloads|TestDrawnHostOutlivesNewerHosts)$' ./internal/ui/blockkit || rc=1
+          go test -count=$COUNT -v -timeout 10m -run '^(TestComposersForOneThreadSendTheirOwn|TestComposerVanishRemountsInItsPane)$' ./internal/ui/composer || rc=1
+          go test -count=$COUNT -v -timeout 20m -run '^(TestComposersDrawInTheirListsPanes|TestPatchedViewShowsUnderQuietFrames)$' ./internal/ui || rc=1
           exit $rc
 
   # What one frame costs the GPU (branch gpu-frame-cost): Clack's window
