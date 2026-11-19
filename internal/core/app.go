@@ -47,6 +47,8 @@ type App struct {
 
 	docs docState // what message Docs read, as the last events left it (msg_refs.go)
 
+	thrUnread threadsMarkedUnread // ThreadsMarkedUnread (message_menu.go)
+
 	msgLog msgChanges // each message's latest change, for the views that keep copies of them (msg_changes.go)
 	// refetchQ is RefetchMessages' rounds (read_changes.go)
 	refetchQ refetchQueue
@@ -176,7 +178,13 @@ func New(c *slack.Client, s *store.Store) *App {
 		a.mu.Lock()
 		a.connected = up
 		a.mu.Unlock()
-		a.emit(Event{Type: "connection", Connected: up})
+		// Merging msg-latency: its OnState block (socketConnected(fast)
+		// and firstUp before the emit, socketDown on a drop) replaces this
+		// emit; keep its block and give its emit Fast: up &&
+		// a.RTM.LastConnectFast(). Without Fast every reconnect reloads
+		// the Threads view (TestThreadsFastReconnectLikeSlack); without
+		// its block slow connects miss its catch-up.
+		a.emit(Event{Type: "connection", Connected: up, Fast: up && a.RTM.LastConnectFast()})
 		a.codeChannelsConnection(up) // the stale code channel closer's timers (codechannel_close.go)
 		if up {
 			a.socketConnected(a.RTM.LastConnectFast()) // the refetchers' slow reconnects (channel_pins.go)
