@@ -4597,6 +4597,18 @@ jobs:
           rc=0
           xvfb-run -a go test -count="$COUNT" -timeout 20m -run '^TestJoinBanner$' ./internal/ui || rc=1
           go test -count="$COUNT" -timeout 10m -run '^TestReactionPillClickSurvivesOtherReactions$' ./internal/ui/messages || rc=1
+          # thread-header-hover-4: search results' and the search popover's buttons by result; the
+          # sender's bot asked as getBotById does, the open card following its trigger; App details for another bot
+          go test -count="$COUNT" -timeout 5m -run '^(TestSearchRowClickSurvivesResultChanges|TestSearchPopoverRowButtonsFollowRows)$' ./internal/ui/popups || rc=1
+          go test -count="$COUNT" -timeout 5m -run '^TestSenderBotAsksLikeSlack$' ./internal/core || rc=1
+          go test -count="$COUNT" -timeout 5m -run '^TestOpenCardFollowsItsTrigger$' ./internal/ui/hovercard || rc=1
+          xvfb-run -a go test -count="$COUNT" -timeout 5m -run '^TestAppDetailsOtherBotOpensItsOwn$' ./internal/ui || rc=1
+          # the quick switcher's Show fewer clicked (a crash when it rebuilt mid-loop), each its own process:
+          # a panic would end the others; the Join… menu's channel; WORKFLOW from a bot_profile; the ask's frame
+          go test -count="$COUNT" -timeout 5m -run '^TestSearchPopoverShowFewerClick$' ./internal/ui/popups || rc=1
+          go test -count="$COUNT" -timeout 5m -run '^TestSearchJoinMenuJoinsItsChannel$' ./internal/ui/popups || rc=1
+          go test -count="$COUNT" -timeout 5m -run '^TestWorkflowBadgeFromBotProfile$' ./internal/core || rc=1
+          go test -count="$COUNT" -timeout 5m -run '^TestTriggerAsksTheFramePointerArrives$' ./internal/ui/hovercard || rc=1
           exit $rc
       - if: ${{ always() && env.XF_ID }}
         uses: ./.github/actions/expect-fail-report
