@@ -2,6 +2,7 @@ package slackc
 
 import (
 	"image"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -104,13 +105,29 @@ func (s *scope) events() {
 		sx = pointer.ScrollRange{Min: -1e6, Max: 1e6}
 		sy = sx
 	}
-	if s.rehover && s.ptrIn {
-		// content scrolled under a still pointer
+	if s.rehover && s.ptrIn && gtx.Source.Enabled() {
+		// content scrolled under a still pointer (a measure pass leaves it
+		// for the live one: its hover change would ask for no frame)
 		s.rehover = false
 		v.setHover(s.hitTest(s.ptr), s, &pointer.Event{Position: s.ptr})
 	}
 	moved := false
 	var last pointer.Event
+	// flushMove sends the frame's mousemove so far, coalesced to the newest
+	// position and to listening subtrees, before a discrete event: as a
+	// browser dispatches its pending coalesced moves ahead of the next
+	// mousedown or mouseup, a handler sees the pointer where it was pressed
+	// (a drag's start, a menu item's hover) before the press itself.
+	flushMove := func() {
+		if !moved {
+			return
+		}
+		moved = false
+		if t := s.hitTest(last.Position); t != nil && chainListens(t, lMove) {
+			v.dispatchPointer(s, t, "mousemove", &last, 0)
+			v.dispatchPointer(s, t, "pointermove", &last, 0)
+		}
+	}
 	for {
 		e, ok := gtx.Event(pointer.Filter{Target: &s.ptag, Kinds: pointer.Move | pointer.Enter | pointer.Leave | pointer.Press | pointer.Release | pointer.Drag | pointer.Scroll | pointer.Cancel, ScrollX: sx, ScrollY: sy})
 		if !ok {
@@ -131,30 +148,29 @@ func (s *scope) events() {
 			moved = true
 			last = pe
 		case pointer.Leave:
+			flushMove()
 			if s.host == nil {
 				s.ptrIn = false
 				v.setHover(nil, s, &pe)
 			}
 		case pointer.Press:
+			flushMove()
 			s.ptr = pe.Position
 			s.press(&pe)
 		case pointer.Release:
+			flushMove()
 			s.release(&pe)
 		case pointer.Scroll:
+			flushMove()
 			s.ptr, s.ptrIn = pe.Position, true
 			s.scroll(&pe)
 		case pointer.Cancel:
+			flushMove()
 			v.pressK = 0
 			v.setActive(nil)
 		}
 	}
-	if moved {
-		// mousemove, throttled to one per frame and to listening subtrees
-		if t := s.hitTest(last.Position); t != nil && chainListens(t, lMove) {
-			v.dispatchPointer(s, t, "mousemove", &last, 0)
-			v.dispatchPointer(s, t, "pointermove", &last, 0)
-		}
-	}
+	flushMove()
 }
 
 func chainListens(t *box, bit uint32) bool {
@@ -409,7 +425,7 @@ func (s *scope) release(pe *pointer.Event) {
 		return
 	}
 	if btn == 0 {
-		v.click(s, target, pe)
+		v.click(s, target, pe, false)
 	} else if btn == 1 {
 		v.dispatchPointer(s, target, "auxclick", pe, btn)
 	}
@@ -430,19 +446,33 @@ func commonAncestor(a, b *box) *box {
 }
 
 // click dispatches click (and dblclick) and runs the default actions:
-// links, labels, checkboxes, selects and form submission.
-func (v *View) click(s *scope, t *box, pe *pointer.Event) {
+// links, labels, checkboxes, selects and form submission. kbd is a
+// keyboard's click (Enter or Space on a button, a link, a checkbox):
+// Blink's activation behaviour dispatches a simulated click, detail 0,
+// never a dblclick, and it doesn't count in the mouse's run.
+func (v *View) click(s *scope, t *box, pe *pointer.Event, kbd bool) {
 	if t.disabled() {
 		return
 	}
-	now := int64(pe.Time / time.Millisecond)
-	k := t.k()
-	if v.lastClk.k == k && now-v.lastClk.t < 500 {
-		v.lastClk.n++
-	} else {
-		v.lastClk.n = 1
+	// the click's detail: the window's count of the press (Gio patch 48,
+	// gio_patch48.go), as Blink's is the platform event's click_count
+	// whatever element it lands on; on stock Gio this element's within the
+	// double-click time
+	v.clickDetail = 0
+	if !kbd {
+		now := int64(pe.Time / time.Millisecond)
+		k := t.k()
+		if v.lastClk.k == k && time.Duration(now-v.lastClk.t)*time.Millisecond <= doubleClickTime() {
+			v.lastClk.n++
+		} else {
+			v.lastClk.n = 1
+		}
+		v.lastClk.k, v.lastClk.t = k, now
+		if n := clicksOf(*pe); n > 0 {
+			v.lastClk.n = n
+		}
+		v.clickDetail = v.lastClk.n
 	}
-	v.lastClk.k, v.lastClk.t = k, now
 	// checkbox/radio state flips before click handlers see it
 	ctrl := t
 	if t.repl != rCheck && t.repl != rRadio {
@@ -455,7 +485,7 @@ func (v *View) click(s *scope, t *box, pe *pointer.Event) {
 		}
 	}
 	v.dispatchPointer(s, t, "click", pe, 0)
-	if v.lastClk.n == 2 {
+	if !kbd && v.lastClk.n == 2 {
 		v.dispatchPointer(s, t, "dblclick", pe, 0)
 	}
 	if ctrl != nil && ctrl != t && !ctrl.disabled() {
@@ -548,6 +578,12 @@ func followLink(href string) {
 	e := env()
 	switch {
 	case strings.HasPrefix(href, "http://") || strings.HasPrefix(href, "https://") || strings.HasPrefix(href, "mailto:"):
+		if e.FollowLink != nil {
+			if !e.FollowLink(href) && e.OpenURL != nil {
+				e.OpenURL(href) // openPermalink's new tab: not a link Clack opens itself
+			}
+			return
+		}
 		if r := slackRoute(href); r != "" && e.Navigate != nil {
 			e.Navigate(r)
 			return
@@ -556,6 +592,9 @@ func followLink(href string) {
 			e.OpenURL(href)
 		}
 	default:
+		if e.FollowLink != nil && e.FollowLink(href) { // slack: links: handleDeepLink
+			return
+		}
 		if r := slackRoute(href); r != "" && e.Navigate != nil {
 			e.Navigate(r)
 		}
@@ -592,9 +631,13 @@ func slackRoute(href string) string {
 	if strings.HasPrefix(href, "http") && !strings.Contains(href[:i], "slack.com") {
 		return ""
 	}
-	parts := strings.Split(strings.SplitN(href[i+len("/archives/"):], "?", 2)[0], "/")
+	path, query, _ := strings.Cut(href[i+len("/archives/"):], "?")
+	parts := strings.Split(path, "/")
 	if len(parts) == 0 || parts[0] == "" {
 		return ""
+	}
+	if q, err := url.ParseQuery(query); err == nil && isMessageTS(q.Get("thread_ts")) {
+		return "c/" + parts[0] + "/t/" + q.Get("thread_ts") // a reply's link: its thread, never the reply as a root
 	}
 	if len(parts) > 1 && len(parts[1]) > 7 && parts[1][0] == 'p' {
 		ts := parts[1][1:]
@@ -604,6 +647,21 @@ func slackRoute(href string) string {
 		return "c/" + parts[0] + "/m/" + ts
 	}
 	return "c/" + parts[0]
+}
+
+// isMessageTS is a message timestamp as Slack writes one
+// ("1700000000.000100"), so a link's thread_ts can't add route segments.
+func isMessageTS(s string) bool {
+	a, b, ok := strings.Cut(s, ".")
+	if !ok || len(a) != 10 || len(b) != 6 {
+		return false
+	}
+	for _, r := range a + b {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *scope) scroll(pe *pointer.Event) {
@@ -690,8 +748,13 @@ func (v *View) focusBox(s *scope, b *box) {
 }
 
 // focusEvents reports focus transitions of a focusable box (called while
-// painting it, every frame).
+// painting it, every frame). Not in a measure pass (a native measuring the
+// tree it lays out, gtx.Disabled()), where Gio reports nothing focused: a
+// focused input there sent JS blur and focus again on every relayout.
 func (v *View) focusEvents(s *scope, b *box) {
+	if !s.gtx.Source.Enabled() {
+		return
+	}
 	ns := v.state(b)
 	f := s.gtx.Focused(v.focusTag(b))
 	if f == ns.focused {
@@ -752,10 +815,10 @@ func (v *View) keyEvents(s *scope, b *box) {
 		if ke.State == key.Press && (ke.Name == key.NameReturn || ke.Name == key.NameEnter || ke.Name == key.NameSpace) && b.n != nil {
 			switch b.n.T {
 			case "button", "a", "summary":
-				v.click(s, b, &pointer.Event{})
+				v.click(s, b, &pointer.Event{}, true)
 			}
 			if b.repl == rCheck || b.repl == rRadio {
-				v.click(s, b, &pointer.Event{})
+				v.click(s, b, &pointer.Event{}, true)
 			}
 		}
 	}
@@ -786,7 +849,12 @@ func (v *View) beginEvent(typ string) []byte {
 
 // endEvent adds target state and the boxes of the target and its
 // ancestors, then dispatches.
-func (v *View) endEvent(t *box, b []byte) {
+func (v *View) endEvent(t *box, b []byte) { v.endEventThen(t, b, nil) }
+
+// endEventThen is endEvent telling done (when non-nil, on any goroutine)
+// whether a JS listener stopped the event's propagation (ResultBridge;
+// false at once without one).
+func (v *View) endEventThen(t *box, b []byte, done func(stopped bool)) {
 	k := t.k()
 	b = append(b, `,"target":{`...)
 	val, hasVal := v.targetValue(t)
@@ -831,11 +899,21 @@ func (v *View) endEvent(t *box, b []byte) {
 		b = append(b, ']')
 	}
 	b = append(b, '}', '}')
-	if br := bridge(); br != nil {
-		br.Dispatch(k, b)
-	}
 	if testDispatch != nil {
 		testDispatch(k, b)
+	}
+	br := bridge()
+	rb, ok := br.(ResultBridge)
+	switch {
+	case ok && done != nil:
+		rb.DispatchResult(k, b, done)
+	case br != nil:
+		br.Dispatch(k, b)
+		fallthrough
+	default:
+		if done != nil {
+			done(false)
+		}
 	}
 }
 
@@ -883,7 +961,7 @@ func (v *View) dispatchPointer(s *scope, t *box, typ string, pe *pointer.Event, 
 	}
 	if typ == "click" || typ == "dblclick" {
 		b = append(b, `,"detail":`...)
-		b = strconv.AppendInt(b, int64(max(v.lastClk.n, 1)), 10)
+		b = strconv.AppendInt(b, int64(v.clickDetail), 10)
 	}
 	v.endEvent(t, b)
 }
@@ -903,18 +981,27 @@ func domButtons(b pointer.Buttons) int {
 }
 
 func (v *View) dispatchSimple(t *box, typ string, extra func([]byte) []byte) {
-	if t == nil || !dispatching() {
-		return
+	v.dispatchThen(t, typ, extra, nil)
+}
+
+// dispatchThen is dispatchSimple telling done whether a listener stopped
+// the event (endEventThen); done hears false when there is nothing to
+// dispatch to.
+func (v *View) dispatchThen(t *box, typ string, extra func([]byte) []byte, done func(stopped bool)) {
+	if t != nil {
+		t = t.elem()
 	}
-	t = t.elem()
-	if t == nil || t.k() == 0 {
+	if t == nil || t.k() == 0 || !dispatching() {
+		if done != nil {
+			done(false)
+		}
 		return
 	}
 	b := v.beginEvent(typ)
 	if extra != nil {
 		b = extra(b)
 	}
-	v.endEvent(t, b)
+	v.endEventThen(t, b, done)
 }
 
 func (v *View) dispatchValue(t *box, typ string) { v.dispatchSimple(t, typ, nil) }
@@ -976,11 +1063,33 @@ func domKey(n key.Name, m key.Modifiers) (string, string) {
 }
 
 func (v *View) dispatchKey(t *box, typ string, ke key.Event) {
+	// A focused plugin element's Escape keydown, once JS has it, goes on
+	// to the layer it was aimed at as it was pressed unless a listener
+	// stopped it, as the DOM's bubbles up to react-modal's content
+	// (layers.go); with no answer in time, as unstopped.
+	var p *EscapePress
+	if typ == "keydown" && ke.Name == key.NameEscape {
+		p = pressEscape(ke, focusTag(curClock.layers.src), true)
+		p.wait()
+	}
+	v.dispatchKeyAs(t, typ, ke, p)
+}
+
+// dispatchKeyAs dispatches a keydown/keyup, telling p (an Escape keydown's
+// press; nil: none) whether a listener stopped it.
+func (v *View) dispatchKeyAs(t *box, typ string, ke key.Event, p *EscapePress) {
+	var done func(stopped bool)
+	if p != nil {
+		done = p.Answer
+	}
 	if !dispatching() {
+		if done != nil {
+			done(false)
+		}
 		return
 	}
 	k, code := domKey(ke.Name, ke.Modifiers)
-	v.dispatchSimple(t, typ, func(b []byte) []byte {
+	v.dispatchThen(t, typ, func(b []byte) []byte {
 		b = append(b, `,"key":`...)
 		b = appendString(b, k)
 		b = append(b, `,"code":`...)
@@ -988,7 +1097,7 @@ func (v *View) dispatchKey(t *box, typ string, ke key.Event) {
 		b = appendMods(b, ke.Modifiers)
 		b = appendBool(b, "repeat", false)
 		return b
-	})
+	}, done)
 }
 
 // dispatchChar sends keydown/keyup for a typed character (editors only
@@ -1094,10 +1203,13 @@ func (v *View) drawTip(gtx layout.Context) {
 	}
 	p := painter{v: v, ops: gtx.Ops, clip: noClip}
 	rad := float32(gtx.Dp(6))
+	ri := image.Rect(int(x), int(y), int(x+w+0.5), int(y+h+0.5))
 	if g := th.C.TooltipGlow; g.A != 0 {
-		// the dark mode outline (theme/tooltip.go) under the box
-		ri := image.Rect(int(x), int(y), int(x+w+0.5), int(y+h+0.5))
+		// the dark mode outline (theme/tooltip.go) under the box: it tells
+		// the inspect tool too (theme.TooltipDrawn)
 		theme.TooltipShape(gtx, ri, int(rad), theme.TooltipArrow{}, th.C.Tooltip, g)
+	} else {
+		inspectTooltip(gtx, ri) // a light theme's box (fillRR): a tooltip layer of the record all the same
 	}
 	p.fillRR(rectF{x, y, x + w, y + h}, [4]float32{rad, rad, rad, rad}, th.C.Tooltip)
 	t := op.Offset(image.Pt(int(x+padX), int(y+padY))).Push(gtx.Ops)

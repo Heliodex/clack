@@ -495,12 +495,10 @@ func (v *ChannelFiles) open(it fileItem) {
 	openFile(v.h, it)
 }
 
-// openLink is LinkEntity's onListItemSelect: window.open(url, "_blank").
-func (v *ChannelFiles) openLink(u string) {
-	if o, ok := v.h.(interface{ OpenURL(string) }); ok {
-		o.OpenURL(u)
-	}
-}
+// openLink is LinkEntity's onListItemSelect: window.open(url, "_blank"),
+// which the desktop app opens as any link (a Slack permalink in the
+// client, the rest in the browser: hostHandler's follow).
+func (v *ChannelFiles) openLink(u string) { hostHandler{v.h}.follow(u, false) }
 
 // openFileMenu is the row's More actions: the Files view's menu (the items
 // Clack has of getFileActionsMenuItems), at FileActions' Popover.
@@ -536,11 +534,34 @@ func (v *ChannelFiles) openLinkMenu(l core.ChannelLink, btn image.Rectangle) {
 		Popover: "right-bottom", OffsetX: 4, TryOpposite: true}))
 }
 
-// cfRich is a row's file as a message attachment (DownloadFile's).
+// cfRich is a row's file as a message attachment (DownloadFile's): the
+// file itself, its URL and Download the file's own (url_private), which
+// Download saves; a video's poster is its thumb_video. The media viewer
+// plays a video's mp4 (cfPlayable).
 func cfRich(it *fileItem) *richtext.File {
-	return &richtext.File{ID: it.ID, Name: it.Name, Title: it.Title, Type: it.Filetype, PrettyType: it.PrettyType,
-		Mime: it.Mime, User: it.User, URL: it.URL, Permalink: it.Permalink, Size: it.Size, Created: it.Created,
-		IsImage: it.isImage()}
+	f := &richtext.File{ID: it.ID, Name: it.Name, Title: it.Title, Type: it.Filetype, PrettyType: it.PrettyType,
+		Mime: it.Mime, User: it.User, URL: it.URL, Download: it.URL, Permalink: it.Permalink, Size: it.Size,
+		Created: it.Created, IsImage: it.isImage()}
+	if it.IsVideo {
+		f.IsVideo = true
+		if it.Thumb != "" {
+			f.Thumb = &richtext.Image{URL: it.Thumb, Alt: it.title(), Title: it.title(), Proxy: true}
+		}
+	}
+	return f
+}
+
+// cfPlayable is cfRich for the media viewer: a video's URL is its
+// progressive source, mp4 || url_private as a message attachment's, and
+// its Download still the file itself, which the viewer's More actions
+// save. The mp4 in cfRich's URL had the Files tab's Download save Slack's
+// transcode instead of the file.
+func cfPlayable(it *fileItem) *richtext.File {
+	f := cfRich(it)
+	if it.IsVideo && it.MP4 != "" {
+		f.URL = it.MP4
+	}
+	return f
 }
 
 // ---- rows ----
@@ -957,7 +978,16 @@ func (v *ChannelFiles) mediaCell(gtx C, c *cfRowClicks, it *fileItem, sz image.P
 				themeImage(gtx, img, sz, rad)
 			}
 		}
-		if strings.HasPrefix(it.Mime, "video/") {
+		video := strings.HasPrefix(it.Mime, "video/")
+		if it.Thumb == "" && !video {
+			// FileImageThumbnail with no thumb src (getThumbSrcForFile
+			// needs thumb_360, thumb_360_gif or thumb_pdf: an image Slack
+			// made no thumbs for): renderIconFallback, the file type's
+			// 20px icon centred in content-sec (.iconFallback__TH2Dz)
+			is := gtx.Dp(20)
+			dirAt(gtx, image.Pt((sz.X-is)/2, (sz.Y-is)/2), func(gtx C) D { return v.icon(gtx, imageTypeIcon(it.Filetype), 20, v.p.Sec) })
+		}
+		if video {
 			// the video file's play pill (VideoMessageFile at rest)
 			ps := gtx.Dp(28)
 			p := image.Pt(gtx.Dp(8), sz.Y-gtx.Dp(8)-ps)
@@ -972,6 +1002,17 @@ func (v *ChannelFiles) mediaCell(gtx C, c *cfRowClicks, it *fileItem, sz image.P
 		}
 		return D{Size: sz}
 	})
+}
+
+// imageTypeIcon is getFileTypeSvgIconName (2HRR) for what the media grid
+// holds without a thumb (search's images type; videos draw their own
+// cell): the image filetypes are "image", the rest "file".
+func imageTypeIcon(filetype string) string {
+	switch filetype {
+	case "jpg", "png", "gif", "webp", "tiff", "bmp", "svg", "heic", "psd", "gdraw":
+		return "image"
+	}
+	return "file"
 }
 
 // fileRow is a DraggableExplorerFile in the list: the c-pillow_file (12px

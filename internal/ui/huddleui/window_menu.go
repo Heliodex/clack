@@ -2,7 +2,9 @@ package huddleui
 
 import (
 	"image"
+	"reflect"
 
+	"gioui.org/io/event"
 	"gioui.org/layout"
 
 	"github.com/some-du6e/clack/internal/core"
@@ -11,6 +13,7 @@ import (
 	"github.com/some-du6e/clack/internal/imgcache"
 	"github.com/some-du6e/clack/internal/richtext"
 	"github.com/some-du6e/clack/internal/ui/popups"
+	"github.com/some-du6e/clack/internal/ui/slackc"
 	"github.com/some-du6e/clack/internal/ui/theme"
 )
 
@@ -177,7 +180,7 @@ func (w *window) toggleAudio(s *huddle.Session) {
 	}
 	w.closeMenus()
 	anchor := w.audioBtn.Add(image.Pt(0, w.barTop))
-	w.audio = popups.NewMenuOpts(winHost{w}, w.c.audioMenu(s), popups.MenuOpts{Anchor: anchor, Side: popups.Above,
+	w.audio = popups.NewMenuOpts(winHost{w}, w.c.audioMenu(s, w.th, false), popups.MenuOpts{Anchor: anchor, Side: popups.Above,
 		MenuClass: "p-huddle_more_actions_menu"})
 }
 
@@ -229,37 +232,33 @@ func (w *window) closeQuick() {
 
 // layoutMore draws the open toolbar menus and the quick picker over the
 // window.
+//
+// In an inspect session each is a layer of the record (inspectLayer).
 func (w *window) layoutMore(gtx C) {
-	if w.stick != nil {
-		w.stick.Layout(gtx)
+	if g := w.stick; g != nil {
+		end := inspectLayer(gtx, g)
+		g.Layout(gtx)
+		end()
 		if w.stick != nil && w.stick.Dismissed() {
 			w.stick = nil
 		}
 	}
-	if w.quick != nil {
-		w.quick.Layout(gtx)
+	if q := w.quick; q != nil {
+		end := inspectLayer(gtx, q)
+		q.Layout(gtx)
+		end()
 		if w.quick != nil && w.quick.Dismissed() {
 			w.quick = nil
 		}
 	}
-	for _, m := range []**popups.Menu{&w.video, &w.leaveMenu, &w.lounge.menu} {
-		if *m != nil {
-			(*m).Layout(gtx)
-			if (*m).Dismissed() {
+	for _, m := range []**popups.Menu{&w.video, &w.leaveMenu, &w.lounge.menu, &w.more, &w.audio} {
+		if mm := *m; mm != nil {
+			end := inspectLayer(gtx, mm)
+			mm.Layout(gtx)
+			end()
+			if mm.Dismissed() && *m == mm {
 				*m = nil
 			}
-		}
-	}
-	if w.more != nil {
-		w.more.Layout(gtx)
-		if w.more.Dismissed() {
-			w.more = nil
-		}
-	}
-	if w.audio != nil {
-		w.audio.Layout(gtx)
-		if w.audio.Dismissed() {
-			w.audio = nil
 		}
 	}
 }
@@ -288,9 +287,21 @@ func (w *window) layoutOverlays(gtx C) {
 	for _, o := range ovs {
 		g := gtx
 		g.Constraints = layout.Exact(gtx.Constraints.Max)
-		o.Layout(g)
+		w.drawOverlay(g, o)
 		if !o.Dismissed() {
 			keep = append(keep, o)
+		}
+	}
+	for o := range w.layers {
+		shown := false
+		for _, x := range keep {
+			if x == o {
+				shown = true
+				break
+			}
+		}
+		if !shown {
+			delete(w.layers, o)
 		}
 	}
 	w.mu.Lock()
@@ -300,4 +311,41 @@ func (w *window) layoutOverlays(gtx C) {
 	}
 	w.overlays = keep
 	w.mu.Unlock()
+}
+
+// winLayer is one of the huddle window's overlays as a layer in its
+// overlay stack (slackc layers.go): an Escape that reaches it (the
+// innermost layer holding the focus, else the topmost) dismisses it.
+type winLayer struct {
+	o    popups.Overlay
+	area int
+}
+
+func (l *winLayer) LayerEscape() {
+	if d, ok := l.o.(interface{ Dismiss() }); ok {
+		d.Dismiss()
+	}
+}
+
+// drawOverlay lays out overlay o as a layer: inside its area, with its
+// focus home when it has one.
+func (w *window) drawOverlay(gtx C, o popups.Overlay) {
+	defer inspectLayer(gtx, o)() // a layer of an inspect session's record
+	if !reflect.TypeOf(o).Comparable() {
+		o.Layout(gtx)
+		return
+	}
+	l := w.layers[o]
+	if l == nil {
+		if w.layers == nil {
+			w.layers = map[popups.Overlay]*winLayer{}
+		}
+		l = &winLayer{o: o}
+		w.layers[o] = l
+	}
+	spec := slackc.LayerSpec{Area: &l.area}
+	if h, ok := o.(interface{ FocusHome() event.Tag }); ok {
+		spec.Home = h.FocusHome()
+	}
+	slackc.DrawLayer(gtx, l, spec, func(gtx C) { o.Layout(gtx) })
 }

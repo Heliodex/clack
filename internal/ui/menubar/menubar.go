@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/some-du6e/clack/internal/ui/shortcut"
 )
@@ -114,9 +115,10 @@ type State struct {
 	Disabled map[string]bool   // by Item.ID
 	Titles   map[string]string // overrides Item.Title, by Item.ID
 	Recent   []Recent          // History's recent views, most recent first
-	// Hidden are the items (separators too, by Item.ID) of the menu that
-	// holds the recent views which don't show right now: History's "Show
-	// full history" and its separator.
+	// Hidden are the items (separators too, by Item.ID) of the top-level
+	// menus without a Kind that don't show right now: History's "Show full
+	// history" and its separator, File's items the account can't use.
+	// AppKit applies it when the menu opens.
 	Hidden map[string]bool
 }
 
@@ -185,6 +187,13 @@ func Flatten(menus []Menu) []*Item {
 	}
 	return out
 }
+
+var installedHook atomic.Pointer[func(took time.Duration)]
+
+// OnInstalled makes f hear, as each Install ends on AppKit's main thread,
+// what it took there (macOS: the startup timeline's menu-bar point). f
+// runs on the main thread: it must not block.
+func OnInstalled(f func(took time.Duration)) { installedHook.Store(&f) }
 
 // Install replaces the menu bar with menus (macOS; a no-op elsewhere).
 // onRecent runs, on its own goroutine, with the Route of the State.Recent

@@ -27,6 +27,7 @@ import (
 	"gioui.org/op"
 	"gioui.org/text"
 
+	"github.com/some-du6e/clack/internal/core"
 	"github.com/some-du6e/clack/internal/ui/theme"
 )
 
@@ -49,18 +50,34 @@ type ActivitySecondary interface {
 }
 
 // openSecondary opens the chosen item in the app's secondary column
-// (Bb on, a Host with one, an item with a conversation).
+// (Bb on, a Host with one, an item with a conversation): a thread at its
+// reply (toThread's replyTs, highlighted), a message's conversation at the
+// message (toMessage: startTs and highlightTs), the conversation itself
+// for an item that points at none (selJumpTS). A file channel's
+// conversation is what Slack's RedirectFileChannel makes of it (the app
+// does: a canvas mention's thread view, activity_canvas.go), and a list
+// record's thread reply its record (selListRecord).
 func (v *Activity) openSecondary() {
 	v.selSec, v.selOut = false, false
 	sh, ok := v.h.(ActivitySecondary)
 	if !ok || !v.selOK || !v.h.Core().ActivityRemovePersistentDetailPanel() {
 		return
 	}
+	ts := v.selJumpTS()
+	at, _ := v.h.(SavedSecondary)
+	lo, _ := v.h.(interface{ OpenListItem(listID, recID string) })
+	list, rec := v.selListRecord()
 	switch {
+	case rec != "" && lo != nil:
+		lo.OpenListItem(list, rec)
 	case v.sel.Channel == "":
 		sh.OpenDetailSecondary(v.selKey, v.pane)
+	case v.selDesc.thread != "" && ts != "" && at != nil:
+		at.OpenThreadAt(v.sel.Channel, v.selDesc.thread, ts)
 	case v.selDesc.thread != "":
 		v.h.OpenThread(v.sel.Channel, v.selDesc.thread)
+	case ts != "" && at != nil:
+		at.OpenMessageSecondary(v.sel.Channel, ts)
 	default:
 		sh.OpenChannelSecondary(v.sel.Channel)
 	}
@@ -70,12 +87,88 @@ func (v *Activity) openSecondary() {
 	v.selSec = v.secondaryShows(sh)
 }
 
+// PaneJumper is optionally implemented by the Host: the conversation its
+// ChannelPane draws started at message ts and the message highlighted
+// (jpad R9's startTs and highlightTs), or with a thread the thread its
+// ThreadPane draws started at reply ts, highlighted (toThread's replyTs and
+// uiState.highlightTs).
+type PaneJumper interface {
+	JumpPane(ch, thread, ts string)
+}
+
+// jumpPane is the persistent detail panel's half of a click (Bb off): GMkG
+// handleOnClickActivityItem's jumpToMessage({channelId, threadTs, ts}) in
+// the Primary beside the list, which the view's own pane draws.
+func (v *Activity) jumpPane() {
+	if !v.paneInView() || v.sel.Channel == "" {
+		return
+	}
+	if v.paneFileJump() { // a canvas's or list's file channel opens the file in the pane (activity_canvas.go)
+		return
+	}
+	if j, ok := v.h.(PaneJumper); ok {
+		if ts := v.selJumpTS(); ts != "" {
+			j.JumpPane(v.sel.Channel, v.selDesc.thread, ts)
+		}
+	}
+}
+
+// selJumpTS is the message GMkG handleOnClickActivityItem opens the chosen
+// item at ("" for the conversation itself):
+//
+//   - a "channel" item, an internal channel invite or a quietly added
+//     channel (Gjwd lN), and a read "dm" whose latest message is the
+//     viewer's: toChannel, no message;
+//   - thread_v2: once read the latest reply (feedTs under activity_inbox,
+//     latestTs without), while unread the first unread one (minUnreadTs);
+//   - anything else with a message: the message (a reply's own ts).
+func (v *Activity) selJumpTS() string {
+	it := &v.sel
+	switch it.Type {
+	case "channel", "internal_channel_invite", "quietly_added_to_channel":
+		return ""
+	case "dm":
+		if !v.selUnread && it.Msg != nil && it.Msg.User != "" && it.Msg.User == v.selfID() {
+			return ""
+		}
+	case "thread_v2":
+		switch {
+		case v.selUnread && it.MinUnreadTS != "":
+			return it.MinUnreadTS
+		case v.selUnread:
+			return it.TS
+		case v.h.Core().ActivityInbox() && it.FeedTS != "":
+			return it.FeedTS
+		case it.LatestTS != "":
+			return it.LatestTS
+		}
+	}
+	if it.Msg == nil && it.TS == "" {
+		return ""
+	}
+	return it.TS
+}
+
 // secondaryShows reports whether the app's column shows the chosen item.
+// For a file channel's item that is what Slack's rules open instead
+// (activity_canvas.go): the thread view on its message, its canvas, its
+// list or record, as well as the conversation a wait gave up on.
 func (v *Activity) secondaryShows(sh ActivitySecondary) bool {
-	if v.sel.Channel == "" {
+	ch := v.sel.Channel
+	if ch == "" {
 		return sh.SecondaryShowsDetail(v.selKey)
 	}
-	return sh.SecondaryShows(v.sel.Channel, v.selDesc.thread)
+	if sh.SecondaryShows(ch, v.selDesc.thread) {
+		return true
+	}
+	if !v.h.Core().IsFileChannelID(ch) {
+		return false
+	}
+	if ts := v.selJumpTS(); v.selDesc.thread == "" && ts != "" && sh.SecondaryShows(ch, ts) {
+		return true
+	}
+	fo, ok := v.h.(FileOpener)
+	return ok && fo.FileShown(core.FileOfChannel(ch))
 }
 
 // closeSecondary closes the item's secondary view (the selected row
@@ -90,6 +183,14 @@ func (v *Activity) closeSecondary() {
 // followSecondary ends the selection once the app's column no longer
 // shows the item (closed, ⌘., Esc, another view opened there).
 func (v *Activity) followSecondary() {
+	if v.selOK && v.selOut && !v.selSec && v.h.Core().IsFileChannelID(v.sel.Channel) {
+		// a file channel's item whose view opened after the click (files.info
+		// waited for, or its message fetched first; or the conversation the
+		// wait gave up on): the column shows the item now
+		if sh, ok := v.h.(ActivitySecondary); ok && v.secondaryShows(sh) {
+			v.selSec = true
+		}
+	}
 	if !v.selOK || !v.selSec {
 		return
 	}
@@ -142,6 +243,7 @@ func (v *Activity) persistentLayout(gtx C) {
 			v.pane(g)
 			return
 		}
+		v.paneLast = nil // Primary shows ActivityEmptyView now
 		v.activityEmpty(g)
 	}()
 	wideSidebarHandle(gtx, v.h, lw, size.Y, extra)

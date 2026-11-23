@@ -45,7 +45,7 @@ const (
 	JoinBannerOldID = "C0JOIN00002"
 )
 
-// unreadsBase is the fixtures' clock: 2026-11-06 09:00 UTC.
+// unreadsBase is the fixtures' clock: 2026-11-07 09:00 UTC.
 const unreadsBase = 1794042000
 
 // UnreadsCall is one recorded unread.* or megaphone.* call.
@@ -83,7 +83,7 @@ func (s *Server) QueueJoinBanner(on bool) {
 	u.mu.Unlock()
 }
 
-var unreadsStates sync.Map // *Server -> *unreadsState
+var unreadsStates = newPerServer() // *Server -> *unreadsState
 
 func (s *Server) unreads() *unreadsState {
 	v, _ := unreadsStates.LoadOrStore(s, &unreadsState{lastRead: map[string]string{}, dismissed: map[string]bool{}})
@@ -226,6 +226,30 @@ func (s *Server) PostUnread(ch, user, text string) string {
 	s.Push(map[string]any{"type": "message", "channel": ch, "user": user, "text": text, "ts": ts, "event_ts": ts,
 		"client_msg_id": m.ClientMsgID})
 	return ts
+}
+
+// PutUnreadMessage adds m to fixture channel ch's history as its newest
+// message, unread, without a realtime event: for a test that wants a
+// message of its own shape (blocks, reactions) in place before the app
+// boots (an Unreads frame ends at boot's client.counts latest). m.TS is
+// set when empty; it returns m's ts.
+func (s *Server) PutUnreadMessage(ch string, m slack.Message) string {
+	s.histMu.Lock()
+	defer s.histMu.Unlock()
+	h := s.hist[ch]
+	if m.TS == "" {
+		var sec int64 = unreadsBase + 3*86400
+		if len(h) > 0 {
+			fmt.Sscanf(h[0].TS, "%d.", &sec)
+			sec += 60
+		}
+		m.TS = unreadsTS(sec, len(h))
+	}
+	if m.Type == "" {
+		m.Type = "message"
+	}
+	s.hist[ch] = append([]slack.Message{m}, h...)
+	return m.TS
 }
 
 func (s *Server) handleUnreads(method string, f url.Values) (any, bool) {

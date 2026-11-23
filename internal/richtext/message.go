@@ -21,6 +21,183 @@ func FromMessage(r Resolver, m *slack.Message) Doc {
 	return FromMessageIn(r, m, m.Channel)
 }
 
+// newBuilder is a builder for message m shown in channel ch: its sender,
+// its canvas unfurls' hints and its files.
+func newBuilder(r Resolver, m *slack.Message, ch string) *builder {
+	c := &builder{r: r, sender: m.User, chID: ch, msgCh: firstNonEmpty(ch, m.Channel), msgTS: m.TS}
+	c.hintsFrom(m)
+	if len(m.Files) > 0 {
+		c.files = make(map[string]*slack.File, len(m.Files))
+		c.used = map[string]bool{}
+		for i := range m.Files {
+			c.files[m.Files[i].ID] = &m.Files[i]
+		}
+	}
+	return c
+}
+
+// hasMessageBlocks is shouldRenderBlocksInsteadOfText's test (client-boot
+// iub5 hasMessageBlocks: a non-empty blocks array). Slack then draws the
+// blocks instead of the text even when every block is null or a rich_text
+// without elements: Blocks (lby4) draws nothing for those, so the body is
+// empty.
+func hasMessageBlocks(raw json.RawMessage) bool {
+	var bs []json.RawMessage
+	return json.Unmarshal(raw, &bs) == nil && len(bs) > 0
+}
+
+// rendersBlocks is shouldRenderBlocksInsteadOfText (client-boot iub5)
+// without its experiment-gated cases (a retention message under
+// system_messages_redesign_m1, the meeting-channel and system-metadata
+// redesigns). It is false for the messages MessageText leaves to another
+// renderer and draws the text of: a meeting's artifacts DM, a canvas share
+// that carries files, a channel tab or folder message, an automated
+// subtype (h3YX isAutomatedSubtype), a huddle (a room, with no subtype, a
+// broadcast's or a huddle's) or its notes, a scheduled or canceled
+// huddle, a list record's or a surface card's comment root, a calendar
+// event and a meeting reminder (a meeting_join_ accessory); anything else
+// draws its blocks when it has any (hasMessageBlocks). FromMessageIn lets
+// the text stand in for blocks that draw nothing by it.
+func rendersBlocks(m *slack.Message) bool {
+	if metaEventType(m.Metadata) == "slack_system.meeting.artifacts_ready" {
+		return false
+	}
+	if m.Subtype == "canvas_sharing_message" {
+		return m.Files == nil
+	}
+	switch m.Subtype {
+	case "channel_tab_added", "channel_tab_added_unread_ignore", "folder_item_added", "folder_item_added_unread_ignore",
+		"folders_organized", "folders_organized_unread_ignore",
+		"huddle_notes_started", "scheduled_huddle_message", "scheduled_huddle_canceled", "surface_card_comment":
+		return false
+	case "list_record_comment":
+		if m.SlackList != nil {
+			return false
+		}
+	}
+	if automatedSubtypes[m.Subtype] {
+		return false
+	}
+	if len(m.Room) > 2 && (m.Subtype == "" || m.Subtype == "thread_broadcast" || m.Subtype == "huddle_message" || m.Subtype == "huddle_thread") {
+		return false
+	}
+	if hasCalendarEvent(m.RawAttachments) || meetingReminder(m.Blocks) {
+		return false
+	}
+	return hasMessageBlocks(m.Blocks)
+}
+
+// automatedSubtypes is h3YX's list (isAutomatedSubtype).
+var automatedSubtypes = map[string]bool{}
+
+func init() {
+	for _, s := range strings.Fields(`agent_view_added code_channel_review_submitted code_channel_lifecycle channel_join
+		channel_join_request channel_leave channel_topic channel_purpose channel_archive channel_unarchive
+		channel_convert_to_private channel_convert_to_public channel_convert_to_linked_private
+		channel_convert_to_linked_private_read channel_convert_to_linked_private_edit
+		channel_convert_to_linked_private_transfer channel_convert_shared group_join group_leave group_topic
+		group_purpose group_archive group_unarchive group_name channel_name play_sound pinned_item unpinned_item
+		sh_room_shared sh_room_created bot_enable bot_disable bot_add bot_remove bot_updated reminder_add
+		reminder_delete reply_broadcast app_conversation_join app_conversation_leave app_conversation_created
+		channel_posting_permissions retention_threshold joiner_notification joiner_notification_for_inviter
+		prejoin_dm_welcome_party_notification slack_connect_dm_acceptance canvas mpdm_move canvas_open_by_default
+		canvas_editing_permissions_changed channel_canvas_updated channel_canvas_updated_unread_ignore
+		tabbed_canvas_updated tabbed_canvas_updated_unread_ignore automatic_ai_huddle_notes_enabled
+		automatic_ai_huddle_notes_disabled workflow_channel_opt_in_enabled workflow_channel_opt_in_disabled
+		welcome_party`) {
+		automatedSubtypes[s] = true
+	}
+}
+
+// metaEventType is a message's metadata.event_type ("" without one).
+func metaEventType(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var md struct {
+		EventType string `json:"event_type"`
+	}
+	_ = json.Unmarshal(raw, &md)
+	return md.EventType
+}
+
+// hasCalendarEvent is isCalendarEventMessage: an attachment with a
+// calendar_event.
+func hasCalendarEvent(raw json.RawMessage) bool {
+	if !strings.Contains(string(raw), `"calendar_event"`) {
+		return false
+	}
+	var as []struct {
+		CalendarEvent json.RawMessage `json:"calendar_event"`
+	}
+	if json.Unmarshal(raw, &as) != nil {
+		return false
+	}
+	for _, a := range as {
+		switch string(a.CalendarEvent) { // JS truthiness
+		case "", "null", "false", `""`, "0":
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+// meetingReminder is isMeetingReminderMsg (kbmb): a block whose
+// accessory's action_id starts with "meeting_join_".
+func meetingReminder(raw json.RawMessage) bool {
+	if !strings.Contains(string(raw), "meeting_join_") {
+		return false
+	}
+	var parts []json.RawMessage
+	if json.Unmarshal(raw, &parts) != nil {
+		return false
+	}
+	for _, p := range parts { // each block on its own: one odd accessory doesn't hide the rest
+		var b struct {
+			Accessory struct {
+				ActionID json.RawMessage `json:"action_id"`
+			} `json:"accessory"`
+		}
+		if json.Unmarshal(p, &b) != nil {
+			continue
+		}
+		var id string
+		if json.Unmarshal(b.Accessory.ActionID, &id) == nil && strings.HasPrefix(id, "meeting_join_") {
+			return true
+		}
+	}
+	return false
+}
+
+// blocksDrawNothing is Blocks' (lby4) check before it renders anything:
+// every block null or a rich_text without elements. bs is raw parsed; a
+// block without a type ({}) isn't null, so the raw JSON decides those.
+func blocksDrawNothing(raw json.RawMessage, bs []bk) bool {
+	for i := range bs {
+		if b := &bs[i]; b.Type != "" && (b.Type != "rich_text" || len(b.Elements) > 0) {
+			return false
+		}
+	}
+	var parts []json.RawMessage
+	if json.Unmarshal(raw, &parts) != nil {
+		return false
+	}
+	for _, p := range parts {
+		if string(p) == "null" {
+			continue
+		}
+		var rt struct {
+			Type     string            `json:"type"`
+			Elements []json.RawMessage `json:"elements"`
+		}
+		if json.Unmarshal(p, &rt) != nil || rt.Type != "rich_text" || len(rt.Elements) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // FromMessageIn is FromMessage for a message shown in channel ch (Slack's
 // MessageContext channelId: a channel-tab slug to ch is the tab's label
 // alone).
@@ -31,21 +208,22 @@ func FromMessageIn(r Resolver, m *slack.Message, ch string) Doc {
 	if m.Subtype == "message_deleted" || m.Subtype == "tombstone" {
 		return Doc{Blocks: []Block{tombstone("This message was deleted.")}}
 	}
-	c := &builder{r: r, sender: m.User, chID: ch, msgCh: firstNonEmpty(ch, m.Channel), msgTS: m.TS}
-	c.hintsFrom(m)
-	if len(m.Files) > 0 {
-		c.files = make(map[string]*slack.File, len(m.Files))
-		c.used = map[string]bool{}
-		for i := range m.Files {
-			c.files[m.Files[i].ID] = &m.Files[i]
-		}
-	}
+	c := newBuilder(r, m, ch)
 	var d Doc
-	if bs := parseBlocks(m.Blocks); len(bs) > 0 {
+	blocks := c.expanded(m.Blocks)
+	if bs := parseBlocks(blocks); len(bs) > 0 && !blocksDrawNothing(blocks, bs) {
 		d.Blocks = c.blocks(bs)
 		d.Jumbo = richOnlyEmoji(bs)
 	}
-	if len(d.Blocks) == 0 && m.Text != "" {
+	// Slack draws the blocks instead of the text whenever the message has
+	// any (shouldRenderBlocksInsteadOfText), even if they draw nothing (a
+	// condition with no case for the desktop, an empty fallback list),
+	// except for the messages another renderer draws (rendersBlocks: the
+	// automated subtypes' MessageAutomatedSubtype, which shows
+	// agent_view_added's blocks through GenericSystemMessage, huddles,
+	// calendar events…): for those the text stands in when the blocks draw
+	// nothing. It does too when a block Clack can't draw yet drew nothing.
+	if len(d.Blocks) == 0 && m.Text != "" && (!rendersBlocks(m) || c.missing) {
 		d.Blocks = FromMrkdwn(r, m.Text)
 		d.Jumbo = onlyEmoji(r, m.Text)
 	}
@@ -68,13 +246,26 @@ func FromMessageIn(r Resolver, m *slack.Message, ch string) Doc {
 			d.Blocks = append(d.Blocks, c.fileBlock(&m.Files[i]))
 		}
 	}
+	var agentChannels []Block
 	for i := range m.Attachments {
 		a := &m.Attachments[i]
+		if u := a.AgentChannelUnfurl; u != nil && u.ChannelID != "" {
+			// MessageKitAttachments: an agent_channel_unfurl is never a
+			// legacy attachment; it is a CodeChannelEntityCard (surface
+			// MessageUnfurl), after the message's other attachments. The
+			// element host draws it (Buttons[0]: kind agent_channel_unfurl,
+			// the channel id); Spans is the fallback without one.
+			agentChannels = append(agentChannels, Block{Kind: Agent,
+				Buttons: []Button{{Kind: AgentChannelUnfurlKind, BlockID: u.ChannelID}},
+				Spans:   plainSpans(c.r, firstNonEmpty(a.Fallback, u.ChannelName))})
+			continue
+		}
 		if b, ok := c.attachment(a); ok {
 			if at := b.Att; at != nil {
 				if a.ID != 0 {
 					at.ID = strconv.Itoa(a.ID)
 				}
+				at.Index = i
 				at.BotID = firstNonEmpty(a.BotID, m.BotID)
 				at.BotName = botName(r, m, at.BotID)
 				at.LinkedInText = a.FromURL != "" && linksURL(m, a.FromURL)
@@ -82,6 +273,7 @@ func FromMessageIn(r Resolver, m *slack.Message, ch string) Doc {
 			d.Blocks = append(d.Blocks, b)
 		}
 	}
+	d.Blocks = append(d.Blocks, agentChannels...)
 	if e, ok := r.(emojiTexter); ok && e.EmojiAsText() { // emoji_mode as_text (highlight.go)
 		EmojiToText(d.Blocks)
 		d.Jumbo = false
@@ -137,6 +329,9 @@ func (c *builder) fileBlock(f *slack.File) Block {
 	out := convertFile(f)
 	c.canvasFile(f, out) // canvasfile.go
 	c.expandable(out)
+	if out.Email != nil {
+		c.emailNames(out.Email)
+	}
 	if f.User != "" && c.sender != "" && f.User != c.sender {
 		out.UploaderID = f.User
 		if mn, ok := c.r.(MemberNamer); ok {
@@ -146,6 +341,26 @@ func (c *builder) fileBlock(f *slack.File) Block {
 		}
 	}
 	return Block{Kind: FileBlock, File: out}
+}
+
+// transcriptStatus is file.transcription.status.
+func transcriptStatus(raw json.RawMessage) string {
+	var t struct {
+		Status string `json:"status"`
+	}
+	if len(raw) == 0 || json.Unmarshal(raw, &t) != nil {
+		return ""
+	}
+	return t.Status
+}
+
+// FileOf is a Slack file object as a message draws it (the composer's
+// uploaded clip, which its pending file plays as FileAudio).
+func FileOf(f *slack.File) *File {
+	if f == nil {
+		return nil
+	}
+	return convertFile(f)
 }
 
 func convertFile(f *slack.File) *File {
@@ -175,23 +390,39 @@ func convertFile(f *slack.File) *File {
 	mime := strings.ToLower(f.Mimetype)
 	switch {
 	case strings.HasPrefix(mime, "image/"):
+		if !slack.FileIsImage(f) {
+			break // getFileType "generic": a file card, no thumb (FileIsImage)
+		}
 		out.IsImage = true
 		out.Thumb = imageThumb(f)
 		if st := stillThumb(f); st != nil && (out.Thumb == nil || st.URL != out.Thumb.URL) {
 			out.Still = st
 		}
 		out.Deanimate = f.Deanimate != ""
-	case strings.HasPrefix(mime, "video/"):
+	case slack.FileIsPlayableAudio(f):
+		// fileIsPlayableAudio: FileAudio's AudioPlayer, playing
+		// getMediaURL's aac || url_private; any other audio/* is a plain
+		// file card (an ogg upload) or a video (a webm one)
+		out.IsAudio = true
+		out.MediaURL = SafeURL(f.AAC)       // URL stays the upload's url_private
+		if p := f.MediaProgress; p != nil { // use_media_elapsed
+			out.MediaOffsetMS, out.MediaWatched = p.OffsetMS, p.MediaWatched
+		}
+		out.Transcript, out.TranscriptRegion, out.VTT = transcriptStatus(f.Transcription), f.IsTranscriptionRegionSupported, SafeURL(f.VTT)
+	case slack.FileIsPlayableVideo(f):
+		// fileIsPlayableVideo; any other video/* is a plain file card
 		out.IsVideo = true
 		out.URL = SafeURL(firstNonEmpty(f.MP4, f.URLPrivate))
 		// FileGalleryVideoFile: original_w || thumb_video_w for the box,
-		// thumb_video_w || original_w for the poster's own size
-		out.Thumb = image(f.ThumbVideo, f.Name, firstPos(f.ThumbVideoW, f.OriginalW), firstPos(f.ThumbVideoH, f.OriginalH))
+		// thumb_video_w || original_w for the poster's own size; the poster
+		// is thumb_video_ts ?? thumb_video (an https URL only)
+		out.Thumb = image(videoPoster(f), f.Name, firstPos(f.ThumbVideoW, f.OriginalW), firstPos(f.ThumbVideoH, f.OriginalH))
 		out.OrigW, out.OrigH = firstPos(f.OriginalW, f.ThumbVideoW), firstPos(f.OriginalH, f.ThumbVideoH)
-	case strings.HasPrefix(mime, "audio/") || f.Subtype == "slack_audio":
-		out.IsAudio = true
-		if f.MP4 != "" {
-			out.URL = SafeURL(f.MP4)
+		if p := f.MediaProgress; p != nil {
+			out.MediaOffsetMS, out.MediaWatched = p.OffsetMS, p.MediaWatched
+		}
+		if f.IsSalesforceFile {
+			out.Salesforce = true
 		}
 	default:
 		out.Thumb = largestThumb(f)
@@ -206,7 +437,83 @@ func convertFile(f *slack.File) *File {
 		out.LinesMore, out.PreviewTruncated = f.LinesMore, f.PreviewIsTruncated
 	}
 	out.EditLink, out.ExternalType = SafeURL(f.EditLink), f.ExternalType
+	if f.Mode == "email" && !out.IsImage && !out.IsVideo && !out.IsAudio {
+		out.Email = convertEmail(f)
+	}
 	return out
+}
+
+// EmailFile is f, an email file from files.info, as a message's file
+// block has it, its senders and recipients named through r (the email's
+// FileDetails view, which reads the whole file).
+func EmailFile(f *slack.File, r Resolver) *File {
+	out := convertFile(f)
+	if out.Email != nil && r != nil {
+		(&builder{r: r}).emailNames(out.Email)
+	}
+	return out
+}
+
+// emailNames names an email's senders and recipients as EmailRecipient
+// shows them: a member by their name (EmailUserEntity's token), a channel
+// id with no address (the email went to a channel's address) by the
+// channel's name (looksLikeChannelId, nQiy).
+func (c *builder) emailNames(e *Email) {
+	for _, list := range [][]EmailAddress{e.From, e.To, e.Cc} {
+		for i := range list {
+			a := &list[i]
+			switch {
+			case a.UserID != "":
+				if mn, ok := c.r.(MemberNamer); ok {
+					if n, ok := mn.MemberName(a.UserID); ok && n != "" {
+						a.Name = n
+					}
+				}
+			case a.Address == "" && looksLikeChannelID(a.Name):
+				if n := c.r.ChannelName(a.Name); n != "" && n != a.Name {
+					a.Name = n
+				}
+			}
+		}
+	}
+}
+
+// looksLikeChannelID is looksLikeChannelId (nQiy): /^(C|G|D|Z)[A-Z0-9]{8,}$/.
+func looksLikeChannelID(s string) bool {
+	if len(s) < 9 || !strings.ContainsRune("CGDZ", rune(s[0])) {
+		return false
+	}
+	for _, r := range s[1:] {
+		if !(r >= 'A' && r <= 'Z' || r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// convertEmail is an email file's message (getFileType "email": mode
+// "email", after images, audio and video).
+func convertEmail(f *slack.File) *Email {
+	addrs := func(in []slack.EmailAddress) []EmailAddress {
+		var out []EmailAddress
+		for _, a := range in {
+			out = append(out, EmailAddress{Name: a.Name, Address: a.Address, UserID: a.SlackUserID})
+		}
+		return out
+	}
+	e := &Email{From: addrs(f.From), To: addrs(f.To), Cc: addrs(f.Cc), Subject: f.Subject,
+		HTML: firstNonEmpty(f.SimplifiedHTML, f.Preview), PlainText: f.PlainText, Preview: f.PreviewPlainText,
+		Timestamp: f.Timestamp, AppID: f.AppID, AppName: f.AppName}
+	if n := len(f.EmailAttachments) + f.InlineAttachmentCount; f.OriginalAttachmentCount > 0 && f.OriginalAttachmentCount != n {
+		e.Removed = f.OriginalAttachmentCount - n // renderAttachments' "{count} attachments removed"
+	}
+	if s := f.EmailSecurity; s != nil && s.HasValidDMARC != nil && !*s.HasValidDMARC {
+		e.Unverified = true
+	}
+	for _, a := range f.EmailAttachments {
+		e.Attachments = append(e.Attachments, EmailAttachment{Name: a.Filename, Mime: a.Mimetype, URL: SafeURL(a.URL), FileID: a.SlackFileID, Size: a.Size})
+	}
+	return e
 }
 
 // FileExpander is an optional Resolver extension (store.Store): a message
@@ -221,7 +528,7 @@ type FileExpander interface {
 // expandable fills a snippet's expandable state and fetched content.
 func (c *builder) expandable(out *File) {
 	fe, ok := c.r.(FileExpander)
-	if !ok || !out.IsSnippet || out.ID == "" {
+	if !ok || !out.IsSnippet && out.Email == nil || out.ID == "" {
 		return
 	}
 	out.Expanded, out.Expanding = fe.FileExpansion(c.msgCh, c.msgTS, out.ID)
@@ -237,9 +544,9 @@ func (c *builder) expandable(out *File) {
 // 720, 2HRR: thumb_480_gif, then thumb_360_gif); one without either draws
 // its static thumbs, as in Slack. Small images have no thumb past their
 // own size (a 223px screenshot stops at thumb_360, which is the
-// original's size), so the original (url_private) comes next and the
-// small thumbs last: Slack's fileIsImage draws any image/* file with an
-// image filetype or a thumb_360 inline, whatever its other thumbs.
+// original's size). Only files slack.FileIsImage takes get here: thumb_360 is
+// there, or a HEIC's thumb_800; the original (url_private) and the small
+// thumbs are left for a Salesforce file.
 func imageThumb(f *slack.File) *Image {
 	for _, g := range []struct {
 		u    string
@@ -265,6 +572,7 @@ func imageThumb(f *slack.File) *Image {
 		{f.Thumb720, f.Thumb720W, f.Thumb720H, 720},
 		{f.Thumb480, f.Thumb480W, f.Thumb480H, 480},
 		{f.Thumb360, f.Thumb360W, f.Thumb360H, 360},
+		{f.Thumb800, 0, 0, 800},
 		{f.URLPrivate, f.OriginalW, f.OriginalH, 0},
 		{f.Thumb160, 0, 0, 160},
 		{f.Thumb80, 0, 0, 80},
@@ -422,7 +730,7 @@ func (c *builder) attachment(a *slack.Attachment) (Block, bool) {
 			att.ShareChannel = strings.TrimPrefix(c.r.ChannelName(a.ChannelID), "#")
 		}
 		for _, mb := range a.MessageBlocks {
-			att.Text = append(att.Text, c.blocks(parseBlocks(mb.Message.Blocks))...)
+			att.Text = append(att.Text, c.topBlocks(mb.Message.Blocks)...)
 		}
 		if len(att.Text) == 0 {
 			att.Text = FromMrkdwn(c.r, a.Text)
@@ -432,6 +740,7 @@ func (c *builder) attachment(a *slack.Attachment) (Block, bool) {
 	} else {
 		att.IsUnfurl = a.ServiceName != "" || a.FromURL != "" || a.OriginalURL != ""
 		att.OriginalURL = SafeURL(a.OriginalURL)
+		att.AppUnfurlURL = SafeURL(a.AppUnfurlURL)
 		att.ServiceURL = SafeURL(a.ServiceURL)
 		att.VideoHTML, att.AudioHTML, att.OtherHTML = a.VideoHTML != "", a.AudioHTML != "", a.OtherHTML != ""
 		att.AudioHTMLCode, att.AudioHTMLHeight = a.AudioHTML, a.AudioHTMLH
@@ -440,11 +749,15 @@ func (c *builder) attachment(a *slack.Attachment) (Block, bool) {
 		att.ServiceIcon = SafeImage(a.ServiceIcon)
 		att.Pretext = flatten(FromMrkdwn(c.r, a.Pretext))
 		if a.Title != "" {
-			att.Title = emojify(c.r, unescape(a.Title), 0)
+			// AttachmentTitle (boot-shared yvlf): Mrkdwn with noSpecials
+			// (TSF's NOMRKDWN): its <links>, mentions and :emoji:, no
+			// *bold* or `code`. A title that is one <url|label> token
+			// (GitHub's "#4045 Update record for …") is that link.
+			att.Title = c.plainLinked(a.Title)
 		}
 		att.TitleLink = SafeURL(a.TitleLink)
 		att.Text = c.attachmentText(a)
-		if kb := c.blocks(parseBlocks(a.Blocks)); len(kb) > 0 {
+		if kb := c.topBlocks(a.Blocks); len(kb) > 0 {
 			att.Kit, att.KitFrom = true, len(att.Text)
 			att.Text = append(att.Text, kb...)
 		}

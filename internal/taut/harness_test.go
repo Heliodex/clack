@@ -11,10 +11,12 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/some-du6e/clack/internal/core"
+	"github.com/some-du6e/clack/internal/fakeslack"
 	"github.com/some-du6e/clack/internal/slack"
 	"github.com/some-du6e/clack/internal/store"
 )
@@ -99,11 +101,15 @@ type testUI struct {
 	panes     []string
 	attached  *Bridge
 	prefsOpen []string
+	links     []string // slack:// links UIHooks.DeepLink opened
+	// invalidations counts UIHooks.Invalidate calls (a redraw asked for)
+	invalidations atomic.Int64
 }
 
 func (u *testUI) hooks() UIHooks {
 	return UIHooks{
-		Attached: func(b *Bridge) { u.mu.Lock(); u.attached = b; u.mu.Unlock() },
+		Attached:   func(b *Bridge) { u.mu.Lock(); u.attached = b; u.mu.Unlock() },
+		Invalidate: func() { u.invalidations.Add(1) },
 		Deliver: func(root uint64, tree []byte) {
 			u.mu.Lock()
 			u.trees[root] = append([]byte(nil), tree...)
@@ -130,6 +136,7 @@ func (u *testUI) hooks() UIHooks {
 			u.mu.Unlock()
 		},
 		OpenPreferences: func(tab string) { u.mu.Lock(); u.prefsOpen = append(u.prefsOpen, tab); u.mu.Unlock() },
+		DeepLink:        func(uri string) bool { u.mu.Lock(); u.links = append(u.links, uri); u.mu.Unlock(); return true },
 		ThreadPane: func(op, ch, ts, arg string) any {
 			u.mu.Lock()
 			u.panes = append(u.panes, op+":"+ch+"/"+ts+":"+arg)
@@ -173,18 +180,66 @@ type harness struct {
 	fetchMu sync.Mutex
 	fetches map[string]string
 	nativeT []string // native thunk calls the test recorded
+	// jsErrors are the runtime's error and warning lines ("level: msg")
+	logMu    sync.Mutex
+	jsErrors []string
+}
+
+// jsLogged returns the runtime's error and warning lines so far.
+func (h *harness) jsLogged() []string {
+	h.logMu.Lock()
+	defer h.logMu.Unlock()
+	return append([]string(nil), h.jsErrors...)
 }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 	api := newFakeAPI(t)
-	c := slack.New(slack.Creds{Token: "xoxc-test", Cookie: "xoxd-test%2Fcookie", UserID: selfID, Team: teamID, EnterpriseID: entID,
-		TeamURL: api.srv.URL + "/", EnterpriseURL: api.srv.URL + "/"})
+	return newHarnessOn(t, api, slack.New(slack.Creds{Token: "xoxc-test", Cookie: "xoxd-test%2Fcookie", UserID: selfID, Team: teamID, EnterpriseID: entID,
+		TeamURL: api.srv.URL + "/", EnterpriseURL: api.srv.URL + "/"}))
+}
+
+// newHarnessOn is newHarness with Clack's client c (on another fake
+// Slack, e.g. internal/fakeslack's); api still answers plugin fetches of
+// its own URL.
+func newHarnessOn(t *testing.T, api *fakeAPI, c *slack.Client) *harness {
+	t.Helper()
 	s := store.New("")
 	seed(s)
 	app := core.New(c, s)
 	app.S.Self = *mustUser(s, selfID)
 	app.ServeOffline()
+	return newHarnessApp(t, api, app)
+}
+
+// newBootedHarness is the harness with core booted over fs (its own
+// workspace, not seed's) and the realtime socket open, so what the client
+// sends the gateway can be checked (fs.SocketFrames).
+func newBootedHarness(t *testing.T, fs *fakeslack.Server) *harness {
+	t.Helper()
+	app := core.New(slack.New(fs.Creds()), store.New(t.TempDir()))
+	t.Cleanup(app.Shutdown)
+	evs, stop := app.Subscribe()
+	if err := app.Boot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	app.SetRealtime(true)
+	deadline := time.After(15 * time.Second)
+	for connected := false; !connected; {
+		select {
+		case ev := <-evs:
+			connected = ev.Type == "connection" && ev.Connected
+		case <-deadline:
+			t.Fatal("timed out waiting for the realtime socket")
+		}
+	}
+	stop()
+	return newHarnessApp(t, newFakeAPI(t), app)
+}
+
+// newHarnessApp is the harness's Taut and UI over app.
+func newHarnessApp(t *testing.T, api *fakeAPI, app *core.App) *harness {
+	t.Helper()
 	h := &harness{t: t, app: app, api: api, dir: t.TempDir(), fetches: map[string]string{},
 		ui: &testUI{trees: map[uint64][]byte{}, treeCh: make(chan uint64, 64), styles: map[string]string{}, inputs: map[string]string{}}}
 	tt, err := New(Options{
@@ -192,6 +247,9 @@ func newHarness(t *testing.T) *harness {
 		CacheDir: t.TempDir(), Fetch: h.fetch, Log: func(level, msg string) {
 			if level == "error" || level == "warn" {
 				t.Logf("js %s: %s", level, msg)
+				h.logMu.Lock()
+				h.jsErrors = append(h.jsErrors, level+": "+msg)
+				h.logMu.Unlock()
 			}
 		},
 	})

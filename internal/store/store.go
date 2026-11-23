@@ -10,7 +10,10 @@ package store
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
+	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -25,6 +28,7 @@ import (
 	"github.com/some-du6e/clack/internal/emoji"
 	"github.com/some-du6e/clack/internal/richtext"
 	"github.com/some-du6e/clack/internal/slack"
+	"github.com/some-du6e/clack/internal/slackasset"
 )
 
 // Timeline is a contiguous window of a conversation's newest messages.
@@ -32,9 +36,26 @@ type Timeline struct {
 	Msgs    []slack.Message // ascending by ts
 	HasMore bool            // older messages exist beyond Msgs[0]
 	Loaded  bool
+	// EndStale: the window may stop short of the conversation's newest
+	// message. Slack's resetReachedEnd at every slow connect
+	// (reached_end.go): nothing the socket missed meanwhile is in it, so
+	// it is read forward from End before it is the newest window again,
+	// and what the socket brings past End waits in Ahead until then.
+	EndStale bool
+	End      string          // EndStale: the newest message from Slack the window held then
+	Ahead    []slack.Message // EndStale: the socket's messages past End, ascending
+	EndGen   uint64          // the reset (ResetReachedEnd) the window's end last went stale at
+	// Epoch is which window this is: a newest page that doesn't meet the
+	// window it replaces starts a new one (SetLatestReadAt), and a list
+	// holding an older epoch's messages takes this one whole instead of
+	// keeping its own in front (Slack keeps such a page a slice of its own)
+	Epoch uint64
 }
 
 type Store struct {
+	// released: Release ran; the package's maps keyed by *Store keep it
+	// no more (a late reader gets state kept nowhere)
+	released    atomic.Bool
 	mu          sync.RWMutex
 	Self        slack.User
 	TeamID      string
@@ -48,13 +69,31 @@ type Store struct {
 	Usergroups  map[string]string
 	Presence    map[string]string
 	timelines   map[string]*Timeline
+	windows     map[string][]*Window       // a conversation's stretches apart from its timeline (windows.go)
+	windowHolds map[string]map[string]int  // the windows lists show, by a ts each holds (HoldWindow)
 	threads     map[string][]slack.Message // key channel/ts
+	threadHist  map[string]*threadHist     // key channel/ts: the threads' history slices (thread_slices.go)
 	pins        map[string]pinRec          // key channel/ts: pin events (pins.go)
 	pinQ        []string                   // pins' keys, oldest first
 	pinSeq      uint64                     // pin events seen
+	endGen      uint64                     // ResetReachedEnd calls so far (reached_end.go)
+	epochs      uint64                     // windows started so far (Timeline.Epoch)
 	live        map[string]liveRec         // key channel/ts: realtime message changes (live.go)
 	liveQ       []string                   // live's keys, oldest first
 	liveSeq     uint64                     // realtime message changes seen
+	fetched     map[string]*slack.Message  // key channel/ts: messages fetched by id (fetched.go)
+	fetchedBy   map[string]map[string]bool // fetched's ts by channel (fetched.go)
+	fetchedUse  map[string]fetchedUse      // fetched's last use and size (fetched.go)
+	fetchedQ    []fetchedTick              // fetched's uses, oldest first
+	fetchedN    uint64                     // fetched's uses so far
+	fetchedSize int                        // fetched's messages' size (messageSize)
+	reacts      map[string][]reactOp       // key channel/ts: realtime reactions (reacts.go)
+	reactQ      []string                   // reacts' keys, oldest first
+	readRevs    []ReadRevision             // revisions reads brought, for core (read_revisions.go)
+	fetchedNew  []MsgRef                   // messages a fetch by id brought that the store held no copy of, for core (fetched.go)
+	subs        map[string]subRec          // key channel/thread_ts: thread subscriptions (thread_subs.go)
+	subQ        []string                   // subs' keys, oldest first
+	subSeq      uint64                     // subscription events seen
 	CustomEmoji emoji.Custom
 	EmojiStyle  string
 	cacheDir    string
@@ -78,6 +117,9 @@ type Store struct {
 	// (the User Group pane watches it, as Slack's pane re-renders on its
 	// userGroups record).
 	ugGen atomic.Uint64
+	// groupsLoaded: SetUsergroups ran (the disk cache's list or
+	// usergroups.list), so a group id Usergroups lacks doesn't exist
+	groupsLoaded bool
 	// Muted is the set of muted conversation ids (from prefs).
 	Muted map[string]bool
 	// Prefs is the curated set of user prefs that change rendering.
@@ -90,13 +132,24 @@ type Store struct {
 	ThreadsUnread          bool
 	ThreadMentions         int
 	ThreadsUnreadByChannel map[string]int
+	// notesMaxTS is the notifications store's maxTs (notifications_maxts.go)
+	notesMaxTS string
+	// countsLive: a client.counts answer was installed (SetCounts*), so the
+	// boot data's thread state no longer applies (bootdata.go)
+	countsLive bool
+	// jr is the write journal (journal.go)
+	jr journal
 	// names of conversations we are not a member of (from search/browse)
 	names       map[string]string
 	prefsCached bool
 	experiments map[string]string                 // the last experiments.getByUser groups (diskCache.Experiments)
+	features    map[string]bool                   // the last features.access.policies.list answer (diskCache.Features)
+	entPrefs    json.RawMessage                   // the last enterprise.prefs.get answer (diskCache.EnterprisePrefs)
 	ext         map[string]*slack.Conversation    // non-sidebar conversations
 	access      map[string]richtext.ChannelAccess // edge channels/info answers for mentioned channels
 	bots        map[string]BotInfo
+	// botsGone are bot ids nothing returned (PutNonexistentBots)
+	botsGone map[string]bool
 
 	// userSeen is when each user was last fetched (unix seconds; from the
 	// disk cache for users it restored): what SaveCache keeps.
@@ -110,14 +163,24 @@ type Store struct {
 	// gen counts changes to what the disk cache holds; SaveCache writes
 	// only when it (or the emoji map's version) moved since the last load
 	// or save.
-	gen       atomic.Uint64
-	saveMu    sync.Mutex
+	gen    atomic.Uint64
+	saveMu sync.Mutex
+	fileMu sync.Mutex // WriteFile's (the warm boot's small files), apart from meta.json's long saves
+	// warmGone: the warm boot's files were deleted for good (a session
+	// that ended, sign-out): WriteFile writes neither again (fileMu)
+	warmGone  bool
 	dropped   atomic.Bool // DropDisk ran (signed out): never write again
 	saved     bool
 	savedGen  uint64
 	savedEmo  uint64
 	emojiAt   time.Time // when the cached emoji map was fetched (emoji.list)
 	emojiAtMu sync.Mutex
+
+	// cachePending: LoadCacheBase installed meta.json's first part and its
+	// rest hasn't run: SaveCache writes nothing meanwhile
+	cachePending atomic.Bool
+	// emojiPartial: the emoji map is the boot data's few only
+	emojiPartial atomic.Bool
 
 	missMu     sync.Mutex
 	missSeen   map[string]bool
@@ -128,6 +191,9 @@ type Store struct {
 	// schedule
 	missUsers  []string
 	userNotify chan struct{}
+	// missBotApps are app ids the lookups that missed a bot knew (a
+	// message's app_id: getBotById's app_id param), for bots.info's app_ids
+	missBotApps map[string]string
 }
 
 // PutName remembers the name of a conversation outside the sidebar.
@@ -204,8 +270,13 @@ func (s *Store) HuddleTextOpts(channel string) richtext.HuddleTextOpts {
 
 // UserAvatar is richtext.AvatarResolver: a user's 48px picture ("" when
 // unknown, which asks for the member).
-func (s *Store) UserAvatar(id string) string {
-	if u, ok := s.User(id); ok && u != nil {
+func (s *Store) UserAvatar(id string) string { return userAvatar(s.User, id) }
+
+func userAvatar(look userLookup, id string) string {
+	if u, ok := look(id); ok && u != nil {
+		if u.ID == SlackSystemUserID { // getMemberProfileImage's n8qp (AvatarURL)
+			return slackasset.SlackLogoMark
+		}
 		return u.Profile.Image48
 	}
 	return ""
@@ -767,10 +838,25 @@ func PrefName(u *slack.User, displayRealNames bool) string {
 	return u.RealName
 }
 
+// SlackSystemUserID is the Slack system user (Slack's isSlackSystemUser,
+// client-boot iXFk: id "USLACK"), the partner of the DM Slack's own
+// notices and apps acting for Slack post in.
+const SlackSystemUserID = "USLACK"
+
 // AvatarURL is u's picture for a slot of size px: the profile image that
 // covers it, else the ca.slack-edge.com picture of avatar_hash under
 // avatarTeam, else Slack's default. viewerTeam is the viewer's team.
+//
+// The Slack system user (USLACK, the DM apps post Slack's own notices in)
+// is Slack's logo at every size: getMemberProfileImage (client-boot 6Knt)
+// returns its bundled slack_logo_mark (n8qp) for memberId "USLACK" before
+// it reads anything else. Its profile has an avatar_hash, whose
+// ca.slack-edge.com picture is the generic blue person, and image_* SVGs
+// of the same logo.
 func AvatarURL(u *slack.User, size int, viewerTeam string) string {
+	if u.ID == SlackSystemUserID {
+		return slackasset.SlackLogoMark
+	}
 	p := u.Profile
 	switch {
 	case size <= 72 && p.Image72 != "":
@@ -812,8 +898,14 @@ func avatarTeam(u *slack.User, viewerTeam string) string {
 
 // ---- richtext.Resolver ----
 
-func (s *Store) UserName(id string) string {
-	u, _ := s.User(id) // a miss is asked for
+// userLookup is how a resolver method reads a member: Store.User (a
+// view's read: the hit counts) or peekUser (Peek's: it doesn't).
+type userLookup func(id string) (*slack.User, bool)
+
+func (s *Store) UserName(id string) string { return userName(s.User, id) }
+
+func userName(look userLookup, id string) string {
+	u, _ := look(id) // a miss is asked for
 	return DisplayName(u)
 }
 
@@ -822,8 +914,29 @@ func (s *Store) UserName(id string) string {
 // pref, "Name hidden" for someone in their hidden_users (0OuZ
 // isUserHidden). ok is false for a member not loaded yet, which is noted
 // to be fetched.
-func (s *Store) MemberName(id string) (string, bool) {
-	u, ok := s.User(id) // a miss is asked for
+func (s *Store) MemberName(id string) (string, bool) { return s.memberName(s.User, id) }
+
+// MemberNameHeld is MemberName for a member the store holds now, a miss
+// asked for by nobody (getRawMemberById's read): for text built once
+// what it names was waited for (a notification's body).
+func (s *Store) MemberNameHeld(id string) (string, bool) { return s.memberName(s.RawUser, id) }
+
+// PrefNameHeld is the held member id's name under the viewer's
+// display_real_names (PrefName), nothing asked and no hidden check (the
+// caller's: core.UserHidden reads the locked hide_person_opt_out too).
+func (s *Store) PrefNameHeld(id string) (string, bool) {
+	u, ok := s.RawUser(id)
+	if !ok || u == nil {
+		return "", false
+	}
+	s.mu.RLock()
+	real := s.Prefs.DisplayRealNames
+	s.mu.RUnlock()
+	return PrefName(u, real), true
+}
+
+func (s *Store) memberName(look userLookup, id string) (string, bool) {
+	u, ok := look(id) // a miss is asked for
 	if !ok || u == nil {
 		return "", false
 	}
@@ -840,8 +953,10 @@ func (s *Store) MemberName(id string) (string, bool) {
 // MemberRealName is richtext.RealNamer: the member's real name, as the
 // member tokens Slack draws with forceRealName print it (a work object's
 // user fields), else their display name; "" for a member not loaded yet.
-func (s *Store) MemberRealName(id string) string {
-	u, ok := s.User(id) // a miss is asked for
+func (s *Store) MemberRealName(id string) string { return memberRealName(s.User, id) }
+
+func memberRealName(look userLookup, id string) string {
+	u, ok := look(id) // a miss is asked for
 	if !ok || u == nil {
 		return ""
 	}
@@ -860,11 +975,27 @@ func firstNonEmptyName(v ...string) string {
 	return ""
 }
 
+// MemberDeleted is richtext.MemberStater: whether the member is
+// deleted; known is false for a member not loaded yet, which is noted to
+// be fetched.
+func (s *Store) MemberDeleted(id string) (deleted, known bool) {
+	now := time.Now().UnixMilli()
+	s.mu.RLock()
+	u, known := s.lookupLocked(id, now)
+	s.mu.RUnlock()
+	s.afterLookup(id, known) // a miss is asked for
+	// a member users.info didn't find is known (Slack's non-existent
+	// member), and not deleted
+	return u != nil && u.Deleted, known
+}
+
 // MemberAvatar is richtext.MemberNamer: the member's own picture for a
 // 36px avatar (ConnectedBaseAvatar asks for twice that), the image
 // message rows draw; "" for a member not loaded yet.
-func (s *Store) MemberAvatar(id string) string {
-	u, ok := s.User(id)
+func (s *Store) MemberAvatar(id string) string { return s.memberAvatar(s.User, id) }
+
+func (s *Store) memberAvatar(look userLookup, id string) string {
+	u, ok := look(id)
 	if !ok || u == nil {
 		return ""
 	}
@@ -892,7 +1023,11 @@ func hiddenUser(raw json.RawMessage, id string) bool {
 	return false
 }
 
-func (s *Store) ChannelName(id string) string {
+func (s *Store) ChannelName(id string) string { return s.channelName(id, true) }
+
+// channelName is ChannelName; a DM's name is its partner's, read as a hit
+// when touch (a view's read) and not otherwise (Peek).
+func (s *Store) channelName(id string, touch bool) string {
 	s.mu.RLock()
 	c, ok := s.Convs[id]
 	if !ok {
@@ -901,7 +1036,13 @@ func (s *Store) ChannelName(id string) string {
 	if ok {
 		if c.IsIM {
 			partner, name := c.User, c.Name
-			u, known := s.lookupLocked(partner, time.Now().UnixMilli())
+			var u *slack.User
+			var known bool
+			if touch {
+				u, known = s.lookupLocked(partner, time.Now().UnixMilli())
+			} else {
+				u, known = s.peekLocked(partner)
+			}
 			s.mu.RUnlock()
 			s.afterLookup(partner, known)
 			if u != nil {
@@ -975,10 +1116,32 @@ func (s *Store) missInitLocked() {
 }
 
 // NoteMissingBot records a bot id whose name/icon is unknown.
-func (s *Store) NoteMissingBot(id string) {
-	if strings.HasPrefix(id, "B") {
-		s.noteMissing('b', id)
+func (s *Store) NoteMissingBot(id string) { s.NoteMissingBotApp(id, "") }
+
+// NoteMissingBotApp is NoteMissingBot with the app the bot belongs to,
+// when the message that drew it says (getBotByMsg passes its app_id):
+// bots.info gets it as app_ids.
+func (s *Store) NoteMissingBotApp(id, appID string) {
+	if !strings.HasPrefix(id, "B") {
+		return
 	}
+	if appID != "" {
+		s.missMu.Lock()
+		if s.missBotApps == nil {
+			s.missBotApps = map[string]string{}
+		}
+		s.missBotApps[id] = appID
+		s.missMu.Unlock()
+	}
+	s.noteMissing('b', id)
+}
+
+// MissingBotApp is the app id a lookup that missed bot id knew ("" when
+// none did).
+func (s *Store) MissingBotApp(id string) string {
+	s.missMu.Lock()
+	defer s.missMu.Unlock()
+	return s.missBotApps[id]
 }
 
 // MissingNotify fires (coalesced) when new unresolved channel, bot or
@@ -1049,6 +1212,12 @@ func (s *Store) PutExtConv(c slack.Conversation) {
 		return
 	}
 	s.mu.Lock()
+	s.putExtConvLocked(c)
+	s.mu.Unlock()
+}
+
+// putExtConvLocked is PutExtConv's body (s.mu held).
+func (s *Store) putExtConvLocked(c slack.Conversation) {
 	if s.ext == nil {
 		s.ext = map[string]*slack.Conversation{}
 	}
@@ -1060,7 +1229,26 @@ func (s *Store) PutExtConv(c slack.Conversation) {
 		s.names[c.ID] = c.Name
 		s.gen.Add(1)
 	}
-	s.mu.Unlock()
+}
+
+// AddExtConv remembers c as PutExtConv does unless the store already
+// holds it (in the sidebar, or outside it with a name): a copy fetched
+// earlier never replaces what a later change stored (a leave's
+// is_member false). It reports whether it stored c.
+func (s *Store) AddExtConv(c slack.Conversation) bool {
+	if c.ID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.Convs[c.ID]; ok {
+		return false
+	}
+	if x, ok := s.ext[c.ID]; ok && x.Name != "" {
+		return false
+	}
+	s.putExtConvLocked(c)
+	return true
 }
 
 // ExtConv returns a non-sidebar conversation.
@@ -1071,6 +1259,23 @@ func (s *Store) ExtConv(id string) (*slack.Conversation, bool) {
 	return c, ok
 }
 
+// ConvJSON is the conversation the store holds for id, a sidebar one or
+// one outside it (ExtConv), as JSON written under the store's lock: what a
+// caller hands on whole to another goroutine, as showNotification's
+// modelObject.
+func (s *Store) ConvJSON(id string) (json.RawMessage, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	c, ok := s.Convs[id]
+	if !ok || c == nil {
+		if c, ok = s.ext[id]; !ok || c == nil {
+			return nil, false
+		}
+	}
+	b, err := json.Marshal(c)
+	return b, err == nil
+}
+
 // ---- bots ----
 
 // BotInfo is a bot's display metadata (bots.info), cached on disk.
@@ -1079,6 +1284,7 @@ type BotInfo struct {
 	Icon     string `json:"icon,omitempty"`
 	AppID    string `json:"app_id,omitempty"`
 	Workflow bool   `json:"is_workflow_bot,omitempty"` // a Workflow Builder bot (badged WORKFLOW)
+	TeamID   string `json:"team_id,omitempty"`         // bots.info team_id (the hover card's bot_home_team)
 }
 
 func (s *Store) PutBot(id string, b BotInfo) {
@@ -1087,8 +1293,40 @@ func (s *Store) PutBot(id string, b BotInfo) {
 		s.bots = map[string]BotInfo{}
 	}
 	s.bots[id] = b
+	delete(s.botsGone, id)
 	s.mu.Unlock()
 	s.gen.Add(1)
+}
+
+// PutNonexistentBots records bots neither the edge cache nor bots.info
+// returned: the bots UnknownFetchManager's upsertNonExistent (client-boot
+// 0mwJ marks every id a fetch didn't return), whose stub getBotById
+// (Emf2 AF) answers from then on. Nothing asks for them again this
+// session (noteMissing records a bot once), and a message only such a bot
+// would name draws BaseMissingMember's non-existent bar.
+func (s *Store) PutNonexistentBots(ids []string) {
+	if len(ids) == 0 {
+		return
+	}
+	s.mu.Lock()
+	for _, id := range ids {
+		if _, ok := s.bots[id]; ok || id == "" {
+			continue
+		}
+		if s.botsGone == nil {
+			s.botsGone = map[string]bool{}
+		}
+		s.botsGone[id] = true
+	}
+	s.mu.Unlock()
+}
+
+// BotNonexistent reports whether nothing returned bot id
+// (PutNonexistentBots): Slack's isNonExistent bot stub.
+func (s *Store) BotNonexistent(id string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.botsGone[id]
 }
 
 // BotName is richtext.BotNamer: the cached bot's name, or "" after
@@ -1106,6 +1344,15 @@ func (s *Store) Bot(id string) (BotInfo, bool) {
 	defer s.mu.RUnlock()
 	b, ok := s.bots[id]
 	return b, ok
+}
+
+// UsergroupsLoaded reports whether the workspace's user group list was
+// read (the disk cache's or usergroups.list): a group id UsergroupName
+// can't name after that doesn't exist.
+func (s *Store) UsergroupsLoaded() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.groupsLoaded
 }
 
 func (s *Store) UsergroupName(id string) string {
@@ -1130,10 +1377,28 @@ func (s *Store) SelfID() string {
 	return s.Self.ID
 }
 
+// TeamIDs is the viewer's workspace and enterprise ids (richtext's
+// TeamResolver: Slack's selectTeamId and selectEnterpriseId, which a
+// condition block's "team" conditions compare against).
+func (s *Store) TeamIDs() (team, enterprise string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if eu := s.Self.EnterpriseUser; eu != nil {
+		enterprise = eu.EnterpriseID
+	}
+	return s.TeamID, enterprise
+}
+
 // ---- conversations ----
 
 func (s *Store) PutConv(c slack.Conversation) {
 	s.mu.Lock()
+	s.putConvLocked(c)
+	s.mu.Unlock()
+}
+
+// putConvLocked is PutConv's body (s.mu held).
+func (s *Store) putConvLocked(c slack.Conversation) {
 	if old, ok := s.Convs[c.ID]; ok {
 		if c.NumMembers == 0 {
 			c.NumMembers = old.NumMembers
@@ -1149,7 +1414,6 @@ func (s *Store) PutConv(c slack.Conversation) {
 		}
 	}
 	s.Convs[c.ID] = &c
-	s.mu.Unlock()
 }
 
 func (s *Store) Conv(id string) (*slack.Conversation, bool) {
@@ -1157,6 +1421,17 @@ func (s *Store) Conv(id string) (*slack.Conversation, bool) {
 	defer s.mu.RUnlock()
 	c, ok := s.Convs[id]
 	return c, ok
+}
+
+// DMUser is an IM's other member (richtext's DMResolver: a DM call's
+// card names them, getOtherMemberNameInDmCall).
+func (s *Store) DMUser(id string) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if c, ok := s.Convs[id]; ok && c.IsIM && c.User != "" {
+		return c.User, true
+	}
+	return "", false
 }
 
 // ---- timelines ----
@@ -1170,6 +1445,7 @@ func (s *Store) Timeline(ch string) *Timeline {
 	}
 	cp := *t
 	cp.Msgs = append([]slack.Message(nil), t.Msgs...)
+	cp.Ahead = append([]slack.Message(nil), t.Ahead...)
 	return &cp
 }
 
@@ -1184,23 +1460,46 @@ func (s *Store) TimelineIDs() []string {
 	return ids
 }
 
-// SetLatest replaces the newest window (from a fresh history fetch).
+// SetLatest replaces the newest window (from a fresh history fetch); a
+// window it now meets joins it (windows.go).
 func (s *Store) SetLatest(ch string, msgs []slack.Message, hasMore bool) {
 	SortAsc(msgs)
 	s.mu.Lock()
-	s.timelines[ch] = &Timeline{Msgs: msgs, HasMore: hasMore, Loaded: true}
+	s.noteAddedLocked(msgs)
+	t := &Timeline{Msgs: msgs, HasMore: hasMore, Loaded: true, EndGen: s.endGen}
+	if old := s.timelines[ch]; old != nil {
+		t.Epoch = old.Epoch // the same window, written whole (a test's)
+	} else {
+		t.Epoch = s.newEpochLocked()
+	}
+	s.timelines[ch] = t
+	s.absorbWindowsLocked(ch)
 	s.mu.Unlock()
 }
 
-// PrependOlder adds an older page to the front.
+// PrependOlder adds an older page to the front (one no request read:
+// a test's window).
 func (s *Store) PrependOlder(ch string, msgs []slack.Message, hasMore bool) {
+	s.PrependOlderSince(ch, msgs, hasMore, ^uint64(0))
+}
+
+// PrependOlderSince is PrependOlder for an older page whose request began
+// at LiveSeq since (scrolling up), a read like the newest page's: a
+// message the socket changed meanwhile keeps the socket's copy, one it
+// deleted stays out, the reactions it brought stay, and a revision the
+// store held another of reaches every copy and core (readWindowLocked).
+// It returns what it kept of the page.
+func (s *Store) PrependOlderSince(ch string, msgs []slack.Message, hasMore bool, since uint64) []slack.Message {
 	SortAsc(msgs)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.noteAddedLocked(msgs)
+	msgs = s.liveKeepLocked(ch, msgs, since)
+	s.readWindowLocked(ch, msgs, since)
 	t := s.timelines[ch]
 	if t == nil {
-		s.timelines[ch] = &Timeline{Msgs: msgs, HasMore: hasMore, Loaded: true}
-		return
+		s.timelines[ch] = &Timeline{Msgs: msgs, HasMore: hasMore, Loaded: true, EndGen: s.endGen, Epoch: s.newEpochLocked()}
+		return msgs
 	}
 	merged := append(append([]slack.Message(nil), msgs...), t.Msgs...)
 	t.Msgs = dedupe(merged)
@@ -1209,12 +1508,25 @@ func (s *Store) PrependOlder(ch string, msgs []slack.Message, hasMore bool) {
 	if len(t.Msgs) > 5000 {
 		t.Msgs = t.Msgs[len(t.Msgs)-5000:]
 	}
+	s.absorbWindowsLocked(ch) // the timeline grew back to a window: they're one (Slack's slices merge as they meet)
+	return msgs
 }
 
 // Upsert inserts or replaces a top-level message in a loaded timeline.
-func (s *Store) Upsert(ch string, m slack.Message) {
+func (s *Store) Upsert(ch string, m slack.Message) { s.upsert(ch, m, true) }
+
+// UpsertLocal is Upsert for a copy only this client has (an optimistic
+// send or its upload placeholder, a local ephemeral): its ts is the local
+// clock's, so the notifications' maxTs, which takes the server's alone,
+// doesn't take it (notifications_maxts.go).
+func (s *Store) UpsertLocal(ch string, m slack.Message) { s.upsert(ch, m, false) }
+
+func (s *Store) upsert(ch string, m slack.Message, server bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if server {
+		s.noteAddedTSLocked(m.TS)
+	}
 	t := s.timelines[ch]
 	if t == nil {
 		return
@@ -1223,6 +1535,51 @@ func (s *Store) Upsert(ch string, m slack.Message) {
 		if t.Msgs[i].TS == m.TS {
 			s.keepPinLocked(ch, &m, &t.Msgs[i])
 			t.Msgs[i] = m
+			return
+		}
+	}
+	s.keepPinLocked(ch, &m, nil)
+	t.Msgs = append(t.Msgs, m)
+	SortAsc(t.Msgs)
+}
+
+// UpsertInRange is Upsert for a message the socket changed that no window
+// or cached thread held (a message_changed of one Activity, Threads or
+// Saved fetched by id: a poll 80 messages back, a root after one of its
+// replies is deleted): it goes into a window holding older history
+// (HasMore) only at or after the window's oldest message from Slack, as
+// the message lists take an update (ui/messages hub.go inRange). Taken in
+// above it, the window's next reader drew it right above the newest page
+// and load-older read from it, skipping the history between; Slack's invH
+// keeps such a ts as a slice of its own, which a page covering it brings.
+// An ephemeral message, a local copy, is no boundary.
+func (s *Store) UpsertInRange(ch string, m slack.Message) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.noteAddedTSLocked(m.TS)
+	t := s.timelines[ch]
+	if t == nil {
+		return
+	}
+	for i := range t.Msgs {
+		if t.Msgs[i].TS == m.TS {
+			s.keepPinLocked(ch, &m, &t.Msgs[i])
+			t.Msgs[i] = m
+			return
+		}
+	}
+	if s.aheadLocked(ch, t, m) { // past a window whose end went stale (reached_end.go)
+		return
+	}
+	if t.HasMore {
+		oldest := ""
+		for i := range t.Msgs {
+			if !t.Msgs[i].IsEphemeral {
+				oldest = t.Msgs[i].TS
+				break
+			}
+		}
+		if oldest == "" || TSLess(m.TS, oldest) {
 			return
 		}
 	}
@@ -1248,6 +1605,20 @@ func (s *Store) mutateLocked(ch, ts string, f func(*slack.Message)) (slack.Messa
 				out, found = t.Msgs[i], true
 			}
 		}
+		for i := range t.Ahead { // past a stale end (reached_end.go)
+			if t.Ahead[i].TS == ts {
+				f(&t.Ahead[i])
+				if !found {
+					out, found = t.Ahead[i], true
+				}
+			}
+		}
+	}
+	if m := s.windowMsgLocked(ch, func(m *slack.Message) bool { return m.TS == ts }); m != nil {
+		f(m)
+		if !found {
+			out, found = *m, true
+		}
 	}
 	for k, th := range s.threads {
 		if !strings.HasPrefix(k, ch+"/") {
@@ -1262,12 +1633,25 @@ func (s *Store) mutateLocked(ch, ts string, f func(*slack.Message)) (slack.Messa
 			}
 		}
 	}
+	// a message fetched by id (fetched.go): the socket's changes reach
+	// it as Slack's reach every message of its store
+	if m := s.fetched[ch+"/"+ts]; m != nil {
+		f(m)
+		s.measureFetchedLocked(ch + "/" + ts)
+		if !found {
+			out, found = *m, true
+		}
+	}
 	return out, found
 }
 
 func (s *Store) Remove(ch, ts string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.removeLocked(ch, ts)
+}
+
+func (s *Store) removeLocked(ch, ts string) {
 	if t := s.timelines[ch]; t != nil {
 		for i := range t.Msgs {
 			if t.Msgs[i].TS == ts {
@@ -1275,7 +1659,14 @@ func (s *Store) Remove(ch, ts string) {
 				break
 			}
 		}
+		for i := range t.Ahead { // past a stale end (reached_end.go)
+			if t.Ahead[i].TS == ts {
+				t.Ahead = append(t.Ahead[:i], t.Ahead[i+1:]...)
+				break
+			}
+		}
 	}
+	s.removeWindowMsgLocked(ch, ts)
 	for k, th := range s.threads {
 		if !strings.HasPrefix(k, ch+"/") {
 			continue
@@ -1283,32 +1674,164 @@ func (s *Store) Remove(ch, ts string) {
 		for i := range th {
 			if th[i].TS == ts {
 				s.threads[k] = append(th[:i], th[i+1:]...)
+				s.removeTimestampLocked(k, ts) // its history's removeTimestamp (thread_slices.go)
 				break
 			}
 		}
 	}
+	s.dropFetchedLocked(ch + "/" + ts) // fetched.go
 }
 
 func (s *Store) Find(ch, ts string) (slack.Message, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if m := s.findRefLocked(ch, ts, ""); m != nil {
+		return *m, true
+	}
+	return slack.Message{}, false
+}
+
+// Holds reports whether ch's cached messages (timeline and threads) have
+// ts, or with cid != "" a message with that client_msg_id: Find without
+// copying the message out.
+func (s *Store) Holds(ch, ts, cid string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.findRefLocked(ch, ts, cid) != nil
+}
+
+// findRefLocked is the cached message of ch with ts (or client_msg_id cid),
+// indexed in place: ranging by value copied every message it passed
+// (slack.Message is large), and InjectedMessages asked once per message of
+// a channel.
+func (s *Store) findRefLocked(ch, ts, cid string) *slack.Message {
+	match := func(m *slack.Message) bool { return m.TS == ts || cid != "" && m.ClientMsgID == cid }
 	if t := s.timelines[ch]; t != nil {
-		for _, m := range t.Msgs {
-			if m.TS == ts {
-				return m, true
+		for i := range t.Msgs {
+			if match(&t.Msgs[i]) {
+				return &t.Msgs[i]
+			}
+		}
+		for i := range t.Ahead { // past a stale end (reached_end.go)
+			if match(&t.Ahead[i]) {
+				return &t.Ahead[i]
 			}
 		}
 	}
+	if m := s.windowMsgLocked(ch, match); m != nil {
+		return m
+	}
+	pre := ch + "/"
 	for k, th := range s.threads {
-		if strings.HasPrefix(k, ch+"/") {
-			for _, m := range th {
-				if m.TS == ts {
-					return m, true
+		if strings.HasPrefix(k, pre) {
+			for i := range th {
+				if match(&th[i]) {
+					return &th[i]
 				}
 			}
 		}
 	}
-	return slack.Message{}, false
+	return nil
+}
+
+// MessageKeys is every ts and client_msg_id among ch's cached messages
+// (timeline, a jump's windows, threads and the messages fetched by id), in
+// one pass: what the plugins' messages slice holds of core's (taut's
+// injected check). The slice holds the windows' messages and the fetched
+// copies, as Slack's one messages store does, and none of them is a
+// message a plugin injected: a conversation's list draws its history
+// (Slack's channelHistory, the windows' slices with it), which a message
+// fetched by id never joins.
+func (s *Store) MessageKeys(ch string) (ts, cids map[string]bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ts, cids = map[string]bool{}, map[string]bool{}
+	add := func(m *slack.Message) {
+		ts[m.TS] = true
+		if m.ClientMsgID != "" {
+			cids[m.ClientMsgID] = true
+		}
+	}
+	if t := s.timelines[ch]; t != nil {
+		for i := range t.Msgs {
+			add(&t.Msgs[i])
+		}
+	}
+	for _, w := range s.windows[ch] {
+		for i := range w.Msgs {
+			add(&w.Msgs[i])
+		}
+	}
+	pre := ch + "/"
+	for k, th := range s.threads {
+		if strings.HasPrefix(k, pre) {
+			for i := range th {
+				add(&th[i])
+			}
+		}
+	}
+	for _, m := range s.fetchedInLocked(ch) {
+		add(m)
+	}
+	return ts, cids
+}
+
+// MsgKey is a message by ts or client_msg_id (Held).
+type MsgKey struct{ TS, CID string }
+
+// Held reports, for each key, whether the store caches a message of ch
+// with its ts (or client_msg_id) in the timeline, a jump's window, a
+// thread or the messages fetched by id (MessageKeys' set: taut's injected
+// check): Holds for many
+// at once, one pass over the store under one read lock (Holds per message
+// scanned the timeline and every cached thread once each).
+func (s *Store) Held(ch string, keys []MsgKey) []bool {
+	out := make([]bool, len(keys))
+	if len(keys) == 0 {
+		return out
+	}
+	byTS := make(map[string][]int, len(keys))
+	byCID := map[string][]int{}
+	for i, k := range keys {
+		byTS[k.TS] = append(byTS[k.TS], i)
+		if k.CID != "" {
+			byCID[k.CID] = append(byCID[k.CID], i)
+		}
+	}
+	mark := func(m *slack.Message) {
+		for _, i := range byTS[m.TS] {
+			out[i] = true
+		}
+		if m.ClientMsgID != "" {
+			for _, i := range byCID[m.ClientMsgID] {
+				out[i] = true
+			}
+		}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if t := s.timelines[ch]; t != nil {
+		for i := range t.Msgs {
+			mark(&t.Msgs[i])
+		}
+	}
+	for _, w := range s.windows[ch] { // a jump's windows, which Holds reads too
+		for i := range w.Msgs {
+			mark(&w.Msgs[i])
+		}
+	}
+	pre := ch + "/"
+	for k, th := range s.threads {
+		if strings.HasPrefix(k, pre) {
+			for i := range th {
+				mark(&th[i])
+			}
+		}
+	}
+	for _, m := range s.fetchedInLocked(ch) {
+		mark(m)
+	}
+	return out
 }
 
 // MsgRef names a cached message.
@@ -1343,7 +1866,50 @@ func (s *Store) WithFile(id string) []MsgRef {
 			add(ch, &th[i])
 		}
 	}
+	for k, m := range s.fetched { // messages fetched by id (fetched.go)
+		ch, _, _ := strings.Cut(k, "/")
+		add(ch, m)
+	}
 	return out
+}
+
+// HeldFile is a complete copy (not a FileStub) of file id that a cached
+// message carries: Slack keeps files in one store by id, which merges
+// every copy it gets (4OY3 processFile: {...held, ...copy}), so a
+// message's stub reads the whole file there; Clack keeps the copies in
+// the messages (core keepFiles). It reads each held message (timelines,
+// threads, messages fetched by id) until it finds one: for a stub only.
+func (s *Store) HeldFile(id string) (slack.File, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	find := func(m *slack.Message) (slack.File, bool) {
+		for i := range m.Files {
+			if f := &m.Files[i]; f.ID == id && !FileStub(f) {
+				return *f, true
+			}
+		}
+		return slack.File{}, false
+	}
+	for _, t := range s.timelines {
+		for i := range t.Msgs {
+			if f, ok := find(&t.Msgs[i]); ok {
+				return f, true
+			}
+		}
+	}
+	for _, th := range s.threads {
+		for i := range th {
+			if f, ok := find(&th[i]); ok {
+				return f, true
+			}
+		}
+	}
+	for _, m := range s.fetched {
+		if f, ok := find(m); ok {
+			return f, true
+		}
+	}
+	return slack.File{}, false
 }
 
 // ClientMsgIDs lists the client_msg_ids of ch's cached messages (timeline
@@ -1383,7 +1949,9 @@ func (s *Store) Thread(ch, ts string) ([]slack.Message, bool) {
 func (s *Store) SetThread(ch, ts string, msgs []slack.Message) {
 	SortAsc(msgs)
 	s.mu.Lock()
+	s.noteAddedLocked(msgs)
 	s.threads[ch+"/"+ts] = msgs
+	s.setThreadWholeLocked(ch+"/"+ts, msgs) // the whole thread: one slice, both ends (thread_slices.go)
 	s.mu.Unlock()
 }
 
@@ -1391,6 +1959,32 @@ func (s *Store) SetThread(ch, ts string, msgs []slack.Message) {
 func (s *Store) AddReply(ch string, m slack.Message) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.noteAddedTSLocked(m.TS)
+	s.addReplyLocked(ch, m)
+}
+
+// AddReplyLocal is AddReply for a copy only this client has (UpsertLocal):
+// maxTs doesn't take its local clock's ts.
+func (s *Store) AddReplyLocal(ch string, m slack.Message) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.addReplyLocked(ch, m)
+}
+
+// AddReplyNoted is AddReply and the reply's live note (NoteLive) under
+// one lock: a replies read landing between the two put an answer from
+// before the reply back over the cached thread.
+func (s *Store) AddReplyNoted(ch string, m slack.Message) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.noteAddedTSLocked(m.TS)
+	s.addReplyLocked(ch, m)
+	if ch != "" && m.TS != "" {
+		s.noteLiveLocked(ch, m.TS, &m)
+	}
+}
+
+func (s *Store) addReplyLocked(ch string, m slack.Message) {
 	key := ch + "/" + m.ThreadTS
 	if th, ok := s.threads[key]; ok {
 		replaced := false
@@ -1408,25 +2002,17 @@ func (s *Store) AddReply(ch string, m slack.Message) {
 			SortAsc(th)
 		}
 		s.threads[key] = th
+		if !replaced {
+			s.liveReplyLocked(key, m.TS) // its history's addTimestamps (thread_slices.go)
+		}
 	}
 }
 
 // ---- counts ----
 
-func (s *Store) SetCounts(c *slack.Counts) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.Counts = map[string]*slack.CountEntry{}
-	for _, l := range [][]slack.CountEntry{c.Channels, c.IMs, c.MPIMs} {
-		for i := range l {
-			e := l[i]
-			s.Counts[e.ID] = &e
-		}
-	}
-	s.ThreadsUnread = c.Threads.HasUnreads
-	s.ThreadMentions = c.Threads.MentionCount
-	s.ThreadsUnreadByChannel = c.Threads.UnreadCountByChannel
-}
+// SetCounts installs a client.counts answer whole (SetCountsSince keeps
+// what changed while the call was out).
+func (s *Store) SetCounts(c *slack.Counts) { s.SetCountsSince(c, math.MaxUint64) }
 
 // Count returns a copy of a conversation's unread state.
 func (s *Store) Count(ch string) (slack.CountEntry, bool) {
@@ -1450,6 +2036,7 @@ func (s *Store) MarkRead(ch, ts string) slack.CountEntry {
 		e = &slack.CountEntry{ID: ch}
 		s.Counts[ch] = e
 	}
+	s.noteMarkLocked(ch) // a counts answer fetched before keeps this cursor (journal.go)
 	e.LastRead = ts
 	if e.Latest == "" || !TSLess(ts, e.Latest) {
 		e.HasUnreads = false
@@ -1471,6 +2058,7 @@ func (s *Store) NoteMessage(ch string, m *slack.Message, mentionsSelf bool) slac
 		e = &slack.CountEntry{ID: ch}
 		s.Counts[ch] = e
 	}
+	s.noteMessageLocked(ch) // newer than a counts answer still out (journal.go)
 	if e.Latest == "" || TSLess(e.Latest, m.TS) {
 		e.Latest = m.TS
 	}
@@ -1484,15 +2072,52 @@ func (s *Store) NoteMessage(ch string, m *slack.Message, mentionsSelf bool) slac
 		return *e
 	}
 	e.HasUnreads = true
-	c := s.Convs[ch]
-	isDM := c != nil && (c.IsIM || c.IsMPIM) || strings.HasPrefix(ch, "D")
-	if isDM && c != nil && c.IsMPIM && s.Muted[ch] {
-		isDM = false // a muted group DM badges on mentions only (Slack's unreadHighlightCnt)
-	}
-	if mentionsSelf || isDM {
+	if mentionsSelf || s.countsAsDMLocked(ch) {
 		e.MentionCount++
 	}
 	return *e
+}
+
+// countsAsDMLocked reports whether NoteMessage counts every message from
+// others in ch as a mention, the way Slack badges a DM: an IM, or a group
+// DM that isn't muted (a muted one badges on mentions only: Slack's
+// unreadHighlightCnt). s.mu held.
+func (s *Store) countsAsDMLocked(ch string) bool {
+	c := s.Convs[ch]
+	isDM := c != nil && (c.IsIM || c.IsMPIM) || strings.HasPrefix(ch, "D")
+	if isDM && c != nil && c.IsMPIM && s.Muted[ch] {
+		isDM = false
+	}
+	return isDM
+}
+
+// CountsAsDM is countsAsDMLocked for the conversation as the store holds it
+// now.
+func (s *Store) CountsAsDM(ch string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.countsAsDMLocked(ch)
+}
+
+// NoteLateDM is NoteMessage's DM rule for message m of ch, counted before
+// the store knew ch (core held the message for its conversations.info):
+// one mention more once ch turns out to be an IM or a group DM, unless the
+// viewer read past it meanwhile or it is the viewer's own.
+func (s *Store) NoteLateDM(ch string, m *slack.Message) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.Counts[ch]
+	if !ok || !e.HasUnreads || !s.countsAsDMLocked(ch) {
+		return
+	}
+	if self := s.Self.ID; m.User == self && self != "" {
+		return
+	}
+	if e.LastRead != "" && !TSLess(e.LastRead, m.TS) {
+		return
+	}
+	s.noteMessageLocked(ch) // newer than a counts answer still out, as NoteMessage's
+	e.MentionCount++
 }
 
 // ---- disk cache (metadata only) ----
@@ -1517,6 +2142,19 @@ type diskCache struct {
 	// persistenceEnabled), so checks read the account's groups before the
 	// call answers again.
 	Experiments map[string]string `json:"experiments,omitempty"`
+	// Features is the last features.access.policies.list answer, name ->
+	// is_enabled: Slack's featureAccess store is persisted too (zxoU,
+	// persistenceEnabled), so a warm launch draws what the features allow
+	// (Directories' User Groups tab) before the call answers again.
+	Features map[string]bool `json:"features,omitempty"`
+	// EnterprisePrefs is the last enterprise.prefs.get answer as Slack
+	// sent it: its enterprisePrefs store is persisted (TI4y,
+	// persistenceEnabled), so the org's prefs hold from the first frame.
+	EnterprisePrefs json.RawMessage `json:"enterprise_prefs,omitempty"`
+	// NotificationsMaxTS is the notifications store's maxTs, which Slack
+	// persists too (storeKey "notifications", persistenceEnabled;
+	// notifications_maxts.go)
+	NotificationsMaxTS string `json:"notifications_max_ts,omitempty"`
 }
 
 // MaxSavedUsers bounds the users meta.json keeps: the most recently fetched
@@ -1556,6 +2194,24 @@ func (s *Store) SetExperimentGroups(g map[string]string) {
 	s.gen.Add(1)
 }
 
+// SetEnterprisePrefs keeps enterprise.prefs.get's answer for the disk
+// cache.
+func (s *Store) SetEnterprisePrefs(raw json.RawMessage) {
+	cp := append(json.RawMessage(nil), raw...)
+	s.mu.Lock()
+	s.entPrefs = cp
+	s.mu.Unlock()
+	s.gen.Add(1)
+}
+
+// CachedEnterprisePrefs returns the enterprise.prefs.get answer the disk
+// cache (or the last SetEnterprisePrefs) holds, nil when there is none.
+func (s *Store) CachedEnterprisePrefs() json.RawMessage {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append(json.RawMessage(nil), s.entPrefs...)
+}
+
 // CachedExperimentGroups returns the experiment groups the disk cache (or
 // the last SetExperimentGroups) holds, nil when there are none.
 func (s *Store) CachedExperimentGroups() map[string]string {
@@ -1571,6 +2227,45 @@ func (s *Store) CachedExperimentGroups() map[string]string {
 	return out
 }
 
+// SetFeatureAccess keeps features.access.policies.list's answer (name ->
+// is_enabled) for the disk cache.
+func (s *Store) SetFeatureAccess(on map[string]bool) {
+	cp := make(map[string]bool, len(on))
+	for k, v := range on {
+		cp[k] = v
+	}
+	s.mu.Lock()
+	s.features = cp
+	s.mu.Unlock()
+	s.gen.Add(1)
+}
+
+// CachedFeatureAccess is the feature answer the disk cache (or the last
+// SetFeatureAccess) holds: ok false when there is none.
+func (s *Store) CachedFeatureAccess(name string) (on, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.features == nil {
+		return false, false
+	}
+	return s.features[name], true
+}
+
+// CachedFeatures is the whole persisted feature answer (a copy; nil when
+// there is none).
+func (s *Store) CachedFeatures() map[string]bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.features == nil {
+		return nil
+	}
+	out := make(map[string]bool, len(s.features))
+	for k, v := range s.features {
+		out[k] = v
+	}
+	return out
+}
+
 // HasCachedPrefs reports whether prefs came from the disk cache.
 func (s *Store) HasCachedPrefs() bool {
 	s.mu.RLock()
@@ -1578,17 +2273,21 @@ func (s *Store) HasCachedPrefs() bool {
 	return s.prefsCached
 }
 
-// SetUsergroups installs usergroups (for <!subteam^> names and autocomplete).
 // SetMyUsergroups replaces the viewer's user groups
 // (bulkSetUserGroupMembership).
-func (s *Store) SetMyUsergroups(ids []string) {
+func (s *Store) SetMyUsergroups(ids []string) (changed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.MyGroups = make(map[string]bool, len(ids))
+	next := make(map[string]bool, len(ids))
 	for _, id := range ids {
-		s.MyGroups[id] = true
+		next[id] = true
 	}
+	if s.MyGroups != nil && maps.Equal(next, s.MyGroups) {
+		return false // the usual answer: nothing a message reads moved
+	}
+	s.MyGroups = next
 	s.gen.Add(1)
+	return true
 }
 
 // SetMyUsergroup records the viewer joining or leaving group id
@@ -1664,6 +2363,29 @@ func (s *Store) SetGroupChannels(id string, ids []string) {
 	}
 }
 
+// MergeUsergroup is upsertEntity for a group (JJAw: {...stored,
+// ...answer}): set gets the stored record (or one with only the id) and
+// writes the answer's fields over it, so the fields the answer leaves out
+// stay as they were; then PutUsergroup.
+func (s *Store) MergeUsergroup(id string, set func(g *slack.Usergroup)) slack.Usergroup {
+	if id == "" {
+		return slack.Usergroup{}
+	}
+	g := slack.Usergroup{ID: id}
+	s.mu.RLock()
+	for i := range s.Groups {
+		if s.Groups[i].ID == id {
+			g = s.Groups[i]
+			break
+		}
+	}
+	s.mu.RUnlock()
+	set(&g)
+	g.ID = id
+	s.PutUsergroup(g)
+	return g
+}
+
 // PutUsergroup is bulkAddGroups for one group (subteam_updated,
 // subteam_created): g replaces the stored record with its id (members
 // and default channels are kept apart, so they stay), or joins the list.
@@ -1728,11 +2450,14 @@ func (s *Store) InUsergroup(id string) bool {
 	return s.MyGroups[id]
 }
 
-func (s *Store) SetUsergroups(gs []slack.Usergroup) {
+// SetUsergroups installs usergroups (for <!subteam^> names and
+// autocomplete) and reports whether they changed.
+func (s *Store) SetUsergroups(gs []slack.Usergroup) (changed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.groupsLoaded = true
 	if s.sameGroups(gs) {
-		return // the usual refresh: nothing to install or save
+		return false // the usual refresh: nothing to install or save
 	}
 	s.Groups = s.Groups[:0]
 	for _, g := range gs {
@@ -1744,37 +2469,76 @@ func (s *Store) SetUsergroups(gs []slack.Usergroup) {
 	}
 	s.gen.Add(1)
 	s.ugGen.Add(1)
+	return true
 }
 
 func (s *Store) LoadCache() {
-	if s.cacheDir == "" || s.dropped.Load() {
-		return
+	if rest := s.LoadCacheBase(); rest != nil {
+		rest()
 	}
+}
+
+// LoadCacheBase reads and installs the part of meta.json a launch's first
+// frame reads: the users, the prefs, the channel names, the bots and the
+// experiments (metaLayout). The returned rest reads and installs the
+// custom emoji and the user groups (6.6 MB and 0.4 MB on Hack Club), once
+// (nil: no cache, or none of it loaded). Until rest has run SaveCache
+// writes nothing, as a save then would lose what rest installs. A file
+// whose first part is cut short loads nothing; one cut inside the rest
+// keeps its first part (Boot fetches the emoji then: the map is empty).
+func (s *Store) LoadCacheBase() (rest func()) {
+	if s.cacheDir == "" || s.dropped.Load() {
+		return nil
+	}
+	t0 := time.Now()
 	f, err := os.Open(filepath.Join(s.cacheDir, "meta.json"))
 	if err != nil {
-		return
+		return nil
 	}
 	var d diskCache
 	var users []*slack.User
-	err = readDiskCache(bufio.NewReaderSize(f, 64<<10), &d, func(u *slack.User) { users = append(users, u) })
-	f.Close()
-	if err != nil {
-		return
+	m := newMetaDecoder(bufio.NewReaderSize(f, 64<<10), &d, func(u *slack.User) { users = append(users, u) })
+	if err := m.base(); err != nil {
+		f.Close()
+		return nil
 	}
+	s.cachePending.Store(true)
+	s.installCacheBase(&d, users)
+	gen := s.gen.Load() // what the store holds now is what is on disk, so far
+	tBase := time.Since(t0)
+	return func() {
+		defer s.cachePending.Store(false)
+		t1 := time.Now()
+		err := m.rest()
+		f.Close()
+		if err != nil || s.dropped.Load() {
+			return // the first part stays; the next save writes the store whole
+		}
+		packed := len(d.EmojiPacked)
+		s.installCacheRest(&d)
+		s.saveMu.Lock()
+		if s.gen.Load() == gen || !s.saved { // nothing else changed between the parts
+			s.saved, s.savedGen, s.savedEmo = true, s.gen.Load(), s.CustomEmoji.Version()
+		}
+		s.saveMu.Unlock()
+		if f := cacheLoadLog; f != nil {
+			f(fmt.Sprintf("cache: meta.json (layout %d) %d users, prefs and names in %s; %d emoji (%.1f MB packed) and %d user groups in %s",
+				m.layout, len(users), tBase.Round(time.Millisecond), s.CustomEmoji.Len(), float64(packed)/(1<<20), len(d.Usergroups),
+				time.Since(t1).Round(time.Millisecond)))
+		}
+	}
+}
+
+// cacheLoadLog hears LoadCacheBase's timing line (core logs it as a debug
+// line: the startup timeline's cache-read detail).
+var cacheLoadLog func(string)
+
+// SetCacheLoadLog sets cacheLoadLog (core, before Boot).
+func SetCacheLoadLog(f func(string)) { cacheLoadLog = f }
+
+// installCacheBase installs LoadCacheBase's part.
+func (s *Store) installCacheBase(d *diskCache, users []*slack.User) {
 	s.putUserPtrs(users, d.UserSeen)
-	if d.EmojiPacked != "" {
-		s.CustomEmoji.Set(unpackEmoji(d.EmojiPacked))
-	} else if len(d.Emoji) > 0 {
-		s.CustomEmoji.Set(d.Emoji)
-	}
-	if d.EmojiAt > 0 {
-		s.emojiAtMu.Lock()
-		s.emojiAt = time.Unix(d.EmojiAt, 0)
-		s.emojiAtMu.Unlock()
-	}
-	if len(d.Usergroups) > 0 {
-		s.SetUsergroups(d.Usergroups)
-	}
 	s.mu.Lock()
 	if len(d.Names) > 0 {
 		if s.names == nil {
@@ -1785,10 +2549,33 @@ func (s *Store) LoadCache() {
 		}
 	}
 	if len(d.Bots) > 0 {
-		s.bots = d.Bots
+		// under what this session stored or found gone meanwhile: that
+		// answer is newer than the disk's copy, and nothing would ask for
+		// the bot again (noteMissing records a bot once a session)
+		if len(s.bots)+len(s.botsGone) == 0 {
+			s.bots = d.Bots
+		} else {
+			if s.bots == nil {
+				s.bots = make(map[string]BotInfo, len(d.Bots))
+			}
+			for id, b := range d.Bots {
+				if _, ok := s.bots[id]; !ok && !s.botsGone[id] {
+					s.bots[id] = b
+				}
+			}
+		}
+	}
+	if TSLess(s.notesMaxTS, d.NotificationsMaxTS) { // a session's newer one stays (it can't be older than the disk's)
+		s.notesMaxTS = d.NotificationsMaxTS
 	}
 	if d.Experiments != nil {
 		s.experiments = d.Experiments
+	}
+	if d.Features != nil {
+		s.features = d.Features
+	}
+	if len(d.EnterprisePrefs) > 0 {
+		s.entPrefs = d.EnterprisePrefs
 	}
 	s.mu.Unlock()
 	if d.Prefs != nil {
@@ -1801,16 +2588,33 @@ func (s *Store) LoadCache() {
 		s.prefsCached = true
 		s.mu.Unlock()
 	}
-	// what was just read is what is on disk
-	s.saveMu.Lock()
-	s.saved, s.savedGen, s.savedEmo = true, s.gen.Load(), s.CustomEmoji.Version()
-	s.saveMu.Unlock()
+}
+
+// installCacheRest installs the rest's part: the custom emoji (over the
+// boot data's few, InstallBootEmoji) and the user groups.
+func (s *Store) installCacheRest(d *diskCache) {
+	if d.EmojiPacked != "" {
+		s.CustomEmoji.Set(unpackEmoji(d.EmojiPacked))
+		s.emojiPartial.Store(false)
+	} else if len(d.Emoji) > 0 {
+		s.CustomEmoji.Set(d.Emoji)
+		s.emojiPartial.Store(false)
+	}
+	if d.EmojiAt > 0 {
+		s.emojiAtMu.Lock()
+		s.emojiAt = time.Unix(d.EmojiAt, 0)
+		s.emojiAtMu.Unlock()
+	}
+	if len(d.Usergroups) > 0 {
+		s.SetUsergroups(d.Usergroups)
+	}
 }
 
 // SetEmojiList installs a fresh emoji.list result, compacted the way the
 // disk cache stores it (see diskCache.EmojiPacked), and stamps its age.
 func (s *Store) SetEmojiList(m map[string]string) {
 	s.CustomEmoji.Set(unpackEmoji(packEmoji(m)))
+	s.emojiPartial.Store(false)
 	s.emojiAtMu.Lock()
 	s.emojiAt = time.Now()
 	s.emojiAtMu.Unlock()
@@ -1821,6 +2625,7 @@ func (s *Store) SetEmojiList(m map[string]string) {
 // share the one string.
 func (s *Store) SetEmojiPacked(p string) {
 	s.CustomEmoji.Set(unpackEmoji(p))
+	s.emojiPartial.Store(false)
 	s.emojiAtMu.Lock()
 	s.emojiAt = time.Now()
 	s.emojiAtMu.Unlock()
@@ -1877,8 +2682,8 @@ func unpackEmoji(p string) map[string]string {
 }
 
 func (s *Store) SaveCache() error {
-	if s.cacheDir == "" {
-		return nil
+	if s.cacheDir == "" || s.cachePending.Load() {
+		return nil // pending: the emoji and the user groups aren't in yet (LoadCacheBase)
 	}
 	s.saveMu.Lock()
 	defer s.saveMu.Unlock()
@@ -1908,18 +2713,39 @@ func (s *Store) SaveCache() error {
 	if s.experiments != nil {
 		d.Experiments = s.experiments // replaced whole, never changed in place
 	}
+	if s.features != nil {
+		d.Features = s.features // replaced whole too
+	}
+	d.EnterprisePrefs = s.entPrefs // replaced whole too
+	d.NotificationsMaxTS = s.notesMaxTS
 	// the stored users are never changed in place (PutUsers replaces
-	// them), so they're written after the lock is let go: the viewer and
-	// the MaxSavedUsers most recently fetched
+	// them), so they're written after the lock is let go: the viewer, the
+	// people the sidebar names (DM partners, group DM members: a warm
+	// boot's rows are labelled from these, bootdata.go) and the
+	// MaxSavedUsers most recently fetched
 	users := make([]*slack.User, 0, len(s.Users))
 	for _, u := range s.Users {
 		users = append(users, u)
 	}
 	if len(users) > MaxSavedUsers {
 		self := s.Self.ID
+		side := map[string]bool{}
+		for _, c := range s.Convs {
+			if c.IsIM && c.User != "" {
+				side[c.User] = true
+			}
+			if c.IsMPIM {
+				for _, m := range c.Members {
+					side[m] = true
+				}
+			}
+		}
 		sort.Slice(users, func(i, j int) bool {
 			if (users[i].ID == self) != (users[j].ID == self) {
 				return users[i].ID == self
+			}
+			if a, b := side[users[i].ID], side[users[j].ID]; a != b {
+				return a
 			}
 			if a, b := s.userSeen[users[i].ID], s.userSeen[users[j].ID]; a != b {
 				return a > b

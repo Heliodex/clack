@@ -54,6 +54,13 @@ func (t *originTracker) get(fallback image.Point) image.Point {
 // of a frame, so origin trackers laid out later in the frame pair each local
 // event with the same event's window position.
 func (a *App) readRootPointer(gtx layout.Context) {
+	// where the last frame's root was in the router's coordinates: Gio's
+	// own title bar (Wayland with no server-side decorations, GNOME's
+	// Mutter) draws the frame below it, and the router's areas include
+	// that offset where FrameEvent coordinates don't (FrameOrigin)
+	if full, _, ok := gtx.Source.AreaBounds(&a.ptrTag); ok {
+		a.frameOrg = full.Min
+	}
 	for {
 		e, ok := gtx.Event(pointer.Filter{Target: &a.ptrTag, Kinds: pointer.Move | pointer.Enter | pointer.Press | pointer.Drag | pointer.Release})
 		if !ok {
@@ -84,6 +91,13 @@ func (a *App) rootPointer(gtx layout.Context) {
 	event.Op(gtx.Ops, &a.ptrTag)
 }
 
+// FrameOrigin is the frame's origin in the router's coordinates, as the
+// last frame put it: subtract it from an AreaBounds rectangle (Gio patch
+// 53, and 57's FollowArea) to get the FrameEvent coordinates everything
+// else uses. Nonzero only under Gio's own decorations (app.Window's
+// decorate: a title bar decoHeight tall).
+func (a *App) FrameOrigin() image.Point { return a.frameOrg }
+
 // PointerPos is the last pointer position in window coordinates (popup
 // anchors; messages.PointerHost).
 func (a *App) PointerPos() image.Point { return a.ptrWin }
@@ -102,6 +116,17 @@ type typer interface{ Typing() string }
 // originSetter covers the feature widgets with an exported Origin field
 // (set through a small adapter in mount_features.go).
 type originSetter interface{ SetOrigin(image.Point) }
+
+// layoutComposerIn lays comp out with its plugin components in slackc
+// pane pane (composer.LayoutIn); a composer without one lays out as it is.
+func layoutComposerIn(comp composerView, gtx layout.Context, pane string) layout.Dimensions {
+	if p, ok := comp.(interface {
+		LayoutIn(layout.Context, string) layout.Dimensions
+	}); ok {
+		return p.LayoutIn(gtx, pane)
+	}
+	return comp.Layout(gtx)
+}
 
 // composerView is what the shell needs from composer.Composer.
 type composerView interface {
@@ -129,6 +154,18 @@ type convo struct {
 	bannerH  int             // its height last frame
 	post     core.Posting    // posting restrictions, cached at postAt
 	postAt   time.Time
+	// zeroSince is when the composer started laying out to no height (zero:
+	// it has its height); rebuiltAt when it was last replaced for that
+	// (composer_guard.go).
+	zeroSince, rebuiltAt time.Time
+	// focusKnown: a navigation here wanted the composer focused while the
+	// channel's membership was unknown (footPending); the first frame that
+	// knows it gives the composer the focus, if it has one
+	focusKnown bool
+	// inputShown: the reply box drew last pass (Slack's thread 'input'
+	// row is mounted). The pass that first draws it again gives it a
+	// pending focusInput's focus (thread_focus_input.go).
+	inputShown bool
 }
 
 func (a *App) convoFor(ch, ts string) *convo {
@@ -137,6 +174,7 @@ func (a *App) convoFor(ch, ts string) *convo {
 		a.convos = map[string]*convo{}
 	}
 	if c := a.convos[k]; c != nil {
+		a.convoOrder = lruTouch(a.convoOrder, k) // view_lru.go
 		return c
 	}
 	c := &convo{ch: ch, ts: ts}
@@ -145,37 +183,66 @@ func (a *App) convoFor(ch, ts string) *convo {
 	} else {
 		c.list = a.mountThreadList(ch, ts)
 	}
-	if cv, ok := a.mountComposer(ch, ts).(composerView); ok {
-		c.comp = cv
-		c.comp.SetOnEditLast(func() { a.editLast(c) })
-		if fl, ok := c.comp.(interface{ SetOnFocusList(func()) }); ok {
-			fl.SetOnFocusList(func() { a.focusList(c) })
-		}
-		if sn, ok := c.comp.(interface{ SetOnSend(func(string, bool)) }); ok {
-			sn.SetOnSend(func(cid string, files bool) { jumpToOwnSend(c, cid, files) })
-		}
-	}
+	a.attachComposer(c)
 	a.convos[k] = c
 	a.convoOrder = append(a.convoOrder, k)
-	if len(a.convoOrder) > 32 {
-		old := a.convoOrder[0]
+	if len(a.convoOrder) > maxConvos {
+		old := a.convoOrder[0] // the least recently used
 		a.convoOrder = a.convoOrder[1:]
 		if oc := a.convos[old]; oc != nil && oc.comp != nil {
 			oc.comp.Close() // saves the draft
 		}
 		delete(a.convos, old)
+		noteEvicted("convo", old)
 	}
 	return c
+}
+
+// attachComposer mounts c's composer and wires it to c's list.
+func (a *App) attachComposer(c *convo) {
+	cv, ok := a.mountComposer(c.ch, c.ts).(composerView)
+	if !ok {
+		return
+	}
+	c.comp = cv
+	c.comp.SetOnEditLast(func() { a.editLast(c) })
+	if fl, ok := c.comp.(interface{ SetOnFocusList(func()) }); ok {
+		fl.SetOnFocusList(func() { a.focusList(c) })
+	}
+	if pk, ok := c.comp.(interface{ SetOnPageKeyEmpty(func(string)) }); ok {
+		pk.SetOnPageKeyEmpty(func(name string) {
+			if l, ok := c.list.(interface{ PageKey(string) }); ok {
+				l.PageKey(name)
+			}
+		})
+	}
+	if sn, ok := c.comp.(interface{ SetOnSend(func(string, bool)) }); ok {
+		sn.SetOnSend(func(cid string, files bool) { jumpToOwnSend(c, cid, files) })
+	}
 }
 
 // layoutConvo draws the list with the composer under it. fallback is the
 // widget's window origin when known from layout (primary panel), used until
 // the origin tracker has seen the pointer.
+//
+// The composer (or the footer in its place) lays out first, and the list
+// gets the height it leaves. Slack top-aligns a short thread, its reply box
+// right under the last reply instead of at the pane's bottom: where that is
+// is known once the list has laid out in this frame, so the box goes there
+// after the list, which is clipped to the thread it drew. Every decision
+// is this frame's: a decision from the last frame's list left a thread's
+// reply box out of the frame that drew its replies, and with nothing else
+// to draw, the window drew no other frame until some input came.
 func (a *App) layoutConvo(gtx layout.Context, c *convo, fallback image.Point) layout.Dimensions {
 	sz := gtx.Constraints.Max
 	origin := c.org.get(fallback)
 	c.org.track(gtx, a)
 
+	// the list's copy of the conversation for this frame, the one it then
+	// draws (messages.ThreadView.Prepare): the reply box goes with it
+	if p, ok := c.list.(interface{ Prepare(layout.Context) }); ok {
+		p.Prepare(gtx)
+	}
 	comp := c.comp
 	if c.edit != nil {
 		if c.edit.Done() {
@@ -189,39 +256,67 @@ func (a *App) layoutConvo(gtx layout.Context, c *convo, fallback image.Point) la
 	}
 	// ThreadsError is the thread pane's only content: no reply input
 	// (messages.ThreadView.HidesComposer)
-	if hc, ok := c.list.(interface{ HidesComposer() bool }); ok && hc.HidesComposer() {
+	hc, _ := c.list.(interface{ HidesComposer() bool })
+	if hc != nil && hc.HidesComposer() {
 		comp = nil
 	}
-	// Slack top-aligns a short thread: the reply composer sits right under
-	// the last reply instead of at the pane's bottom (last frame's height).
-	fit := 0
-	if ch, ok := c.list.(interface{ ContentHeight() int }); ok && c.ts != "" {
-		if h := ch.ContentHeight(); h > 0 && h < sz.Y-c.compH {
-			fit = h
-		}
+	// the composer's (or footer's) window origin while it lays out (its
+	// popups, rects): where the last frame put it; the list says where it
+	// goes in this frame
+	guess := sz.Y - c.compH
+	if c.fitH > 0 {
+		guess = c.fitH
 	}
-	compH := 0
+	compH, mx, bannerH := 0, 0, 0
 	var call op.CallOp
 	foot := a.footerFor(c)
-	if foot != footNone {
+	if foot != footPending && c.focusKnown {
+		// the navigation's focus, held while membership was unknown
+		// (focusAfterNavigate): MessagePaneInput's onFocusTransition once
+		// the input mounts
+		c.focusKnown = false
+		if foot == footNone && c.comp != nil && c.edit == nil && a.router.Current().Channel() == c.ch && !a.overlayOpen() {
+			c.comp.Focus()
+		}
+	}
+	switch foot {
+	case footNone:
+	case footPending:
+		comp = nil // membership unknown: neither the composer nor a footer yet
+	default:
 		// a preview or an archived channel: Slack's footer, no composer
 		comp = nil
 		m := op.Record(gtx.Ops)
 		g := gtx
 		g.Constraints = layout.Constraints{Min: image.Pt(sz.X, 0), Max: image.Pt(sz.X, sz.Y*6/10)}
-		compY := sz.Y - c.compH
-		if fit > 0 {
-			compY = fit
-		}
-		d := a.layoutFooter(g, c, foot, origin.Add(image.Pt(0, compY)))
+		d := a.layoutFooter(g, c, foot, origin.Add(image.Pt(0, guess)))
 		call = m.Stop()
 		compH = d.Size.Y
 		c.compH = compH
 	}
+	// the input row mounts (InputContainer.componentDidMount with
+	// focusInputOnMount, l6n6.js:10074, KafO.js:880): a thread focusInput
+	// names takes the focus. No box this pass (loading, ThreadsError, a
+	// footer) is no row yet; an edit composer standing in leaves it alone.
+	// Under an open modal or menu the box mounts unfocused: Slack's
+	// componentDidMount focuses regardless, but a modal's focus trap takes
+	// the focus straight back, and Clack's overlays have none (as
+	// focusKnown's focus above).
+	mounted := false
+	switch {
+	case comp == nil:
+		c.inputShown = false
+	case comp == c.comp && !c.inputShown:
+		c.inputShown = true
+		if a.threadFocusWanted(c) && !a.overlayOpen() {
+			c.comp.Focus()
+			mounted = true
+		}
+	}
 	if comp != nil {
 		// Edit composers draw just the box: give them the same side and
 		// bottom margins as the normal composer (20px channel, 16px thread).
-		mx, mb := 0, 0
+		mb := 0
 		if comp == c.edit {
 			mx = gtx.Dp(20)
 			if c.ts != "" {
@@ -229,31 +324,37 @@ func (a *App) layoutConvo(gtx layout.Context, c *convo, fallback image.Point) la
 			}
 			mb = gtx.Dp(24)
 		}
-		compY := sz.Y - c.compH
-		if fit > 0 {
-			compY = fit
-		}
-		comp.SetOrigin(origin.Add(image.Pt(mx, compY)))
+		comp.SetOrigin(origin.Add(image.Pt(mx, guess)))
 		a.composerRoadblock(c, comp)
 		m := op.Record(gtx.Ops)
 		g := gtx
 		g.Constraints = layout.Constraints{Min: image.Pt(sz.X-2*mx, 0), Max: image.Pt(sz.X-2*mx, sz.Y*6/10)}
 		st := op.Offset(image.Pt(mx, 0)).Push(gtx.Ops)
-		d := comp.Layout(g)
+		// in its list's slackc pane: the plugin roots are this
+		// conversation's, never another place's composer for it
+		pane := ""
+		if p, ok := c.list.(interface{ PaneID() string }); ok {
+			pane = p.PaneID()
+		}
+		d := layoutComposerIn(comp, g, pane)
+		if a.composerHeight(gtx, g, c, comp, d.Size.Y) { // no height: a new composer (composer_guard.go)
+			comp = c.comp
+			if mounted {
+				comp.Focus() // the box mounting now is the new one
+			}
+			comp.SetOrigin(origin.Add(image.Pt(mx, guess)))
+			a.composerRoadblock(c, comp)
+			d = layoutComposerIn(comp, g, pane)
+		}
 		st.Pop()
 		call = m.Stop()
 		compH = d.Size.Y + mb
 		c.compH = compH
-		compY = sz.Y - compH
-		if fit > 0 && fit < compY {
-			compY = fit
-		}
-		top := origin.Add(image.Pt(0, compY))
-		c.compRect = image.Rectangle{Min: top, Max: top.Add(image.Pt(sz.X, compH))}
 		// the channel join banner sits over the composer (message pane
-		// input chrome); the list gives up its height
+		// input chrome); the list gives up its height. Channels only, so
+		// no short thread moves it.
 		bm := op.Record(gtx.Ops)
-		bd := a.layoutJoinBanner(gtx, c, origin.Add(image.Pt(0, compY-c.bannerH)))
+		bd := a.layoutJoinBanner(gtx, c, origin.Add(image.Pt(0, sz.Y-compH-c.bannerH)))
 		bcall := bm.Stop()
 		if bd.Size.Y > 0 {
 			inner := call
@@ -265,30 +366,61 @@ func (a *App) layoutConvo(gtx layout.Context, c *convo, fallback image.Point) la
 			call = m.Stop()
 			compH += bd.Size.Y
 		}
+		bannerH = bd.Size.Y
 		if c.bannerH != bd.Size.Y {
 			c.bannerH = bd.Size.Y
 			a.Invalidate()
 		}
 	}
-	listH := sz.Y - compH
-	if fit > 0 && fit < listH {
-		listH = fit
-	}
-	if fit != c.fitH { // the thread grew or shrank: settle on the next frame
-		c.fitH = fit
-		a.Invalidate()
-	}
+	// the list in what the composer leaves
+	availH := sz.Y - compH
 	if s, ok := c.list.(originSetter); ok {
 		s.SetOrigin(origin)
 	}
-	atExact(gtx, image.Point{}, image.Pt(sz.X, listH), func(gtx layout.Context) layout.Dimensions {
-		defer clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops).Pop()
-		return c.list.Layout(gtx)
-	})
-	if comp != nil || foot != footNone {
+	lm := op.Record(gtx.Ops)
+	atExact(gtx, image.Point{}, image.Pt(sz.X, availH), c.list.Layout)
+	lcall := lm.Stop()
+	// a thread that fits over its box ends where the list drew its last
+	// reply in this frame (messages.ThreadView.ContentHeight): the list is
+	// clipped there and the box goes under it
+	fit := 0
+	if ch, ok := c.list.(interface{ ContentHeight() int }); ok && c.ts != "" {
+		if h := ch.ContentHeight(); h > 0 && h < availH {
+			fit = h
+		}
+	}
+	c.fitH = fit
+	listH := availH
+	if fit > 0 {
+		listH = fit
+	}
+	cl := clip.Rect{Max: image.Pt(sz.X, listH)}.Push(gtx.Ops)
+	lcall.Add(gtx.Ops)
+	cl.Pop()
+	compY := listH + bannerH // the composer's top (the footer's: no banner)
+	if comp != nil {
+		comp.SetOrigin(origin.Add(image.Pt(mx, compY))) // BoxRect, popups
+		top := origin.Add(image.Pt(0, compY))
+		c.compRect = image.Rectangle{Min: top, Max: top.Add(image.Pt(sz.X, compH-bannerH))}
+	} else {
+		// no composer this frame (a preview's or archived channel's
+		// footer, membership unknown, ThreadsError): the emoji picker
+		// anchors on the composer this frame drew, not one from before
+		c.compRect = image.Rectangle{}
+	}
+	switch {
+	case comp != nil || (foot != footNone && foot != footPending):
 		t := op.Offset(image.Pt(0, listH)).Push(gtx.Ops)
 		call.Add(gtx.Ops)
 		t.Pop()
+		if compY != guess {
+			// it laid out where it was (the thread loaded, grew or shrank,
+			// the composer's height changed): again, so what it anchors
+			// in window coordinates is where it is
+			a.Invalidate()
+		}
+	case foot == footNone && c.comp != nil && hc != nil && !hc.HidesComposer():
+		a.Invalidate() // the thread's box shows now (its list changed under the decision)
 	}
 	// Slack's FileDragDrop around the pane: its drop zone, and the drop
 	// overlay over list and composer while files hover it (drop_overlay.go)
@@ -312,28 +444,14 @@ func (a *App) editLast(c *convo) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		var msgs []core.Message
-		if c.ts == "" {
-			p, err := svc.History(ctx, c.ch, "")
-			if err != nil {
-				return
-			}
-			msgs = p.Messages
-		} else {
-			rs, err := svc.Replies(ctx, c.ch, c.ts)
-			if err != nil {
-				return
-			}
-			msgs = rs
+		m, found, ok := lastOwnEditable(ctx, svc, c.ch, c.ts, self) // the newest slice's (unsend.go)
+		switch {
+		case !ok:
+		case found:
+			a.Post(func() { a.startEdit(c, m) })
+		default:
+			a.Post(func() { a.Toast("You haven't sent anything here yet") })
 		}
-		for i := len(msgs) - 1; i >= 0; i-- {
-			m := msgs[i]
-			if m.User == self && !m.System && m.Subtype == "" {
-				a.Post(func() { a.startEdit(c, m) })
-				return
-			}
-		}
-		a.Post(func() { a.Toast("You haven't sent anything here yet") })
 	}()
 }
 

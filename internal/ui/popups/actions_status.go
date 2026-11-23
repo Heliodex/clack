@@ -203,6 +203,11 @@ func actKeepLabel(exp int64, now time.Time) string {
 	return nsStatus.T("Until {expirationDate}", "expirationDate", date)
 }
 
+// StatusUntil is BaseCustomStatusExpiration's "Until {expirationDate}"
+// for a status expiring at exp (unix seconds): the custom status
+// tooltip's subtitle (messages/status_tip.go).
+func StatusUntil(exp int64, now time.Time) string { return actKeepLabel(exp, now) }
+
 // actDurLabel is a duration's label in the locale (current_status).
 func actDurLabel(d actDur) string { return nsStatus.T(actDurLabels[d]) }
 
@@ -1519,7 +1524,11 @@ type actTipPill struct {
 	h     Host
 	modal *Modal
 	done  bool
+	rect  image.Rectangle // the pill as last drawn, window coords (Rect)
 }
+
+// Rect is the pill as last drawn (window coords).
+func (p *actTipPill) Rect() image.Rectangle { return p.rect }
 
 func (p *actTipPill) Dismissed() bool { return p.done || p.modal == nil || p.modal.Dismissed() }
 
@@ -1561,6 +1570,7 @@ func (p *actTipPill) Layout(gtx layout.Context) layout.Dimensions {
 		tw += textW(gtx, th, 15, sg.w, sg.s)
 	}
 	r := actTipRect(gtx, p.modal.rect, tw)
+	p.rect = r
 	rrect(gtx, r, r.Dy()/2, rgba(0x000000, .7))
 	x := r.Min.X + (r.Dx()-tw)/2
 	for _, sg := range segs {

@@ -201,6 +201,11 @@ type AppHome struct {
 	AppID, AppInstalledTeamID, ChannelID string
 	HomeTab, MessagesTab, MessagesRO     bool
 	HomeViewID                           string
+	// AgentTasks is SUqq getAppHomeFormatted's isAgentTasksEnabled: the
+	// app home's agent_tasks_enabled, on unless it is false (the app
+	// settings' "Show a Tasks tab", which the settings page turns off
+	// with the Messages tab). agent_tasks.go's tab rule reads it.
+	AgentTasks bool
 }
 
 // AppShortcut is one app shortcut (global or message action).
@@ -244,7 +249,7 @@ type Interactive struct {
 	feedback map[string][]string
 }
 
-var interactiveIndex sync.Map // *App → *Interactive
+var interactiveIndex = newPerApp() // *App → *Interactive
 
 // Interactive returns the App's interaction service (created on first
 // use; it starts listening for view and ephemeral events right away).
@@ -276,16 +281,38 @@ func (ix *Interactive) start() {
 func (ix *Interactive) Subscribe() (<-chan ViewEvent, func()) {
 	c := make(chan ViewEvent, 64)
 	ix.mu.Lock()
+	if ix.a.released.Load() { // Release closed the others: nothing would close it
+		ix.mu.Unlock()
+		close(c)
+		return c, func() {}
+	}
 	ix.subs[c] = struct{}{}
 	ix.mu.Unlock()
 	var once sync.Once
 	return c, func() {
 		once.Do(func() {
+			// whoever takes c out closes it (emit sends under ix.mu): a
+			// stop before Release used to leave blockkit's range loop, and
+			// the App it posts to, waiting for good (ci-speed-3)
 			ix.mu.Lock()
-			delete(ix.subs, c)
+			if _, live := ix.subs[c]; live {
+				delete(ix.subs, c)
+				close(c)
+			}
 			ix.mu.Unlock()
 		})
 	}
+}
+
+// closeSubs closes every subscriber's channel (their range loops end):
+// the App is done (Release). A stop after it finds nothing to close.
+func (ix *Interactive) closeSubs() {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	for c := range ix.subs {
+		close(c)
+	}
+	ix.subs = map[chan ViewEvent]struct{}{}
 }
 
 func (ix *Interactive) emit(e ViewEvent) {
@@ -986,6 +1013,7 @@ func (ix *Interactive) AppHome(ctx context.Context, ch string) (AppHome, *View, 
 			MessagesTab        bool   `json:"messages_tab_enabled"`
 			MessagesRO         bool   `json:"messages_tab_read_only_enabled"`
 			HomeViewID         string `json:"home_view_id"`
+			AgentTasks         *bool  `json:"agent_tasks_enabled"`
 		} `json:"app_home"`
 		HomeView json.RawMessage `json:"home_view"`
 	}
@@ -997,7 +1025,7 @@ func (ix *Interactive) AppHome(ctx context.Context, ch string) (AppHome, *View, 
 	}
 	h := AppHome{AppID: res.AppHome.AppID, AppInstalledTeamID: res.AppHome.AppInstalledTeamID, ChannelID: ch,
 		HomeTab: res.AppHome.HomeTab, MessagesTab: res.AppHome.MessagesTab, MessagesRO: res.AppHome.MessagesRO,
-		HomeViewID: res.AppHome.HomeViewID}
+		HomeViewID: res.AppHome.HomeViewID, AgentTasks: res.AppHome.AgentTasks == nil || *res.AppHome.AgentTasks}
 	var v *View
 	if pv, err := ParseView(res.HomeView); err == nil {
 		pv.ChannelID = ch
@@ -1094,6 +1122,11 @@ func (ix *Interactive) MessageContainer(m *Message, attachmentID int) BlockActio
 			b.ServiceID = m.BotProfile.ID
 		}
 	}
+	if b.ServiceID == "" && m.User == "USLACKBOT" && quipFeedbackBlocks(m.Blocks) {
+		// Slack's serviceId is bot_id || (isSlackbotMessage &&
+		// hasQuipMigrationFeedbackBlocks ? "BSLACKBOT")
+		b.ServiceID = "BSLACKBOT"
+	}
 	if b.ServiceTeamID == "" {
 		b.ServiceTeamID = ix.teamID()
 	}
@@ -1112,6 +1145,27 @@ func (ix *Interactive) MessageContainer(m *Message, attachmentID int) BlockActio
 	}
 	b.Container = c
 	return b
+}
+
+// quipFeedbackBlocks is Slack's hasQuipMigrationFeedbackBlocks: a block
+// whose block_id starts with "quip_migration_feedback".
+func quipFeedbackBlocks(raw json.RawMessage) bool {
+	if !strings.Contains(string(raw), "quip_migration_feedback") {
+		return false
+	}
+	var bs []struct {
+		BlockID json.RawMessage `json:"block_id"`
+	}
+	if json.Unmarshal(raw, &bs) != nil {
+		return false
+	}
+	for _, b := range bs {
+		var id string
+		if json.Unmarshal(b.BlockID, &id) == nil && strings.HasPrefix(id, "quip_migration_feedback") {
+			return true
+		}
+	}
+	return false
 }
 
 // ViewContainer builds the blocks.actions container of a view.

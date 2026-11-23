@@ -33,7 +33,9 @@ import (
 //     "unread_marked_read" (the ghost: its line at half opacity after 3 s).
 //   - checkUnreads: while the user's attention is on the thread (window
 //     focused, no overlay) a followed thread with lastRead < maxMarkableTs
-//     is marked read 350 ms later (setThreadLastRead).
+//     is marked read 350 ms later (setThreadLastRead), unless the viewer
+//     marked it unread (threadsManuallyMarkedUnread, which the pane's
+//     mount, a thread switch and its reply box's focus empty of it).
 //   - getThreadStartPosition: a thread opens at its first unread reply
 //     (offset 100), at the reply it was last read to, or at the root.
 //   - onEsc: Esc marks the thread read when there is something to mark;
@@ -68,12 +70,17 @@ type AttentionHost interface {
 	UserAttention() bool
 }
 
-// threadRoot is the loaded root message.
+// threadRoot is the root message (rootMsg): the slice's first when the
+// slice starts with it, else the store's copy the model keeps
+// (thread_load.go), wherever the slice is.
 func (s *listState) threadRoot() (*core.Message, bool) {
-	if len(s.snap.msgs) == 0 || s.snap.msgs[0].m.TS != s.ts {
-		return nil, false
+	if len(s.snap.msgs) > 0 && s.snap.msgs[0].m.TS == s.ts {
+		return &s.snap.msgs[0].m, true
 	}
-	return &s.snap.msgs[0].m, true
+	if r := s.snap.th.root; r != nil && r.TS == s.ts && (s.snap.loaded || len(s.snap.msgs) > 0) {
+		return r, true
+	}
+	return nil, false
 }
 
 // threadSub is use_thread_subscription: followed, and its lastRead.
@@ -88,13 +95,22 @@ func (s *listState) threadSub() (subscribed bool, lastRead string) {
 	return true, r.ThreadLastRead
 }
 
-// maxMarkable is maxRealTs over the thread's timestamps: the newest
-// message that isn't a temp (pending) one.
+// maxMarkable is maxRealTs (8GqV) over the thread's timestamps: the
+// newest message that isRealMsg, neither a temp (pending) one nor an
+// ephemeral (is_ephemeral: an app's "Only visible to you" reply, such as
+// Slack Extra's "please don't reply to the anchor", which no
+// subscriptions.thread.mark may name).
 func (s *listState) maxMarkable() string {
+	var ix *core.Interactive
+	if s.hb != nil && s.hb.app != nil {
+		ix = s.hb.app.Interactive()
+	}
 	for i := len(s.snap.msgs) - 1; i >= 0; i-- {
-		if m := &s.snap.msgs[i].m; !m.Pending && !m.Failed {
-			return m.TS
+		m := &s.snap.msgs[i].m
+		if m.Pending || m.Failed || m.Ephemeral || (ix != nil && ix.Ephemeral(s.ch, m.TS)) {
+			continue
 		}
+		return m.TS
 	}
 	return ""
 }
@@ -180,6 +196,12 @@ func (s *listState) checkThreadUnreads(gtx layout.Context, h Host, now time.Time
 	}
 	if ah, ok := h.(AttentionHost); ok && !ah.UserAttention() {
 		s.thr.armed = time.Time{} // Not marking …: the window isn't focused
+		return
+	}
+	if app := h.Core(); app != nil && app.ThreadMarkedUnread(s.ch, s.ts) != "" {
+		// checkUnreads marks only a thread that isn't in
+		// threadsManuallyMarkedUnread: Mark unread in the open pane holds
+		s.thr.armed = time.Time{}
 		return
 	}
 	if s.thr.armed.IsZero() {
@@ -268,8 +290,25 @@ func (s *listState) threadStart(jump string) (key string, offset bool) {
 
 // threadStartPosition is threadStart as a list position: the item at y
 // 100 (or 0), clamped by the list at either end like Slack's
-// AnchorLayout brackets scrollTop.
+// AnchorLayout brackets scrollTop. With no jump, the scrollmark the pane
+// saved as it last unmounted comes first, where the slice drawn holds its
+// message (getThreadStartPosition: scrollmark.mark unless highlighting);
+// it serves one mount. Then the start is getThreadStartTs': the jump, else
+// the thread metadata's startTs (a jump's the model kept across a thread
+// switch, CloseThread), else the last read.
 func (s *listState) threadStartPosition(gtx layout.Context, jump string) layout.Position {
+	mark := s.thrMark
+	s.thrMark = threadMark{}
+	if mark.key != "" && jump == "" {
+		for i, it := range s.items {
+			if it.kind == itMsg && it.key == mark.key {
+				return layout.Position{BeforeEnd: true, First: i, Offset: mark.off}
+			}
+		}
+	}
+	if jump == "" && !s.snap.th.picked {
+		jump = s.snap.th.start
+	}
 	key, off := s.threadStart(jump)
 	for i, it := range s.items {
 		if it.kind == itMsg && it.key == key {

@@ -49,6 +49,7 @@ func (a *App) layoutSlackToast(gtx layout.Context) {
 	w, h := 2*px+is+gap+tw, 2*py+lh
 	off := gtx.Dp(20)
 	r := image.Rect(sz.X-off-w, sz.Y-a.toastBottom(gtx)-h, sz.X-off, sz.Y-a.toastBottom(gtx))
+	a.toast.rect = r
 	theme.Shadow(gtx, r.Add(image.Pt(0, gtx.Dp(4))), gtx.Dp(8), gtx.Dp(12), theme.WithAlpha(c.PanelShadow, 0x14))
 	theme.RRect(gtx, r.Inset(-max(1, gtx.Dp(1))), gtx.Dp(8)+1, theme.WithAlpha(c.Fg, 0x21))
 	theme.RRect(gtx, r, gtx.Dp(8), c.Tooltip)
@@ -111,6 +112,7 @@ func (a *App) layoutRichToast(gtx layout.Context) {
 	w, h := 2*px+is+gap+tw, 2*py+lines*lh
 	off := gtx.Dp(20)
 	r := image.Rect(sz.X-off-w, sz.Y-a.toastBottom(gtx)-h, sz.X-off, sz.Y-a.toastBottom(gtx))
+	a.toast.rect = r
 	theme.Shadow(gtx, r.Add(image.Pt(0, gtx.Dp(4))), gtx.Dp(8), gtx.Dp(12), theme.WithAlpha(c.PanelShadow, 0x14))
 	theme.RRect(gtx, r.Inset(-max(1, gtx.Dp(1))), gtx.Dp(8)+1, theme.WithAlpha(c.Fg, 0x21))
 	theme.RRect(gtx, r, gtx.Dp(8), c.Tooltip)
@@ -163,9 +165,13 @@ func (a *App) wrapToastParts(gtx layout.Context, parts []i18n.Part, maxW int) ([
 		case p.Tag == "link" && a.toast.linkHref != "":
 			href = a.toast.linkHref
 		}
-		for i, f := range strings.Split(p.Text, " ") {
+		for i, f := range strings.Split(strings.ReplaceAll(p.Text, "\n", " \n "), " ") {
 			if i > 0 {
 				pendingSpace = true
+			}
+			if f == "\n" { // a <div> or <br> line break (the workflow toasts, Izws)
+				line, x, pendingSpace = line+1, 0, false
+				continue
 			}
 			if f == "" {
 				continue
@@ -198,8 +204,8 @@ func (a *App) toastLink(gtx layout.Context, r image.Rectangle, href string) {
 		if !ok {
 			break
 		}
-		if ev.Kind == gesture.KindClick {
-			a.OpenURL(href)
+		if ev.Kind == gesture.KindClick && !a.FollowLink(href, false) {
+			openURL(href) // Slack's Link: a Slack link in the client, the rest in the browser
 		}
 	}
 	defer clip.Rect(r).Push(gtx.Ops).Pop()

@@ -40,7 +40,7 @@ func TestActivityFakeslackFeed(t *testing.T) {
 		keys[page.Items[i].Key] = &page.Items[i]
 	}
 	// generic_system_alert and team_joiner_invite aren't in the all view's
-	// types (hgTi adds team_joiner_invite only behind an experiment)
+	// types (Ku1y j, build c07ab895506f, never asks for team_joiner_invite)
 	for _, k := range fakeslack.ActivityKeys() {
 		if keys[k] == nil && k != "fa-alert" && k != "fa-joiner" {
 			t.Errorf("%s missing from the all view", k)

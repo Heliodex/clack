@@ -230,8 +230,8 @@ func TestCodeChannelPaneFakeslack(t *testing.T) {
 		})
 		shot("code-pane-canvas")
 
-		// pull_request views: session_channels_gh_wo
-		e.a.data.core.SetExperimentGroup("session_channels_gh_wo", "on")
+		// pull_request views: readablePrViewsEnabled (session_channels_code_tab_pr)
+		e.a.data.core.SetExperimentGroup("session_channels_code_tab_pr", "on")
 		open("V0PR")
 		e.until("pull request", 15*time.Second, func() bool { v := diff("V0PR"); return v != nil && v.done })
 		pr := diff("V0PR")
@@ -248,7 +248,7 @@ func TestCodeChannelPaneFakeslack(t *testing.T) {
 		shot("code-pane-pr-split")
 		pr.split = false
 		shot("code-pane-pr-unified")
-		e.a.data.core.SetExperimentGroup("session_channels_gh_wo", "off")
+		e.a.data.core.SetExperimentGroup("session_channels_code_tab_pr", "off")
 		pr.subtab, pr.split = "conversation", false
 		e.a.CloseSecondary()
 		e.a.secondary.expanded = false

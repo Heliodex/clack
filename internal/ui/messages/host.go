@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"gioui.org/text"
 
@@ -30,11 +31,78 @@ type Host interface {
 	popups.Host
 }
 
+// MediaHost is optional on the Host: a message's playable videos play in
+// place (internal/ui/videoplayer, through richview.Media). pane names the
+// list ("channel", "thread", with its container), h is the row's
+// handler.
+type MediaHost interface {
+	MessageMedia(pane, ch, ts string, h MediaRowHost) richview.Media
+}
+
+// MediaRowHost is what a row gives its videos: its handler's file
+// actions (the corner's More actions) and its OpenFile.
+type MediaRowHost interface {
+	OpenFile(f *richtext.File)
+	FileAction(a richview.FileAction, f *richtext.File, btn image.Rectangle)
+}
+
+// VideoViewerOpener is optional on the Host: the media viewer at f, one
+// of m's files (a gallery's video, fIJO's tE; Expand, its tR), from at,
+// playing unless !autoplay; false where videos don't play.
+type VideoViewerOpener interface {
+	OpenVideoViewer(f *richtext.File, m core.Message, at time.Duration, autoplay bool) bool
+}
+
+// OpenFileMenu is the video player's More actions
+// (videoplayer.MenuOpener): VideoActionsButton's menu under the button
+// (win when Gio said where, else view from the row's anchor), onClose once
+// it closes.
+func (r *richHandler) OpenFileMenu(f *richtext.File, win, view image.Rectangle, onClose func()) bool {
+	ph, ok := r.h.(popups.Host)
+	if !ok || r.m == nil || f == nil {
+		return false
+	}
+	btn := win
+	if btn.Empty() {
+		btn = view
+		if r.anchor != nil {
+			min := r.anchor(view.Min)
+			btn = image.Rectangle{Min: min, Max: min.Add(view.Size())}
+		}
+	}
+	mn := popups.NewVideoActionsMenuClosing(ph, btn, *r.m, f, r.thread, onClose)
+	if mn == nil {
+		return false
+	}
+	ph.ShowOverlay(mn)
+	return true
+}
+
+// ExpandVideo is the inline player's Expand (videoplayer.Expander).
+func (r *richHandler) ExpandVideo(f *richtext.File, at time.Duration, autoplay bool) bool {
+	vo, ok := r.h.(VideoViewerOpener)
+	return ok && r.m != nil && vo.OpenVideoViewer(f, *r.m, at, autoplay)
+}
+
+// mediaVisibility is optional on a row's richview.Media: the share of a
+// video tile the list showed as it laid out.
+type mediaVisibility interface {
+	MediaVisible(f *richtext.File, frac float64)
+}
+
 // CanvasOpener is optional: the ui root shows canvases natively (canvas
 // files in messages, links to canvases).
 type CanvasOpener interface {
 	OpenCanvas(id string)
 	OpenCanvasLink(url string) bool
+}
+
+// WorkflowMentionOpener is optional: OpenWorkflowMention handles a click
+// on a workflow mention in m (rich text workflow_mention, linking to url):
+// Slack's WorkflowMention opens the workflow details view
+// (workflows_wire.go). It reports whether url was one.
+type WorkflowMentionOpener interface {
+	OpenWorkflowMention(m *core.Message, url string) bool
 }
 
 // ChannelTabOpener is optional: OpenChannelTabLink handles a channel-tab
@@ -49,6 +117,21 @@ type ChannelTabOpener interface {
 type ListOpener interface {
 	OpenList(id string)
 	OpenListLink(url string) bool
+}
+
+// newEmailRendering is new_email_rendering: off, Slack's EmailFileDetails
+// draws nothing (FkQ0), so an email file opens no email pane.
+func newEmailRendering(h Host) bool {
+	app := h.Core()
+	return app == nil || app.NewEmailRendering()
+}
+
+// EmailOpener is optional: an email file's header (MessageFileHeader's
+// onEmailHeaderClick) and its View file details open Slack's
+// EmailFileDetails in the secondary view (toFileDetails), for the
+// message ch/ts that shares it.
+type EmailOpener interface {
+	OpenEmailFile(f *richtext.File, ch, ts string)
 }
 
 // PaneBack is optional: the back stack of the view container being laid
@@ -116,11 +199,20 @@ var (
 	styles   = map[*text.Shaper]*styleEntry{}
 )
 
+func init() { // a finished App's shapers leave the cache (theme.ForgetShaper)
+	theme.OnForgetShaper(func(sh *text.Shaper) {
+		stylesMu.Lock()
+		delete(styles, sh)
+		stylesMu.Unlock()
+	})
+}
+
 func styleFor(h Host) *richview.Style {
 	st := styleForTheme(h.Theme(), h.Images())
 	if app := h.Core(); app != nil {
 		st.SetFlatHeadings(flatHeadings(app))
-		st.SetWorkObjects(woStyleFlags(h, app)) // work object cards (workobjects.go)
+		st.SetNewEmailRendering(app.NewEmailRendering()) // email files (richview email.go)
+		st.SetWorkObjects(woStyleFlags(h, app))          // work object cards (workobjects.go)
 		st.WorkObjects = woSource{app}
 		st.PrivateForwarding = func() bool { v, _ := app.TeamPref("private_message_forwarding"); return string(v) == "true" }
 	}
@@ -184,9 +276,18 @@ type richHandler struct {
 	h      Host
 	m      *core.Message
 	anchor func(p image.Point) image.Point
+	thread bool // the row is in a thread pane
 }
 
-func (r *richHandler) OpenURL(url string) {
+func (r *richHandler) OpenURL(url string) { r.open(url, false) }
+
+// open is a link's click; openRoot: a mrkdwn or rich_text link's
+// (BaseMrkdwnLink's openThreadForRootMessage), so a link to a thread's
+// parent opens its thread.
+func (r *richHandler) open(url string, openRoot bool) {
+	if wo, ok := r.h.(WorkflowMentionOpener); ok && wo.OpenWorkflowMention(r.m, url) {
+		return
+	}
 	if blockkit.OpenWorkflowLink(r.h, url, r.m.Channel, r.m.TS) {
 		return
 	}
@@ -209,25 +310,80 @@ func (r *richHandler) OpenURL(url string) {
 		}
 		return
 	}
-	if ch, ts, ok := slackLink(url); ok {
-		if ts != "" {
-			r.h.Navigate("c/" + ch + "/t/" + ts)
-		} else {
-			r.h.Navigate("c/" + ch)
+	if lf, ok := r.h.(LinkFollower); ok {
+		if !lf.FollowLink(url, openRoot) {
+			openURL(url) // openPermalink's new tab: not a link Slack opens itself
 		}
+		return
+	}
+	if route, ok := slackLinkRoute(url); ok { // a Host without Slack's Link
+		r.h.Navigate(route)
 		return
 	}
 	openURL(url)
 }
 
-// OpenLink is a mrkdwn link's click with its text: Slack's
-// suspicious-link warning first (popups.MaybeWarnLink, unless
-// suppress_link_warning), then OpenURL.
+// LinkFollower is optional on the Host: Slack's Link click (jRB6, the ui
+// root's App.FollowLink) for a link in a message. A slack: link goes to
+// handleDeepLink, a link to a message or a conversation through
+// openPermalink (jumpToMessage({channelId, ts, threadTs}), which looks
+// the message's thread up when the link has none, so a reply opens in
+// its parent's thread and is never a thread's root; openRoot opens a
+// thread's parent's own). false: the caller opens it in the browser.
+type LinkFollower interface {
+	FollowLink(url string, openRoot bool) bool
+}
+
+// MessageJumper is optional on the Host: a message_mention pill's click
+// (MessageMention, p9lB): jumpToMessage({channelId, ts, threadTs}) with
+// the pill's own channel_id, message_ts and thread_ts (the ui root's
+// App.JumpToMessage).
+type MessageJumper interface {
+	JumpToMessage(ch, ts, thread string)
+}
+
+// ReplyRootRedirector is optional on the Host: a thread pane whose root
+// turned out to be a reply in thread root once its messages loaded (it
+// was opened with the reply's ts) hands the thread on, its parent's
+// thread at the reply (the ui root's App.ReplyAsThreadRoot). Slack never
+// draws a reply as a thread's root: the pane draws its loading state
+// until the Host has moved on. Called once each time the pane opens,
+// mid-layout.
+type ReplyRootRedirector interface {
+	ReplyAsThreadRoot(ch, reply, root string)
+}
+
+// OpenLink is a link's click with its text: Slack's suspicious-link
+// warning first (popups.MaybeWarnLink, unless suppress_link_warning),
+// then OpenURL.
 func (r *richHandler) OpenLink(url, text string) {
 	if ph, ok := r.h.(popups.Host); ok && popups.MaybeWarnLink(ph, text, url) {
 		return
 	}
-	r.OpenURL(url)
+	r.open(url, false)
+}
+
+// OpenMrkdwnLink is a mrkdwn or rich_text link's click (richview's
+// MrkdwnLinkHandler, Slack's BaseMrkdwnLink): OpenLink with
+// openThreadForRootMessage.
+func (r *richHandler) OpenMrkdwnLink(url, text string) {
+	if ph, ok := r.h.(popups.Host); ok && popups.MaybeWarnLink(ph, text, url) {
+		return
+	}
+	r.open(url, true)
+}
+
+// OpenMessageMention is a message_mention pill's click (richview's
+// MessageMentionHandler): MessageMention's jumpToMessage, else the pill's
+// link.
+func (r *richHandler) OpenMessageMention(ch, ts, thread, url string) {
+	if mj, ok := r.h.(MessageJumper); ok && ch != "" && ts != "" {
+		mj.JumpToMessage(ch, ts, thread)
+		return
+	}
+	if url != "" {
+		r.open(url, false)
+	}
 }
 
 // OpenBot is "Added by <app>" under a Block Kit attachment:
@@ -254,6 +410,10 @@ func (r *richHandler) OpenImage(img richtext.Image) {
 	r.h.OpenLightbox(img, *r.m)
 }
 func (r *richHandler) OpenFile(f *richtext.File) {
+	if eo, ok := r.h.(EmailOpener); ok && f.ID != "" && f.Email != nil && r.m != nil && newEmailRendering(r.h) {
+		eo.OpenEmailFile(f, r.m.Channel, r.m.TS)
+		return
+	}
 	if co, ok := r.h.(CanvasOpener); ok && f.ID != "" && core.IsCanvasFile(f.Type, "", f.PrettyType) {
 		co.OpenCanvas(f.ID)
 		return
@@ -274,11 +434,50 @@ func (r *richHandler) OpenFile(f *richtext.File) {
 		r.h.OpenLightbox(img, *r.m)
 		return
 	}
+	if f.IsVideo { // a gallery's video: the media viewer, playing (tE)
+		if vo, ok := r.h.(VideoViewerOpener); ok && vo.OpenVideoViewer(f, *r.m, 0, true) {
+			return
+		}
+	}
 	if f.Permalink != "" {
 		openURL(f.Permalink)
 	} else if f.URL != "" {
 		openURL(f.URL)
 	}
+}
+
+// OpenAudioClipMenu is the audio player's More actions
+// (videoplayer.AudioMenuOpener): AudioClipOverflowMenu under the ⋮.
+func (r *richHandler) OpenAudioClipMenu(f *richtext.File, win, view image.Rectangle, onClose func()) bool {
+	ph, ok := r.h.(popups.Host)
+	if !ok || r.m == nil || f == nil {
+		return false
+	}
+	btn := win
+	if btn.Empty() {
+		btn = view
+		if r.anchor != nil {
+			min := r.anchor(view.Min)
+			btn = image.Rectangle{Min: min, Max: min.Add(view.Size())}
+		}
+	}
+	mn := popups.NewAudioClipMenuClosing(ph, btn, *r.m, f, onClose)
+	if mn == nil {
+		return false
+	}
+	ph.ShowOverlay(mn)
+	return true
+}
+
+// OpenEmailLink is a link in an email's body (richview.EmailLinkHandler):
+// the Host's Open Link confirmation (EmailIframe's openLinkRedirectModal),
+// else the link.
+func (r *richHandler) OpenEmailLink(u string) {
+	if o, ok := r.h.(interface{ OpenEmailLink(string) }); ok {
+		o.OpenEmailLink(u)
+		return
+	}
+	r.OpenURL(u)
 }
 
 // FileSectionMenuOpener is optional on the Host: a message file card's
@@ -361,6 +560,10 @@ func (r *richHandler) FileAction(a richview.FileAction, f *richtext.File, btn im
 			openURL(u)
 		}
 	case richview.FileEditWindow, richview.FileDetails:
+		if eo, ok := r.h.(EmailOpener); ok && a == richview.FileDetails && f.Email != nil && f.ID != "" && newEmailRendering(r.h) {
+			eo.OpenEmailFile(f, m.Channel, m.TS)
+			return
+		}
 		if f.Permalink != "" {
 			openURL(f.Permalink)
 		}
@@ -380,6 +583,12 @@ func (r *richHandler) FileAction(a richview.FileAction, f *richtext.File, btn im
 			r.h.Invalidate()
 		}()
 	case richview.FileMore:
+		if ph != nil && f.IsVideo { // a video player's corner (internal/ui/videoplayer)
+			if mn := popups.NewVideoActionsMenu(ph, btn, *m, f, r.thread); mn != nil {
+				ph.ShowOverlay(mn)
+			}
+			return
+		}
 		if ph != nil {
 			gallery := f.IsImage && f.Thumb != nil
 			if mn := popups.NewFileActionsMenu(ph, btn, *m, f, gallery); mn != nil {
@@ -393,6 +602,37 @@ func (r *richHandler) FileAction(a richview.FileAction, f *richtext.File, btn im
 	case richview.FileShowLess, richview.FileCollapse:
 		if app != nil {
 			app.CollapseFile(m.Channel, m.TS, f.ID)
+		}
+	}
+}
+
+// WorkflowCard is a share_shortcut card (richview.WorkflowCardHandler):
+// the card opens the workflow details view (WorkflowEntity's onClick),
+// Start Workflow trips the link trigger from the message
+// (WorkflowStartButton: workflowsTriggersTrip with the message context),
+// the ⋮ opens More actions.
+func (r *richHandler) WorkflowCard(act string, c *richtext.ShortcutCard, at image.Rectangle) {
+	m := r.m
+	if m == nil || c == nil {
+		return
+	}
+	switch act {
+	case "open":
+		if popups.OpenWorkflowDetails != nil && c.TriggerID != "" {
+			popups.OpenWorkflowDetails(c.TriggerID, m.Channel)
+		}
+	case "start":
+		// BaseWorkflowStartButton is disabled while the trigger runs
+		// (isTriggerRunning): no second trip until the first is answered
+		if c.URL != "" && !blockkit.TripRunning(c.TriggerID) {
+			blockkit.TripWorkflow(r.h, c.URL, core.MessageTripContext(m.Channel, m.TS), "")
+		}
+	case "more":
+		if popups.WorkflowCardMenu != nil {
+			if r.anchor != nil {
+				at = image.Rectangle{Min: r.anchor(at.Min), Max: r.anchor(at.Max)}
+			}
+			popups.WorkflowCardMenu(r.h, at, c, m.Channel, m.TS)
 		}
 	}
 }

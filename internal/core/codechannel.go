@@ -15,6 +15,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/url"
 	"strconv"
 	"strings"
@@ -84,6 +85,7 @@ const (
 	ViewCanvas      = "canvas"
 	ViewBlockKit    = "block_kit"
 	ViewPullRequest = "pull_request"
+	ViewList        = "list" // never a view: getCodeChannelViews drops it
 )
 
 // CodeChannelView is an artifact the agent published: one of
@@ -198,7 +200,8 @@ func ParseCodeChannel(props json.RawMessage) *CodeChannel {
 }
 
 // codeChannelViews is getCodeChannelViews (PntH.B) with session channels
-// on: agent_session_views (pull requests only with prViews and a pr_url),
+// on: agent_session_views (never a list; pull requests only with prViews
+// and a linkable pr_url),
 // agent_views as html, diff_file_id as the Code diff, plan_canvases as
 // canvases; the Code diff first. CodeChannelViews applies the viewer's
 // experiments to the prViews list.
@@ -215,7 +218,7 @@ func codeChannelViews(c map[string]json.RawMessage, prViews bool, canvasTabs map
 	var views []CodeChannelView
 	_ = json.Unmarshal(c["agent_session_views"], &views)
 	for _, v := range views {
-		if v.Type == ViewPullRequest && (!prViews || v.PRURL == "") {
+		if v.Type == ViewList || v.Type == ViewPullRequest && (!prViews || !linkablePRURL(v.PRURL)) {
 			continue
 		}
 		seen[v.ViewID] = true
@@ -476,6 +479,37 @@ func (a *App) StopAgent(ctx context.Context, ch string) error {
 	return a.C.Call(ctx, "agents.sessions.stop", url.Values{"channel": {ch}, "reason": {"stopped-by-user"}}, nil)
 }
 
+// JoinCodeChannel is joinCodeChannel (boot-shared kR8w e0, "Join a code
+// channel from an origin the user can see"), the Join of a private code
+// channel's card in a message: client.codeChannels.join {channel_id,
+// origin_channel_id}, the origin being the channel the agent_channel_unfurl
+// says it may be joined from (joinable_from_channel_id). A channel the
+// viewer is already in asks nothing. The answer's channel, when there is
+// one, goes in the store as it came (upsertChannel) and the sidebar hears
+// of it, so the channel opens on what Slack returned. Each Join is the
+// viewer's own click, sent whatever failed just before (slack.NoBackoff:
+// Slack's "Please try again" does send again).
+func (a *App) JoinCodeChannel(ctx context.Context, ch, origin string) error {
+	if ch == "" || origin == "" {
+		return errors.New(`core: JoinCodeChannel needs the channel and the origin channel`)
+	}
+	if cv, ok := a.Conv(ch); ok && cv.Member {
+		return nil
+	}
+	var res struct {
+		Channel *slack.Conversation `json:"channel"`
+	}
+	if err := a.C.Call(slack.NoBackoff(ctx), "client.codeChannels.join", url.Values{"channel_id": {ch}, "origin_channel_id": {origin}}, &res); err != nil {
+		return err
+	}
+	if c := res.Channel; c != nil && c.ID != "" {
+		a.S.PutConvLocal(*c)
+		v := a.conv(c)
+		a.emit(Event{Type: "conv", Channel: c.ID, Conv: &v})
+	}
+	return nil
+}
+
 // CodeChannelBlockKitView fetches a block_kit view (CodeChannelBlockKitView):
 // client.codeChannels.getBlockKitView {channel_id, view_id}, answering
 // {blocks, service_id, app_id}.
@@ -519,6 +553,8 @@ func (a *App) onChannelUpdated(raw json.RawMessage) []string {
 			ids = []string{id}
 		}
 	}
+	_, unlinked := e.Updates["unlinked"]
+	_, connected := e.Updates["connected_team_ids"]
 	var changed []string
 	for _, id := range ids {
 		cur, ok := a.S.Conv(id)
@@ -528,6 +564,9 @@ func (a *App) onChannelUpdated(raw json.RawMessage) []string {
 				continue // "Received channel_updated on missing channel"
 			}
 			ext = true
+		}
+		if unlinked || connected { // channelUpdated: the list prefs are stale (upload_gates.go)
+			a.listPrefsStale(id)
 		}
 		b, err := json.Marshal(cur)
 		if err != nil {

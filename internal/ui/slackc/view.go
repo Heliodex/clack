@@ -24,10 +24,14 @@ type View struct {
 	learnPending bool // a new tree: learn its original's insets after the next layout (reserve.go)
 	root         uint64
 	overlay      bool
-	sheet        string // text of the tree's <style> elements, installed as "root:<id>"
+	layer        jsLayer // the overlay root as a window layer (LayoutOverlays)
+	sheet        string  // text of the tree's <style> elements, installed as "root:<id>"
 
 	fr   frame
 	name string
+	// ownRoot: the native the tree renders as its root "@" node draws
+	// that element's box itself (ComponentBox), as a Slot.OwnBox does
+	ownRoot bool
 
 	nodes []*Node
 	top   []*box
@@ -35,7 +39,17 @@ type View struct {
 	ns    map[int64]*nodeState
 	main  scope
 	subs  map[any]*scope
-	extra map[*Node]*extraTree
+	// prevSubs holds the sub scopes of the tree setTree replaced, by
+	// their nodes' stable ids (subStable): the new tree's scope for the
+	// same host and nodes takes the old one's place, so its Gio pointer
+	// tag (&scope.ptag) lives on. A press under way keeps its release
+	// then; a new tag got a Cancel instead, and the release went to the
+	// outer scope, which hit-tested an ancestor and clicked that: a JS
+	// re-render between a press and its release (the patched Menu's, a
+	// mousedown's) lost the click on a plugin's menu row
+	// (TestMessageMenuOldMenuRows, alpha.135's release test job).
+	prevSubs map[subStable]*scope
+	extra    map[*Node]*extraTree
 
 	topEl     css.Element
 	topKey    uint64
@@ -58,6 +72,7 @@ type View struct {
 	maxH           int
 	pendingImg     bool
 	frameNo        uint64
+	paintSeq       uint64 // numbers scope paints (scope.paintSeq)
 	layGen         uint32 // generation of the scope being laid out
 	genSeq         uint32
 
@@ -75,6 +90,10 @@ type View struct {
 		t int64
 		n int
 	}
+	// clickDetail is the click (or dblclick) being dispatched's detail: the
+	// mouse click's count, 0 for a keyboard's (Blink's simulated click)
+	clickDetail int
+
 	dragK    int64
 	rangeK   int64
 	chainBuf []*box
@@ -107,6 +126,7 @@ type frame struct {
 // nodeState is a host node's UI state that survives new trees.
 type nodeState struct {
 	k                int64
+	layer            jsLayer // an in-page modal <dialog> as a window layer (painter.fixed)
 	st               css.State
 	scrollX, scrollY float32
 	hover            bool
@@ -165,8 +185,15 @@ type scope struct {
 
 	natives []*box
 	hits    []hitEntry
-	painted []*box
-	bounds  rectF
+	// painted is the boxes the scope painted this frame (flushRects),
+	// reset by its first paint in a frame only: a scope painted again in
+	// the same frame (its host drawn again) paints boxes already listed,
+	// which painter.rect doesn't list twice. paintSeq numbers the paint
+	// (View.paintSeq), so a box painted again takes the later paint's rect
+	painted   []*box
+	paintedFr uint64
+	paintSeq  uint64
+	bounds    rectF
 
 	ptag, ctag, stag int // pointer handler, cursor areas, shields (addresses used)
 
@@ -181,6 +208,18 @@ type scope struct {
 	rectsDirty bool
 	rehover    bool
 	dropdown   dropState
+	// kids marks a scope laying out its host's own children
+	// (Host.Children), or the children a native lays out inside its own
+	// element (ClassDef.LayoutChildren; src is then that element's
+	// style): when CSS makes that box a flex or grid container, its root
+	// is that container (hostContainer).
+	kids bool
+	// place is where the host's native drew this scope, from the host
+	// box's content edge (Host.PlaceChildren): window origins and the
+	// rects JS reads follow it.
+	place f32.Point
+	// rectsAt is the window origin the rects JS has were flushed at
+	rectsAt f32.Point
 }
 
 type scopeKey struct {
@@ -314,6 +353,17 @@ func (v *View) setTree(nodes []*Node) {
 	v.main.boxes = v.top
 	v.main.root.lk = v.top
 	v.main.ok = false
+	v.prevSubs = nil
+	for key, sc := range v.subs {
+		if st, ok := key.(subKey); ok {
+			if id, ok := st.stable(); ok {
+				if v.prevSubs == nil {
+					v.prevSubs = map[subStable]*scope{}
+				}
+				v.prevSubs[id] = sc
+			}
+		}
+	}
 	v.subs = nil
 	v.extra = nil
 	v.svgCSS = nil
@@ -367,6 +417,7 @@ func (v *View) Close() {
 	clear(v.byK)
 	clear(v.ns)
 	v.subs = nil
+	v.prevSubs = nil
 	v.extra = nil
 	v.hover = nil
 	v.main = scope{v: v}
@@ -420,7 +471,7 @@ func (s *scope) windowOrigin() (float32, float32) {
 	}
 	if s.host != nil && s.host.scope != nil && s.host.scope != s {
 		hx, hy := s.host.scope.windowOrigin()
-		return hx + s.host.ax + s.host.bd[3] + s.host.pad[3], hy + s.host.ay + s.host.bd[0] + s.host.pad[0]
+		return hx + s.host.ax + s.host.bd[3] + s.host.pad[3] + s.place.X, hy + s.host.ay + s.host.bd[0] + s.host.pad[0] + s.place.Y
 	}
 	return 0, 0
 }
@@ -484,7 +535,11 @@ func (s *scope) layout() {
 	// native are as wide as their content too: the native places the
 	// tree as one more item (the help button's caller right-aligns it).
 	flexItems := v.topFlex && v.topStyle != nil && (v.topStyle.Display == css.DisplayFlex || v.topStyle.Display == css.DisplayInlineFlex)
-	if s.exact || !flexItems && !s.inlineRoot() && maxW < inf/2 {
+	// A native's own children are its items when CSS makes its box a flex
+	// or grid container (hostContainer); the native places them, so the
+	// container is as wide as they are, like FlexItems' root.
+	hostBox := s.hostContainer()
+	if s.exact || !flexItems && !hostBox && !s.inlineRoot() && maxW < inf/2 {
 		c.fixedW, c.fixW = true, maxW
 	} else {
 		c.shrink = true
@@ -499,6 +554,14 @@ func (s *scope) layout() {
 		root.st.FlexDirection, root.st.FlexWrap = ps.FlexDirection, ps.FlexWrap
 		root.st.JustifyContent, root.st.AlignItems, root.st.AlignContent = ps.JustifyContent, ps.AlignItems, ps.AlignContent
 		root.st.RowGap, root.st.ColGap = ps.RowGap, ps.ColGap
+	} else if ps := &s.src; hostBox {
+		root.st.Display = css.DisplayFlex
+		if isGrid(ps.Display) {
+			root.st.Display = css.DisplayGrid
+		}
+		root.st.FlexDirection, root.st.FlexWrap = ps.FlexDirection, ps.FlexWrap
+		root.st.JustifyContent, root.st.AlignItems, root.st.AlignContent = ps.JustifyContent, ps.AlignItems, ps.AlignContent
+		root.st.RowGap, root.st.ColGap, root.st.GridColumns = ps.RowGap, ps.ColGap, ps.GridColumns
 	}
 	root.lastOK = false
 	v.layout(root, c)
@@ -557,6 +620,22 @@ func flatContents(boxes []*box) []*box {
 	return out
 }
 
+// hostContainer reports a Host.Children scope whose host box CSS makes a
+// flex or grid container, or a ClassDef.LayoutChildren scope whose
+// element is one: in the browser the element lays its children out as
+// its items (Slack's .c-button is inline-flex; OwlMode's Save in Taut is
+// display:flex with gap 6px, an icon and a bare text run; the reaction
+// pill's .c-reaction is inline-flex, its emoji and count 4px apart and
+// centred). buildLayoutKids already wrapped the host's text runs into
+// anonymous items, which a block root would stack.
+func (s *scope) hostContainer() bool {
+	if !s.kids || !s.srcOK {
+		return false
+	}
+	d := s.src.Display
+	return isFlex(d) && s.src.LineClamp == 0 || isGrid(d)
+}
+
 // inlineRoot reports a scope whose in-flow top-level boxes are all
 // inline-level.
 func (s *scope) inlineRoot() bool {
@@ -608,13 +687,21 @@ func (s *scope) measureNative(b *box, cs layout.Constraints) dimsF {
 	g := s.gtx.Disabled()
 	g.Constraints = cs
 	m := op.Record(g.Ops)
-	d := s.callNative(g, b)
+	d := s.measureCall(g, b)
 	m.Stop()
 	df := dimsOf(d)
 	e := &b.natMeas[b.natMeasN%uint8(len(b.natMeas))]
 	b.natMeasN++
 	e.ok, e.ck, e.d = true, k, df
 	return df
+}
+
+// measureCall is callNative inside a measure pass (measuring), which ends
+// even if the native panics.
+func (s *scope) measureCall(g layout.Context, b *box) layout.Dimensions {
+	measuring++
+	defer func() { measuring-- }()
+	return s.callNative(g, b)
 }
 
 func dimsOf(d layout.Dimensions) dimsF {
@@ -689,7 +776,7 @@ func (s *scope) callNative(gtx layout.Context, b *box) layout.Dimensions {
 				return v.fr.native(gtx, nativeProps(b))
 			}
 		case b.hostFn != nil:
-			b.host = Host{Node: b.n, Props: b.n.P, Style: &b.st, view: v, fr: &v.fr}
+			b.host = Host{Node: b.n, Props: b.n.P, Style: &b.st, view: v, fr: &v.fr, set: b.set}
 			return b.hostFn(gtx, &b.host)
 		}
 		return layout.Dimensions{}
@@ -726,7 +813,13 @@ func (s *scope) paint() {
 	gtx := s.gtx
 	p := painter{v: s.v, s: s, gtx: gtx, ops: gtx.Ops, clip: noClip}
 	s.hits = s.hits[:0]
-	s.painted = s.painted[:0]
+	if measuring == 0 {
+		if s.paintedFr != s.v.frameNo {
+			s.painted, s.paintedFr = s.painted[:0], s.v.frameNo
+		}
+		s.v.paintSeq++
+		s.paintSeq = s.v.paintSeq
+	}
 	s.bounds = rectF{}
 	p.filt = s.v.filtBuf[:0]
 	p.paintBox(&s.root, 0, 0)
@@ -791,13 +884,48 @@ type subKey struct {
 	ptr  any
 }
 
+// subStable is a subKey by the stable host-instance ids (Node.K) of its
+// host and first node, which a new tree from JS keeps for the same
+// elements (React's reconciliation) while its boxes and nodes are new.
+type subStable struct {
+	host, first int64
+	kind        uint8
+}
+
+func (k subKey) stable() (subStable, bool) {
+	id := subStable{kind: k.kind}
+	if k.b != nil {
+		id.host = k.b.k()
+	}
+	if n, ok := k.ptr.(*Node); ok && n != nil {
+		id.first = n.K
+	}
+	switch k.kind {
+	case 1: // a host's own children: the host's id
+		return id, id.host != 0
+	case 2: // nodes a native lays out: those nodes' id
+		return id, id.first != 0
+	}
+	return id, false // text: nothing to click, keyed by its content
+}
+
 func (v *View) sub(key subKey, host *box, st *css.Style) *scope {
 	if v.subs == nil {
 		v.subs = map[any]*scope{}
 	}
 	s := v.subs[key]
 	if s == nil {
-		s = &scope{v: v, host: host}
+		if id, ok := key.stable(); ok && v.prevSubs[id] != nil {
+			// the replaced tree's scope for these elements, as new but
+			// at its address: its pointer tag stays the handler Gio
+			// routes the pointer's press, drag and release to
+			s = v.prevSubs[id]
+			delete(v.prevSubs, id)
+			*s = scope{}
+		} else {
+			s = &scope{}
+		}
+		s.v, s.host = v, host
 		s.root.kind = kAnon
 		s.root.v = v
 		v.subs[key] = s
@@ -817,7 +945,8 @@ func sameStyleShallow(a, b *css.Style) bool {
 		a.LineHeight == b.LineHeight && a.WhiteSpace == b.WhiteSpace && a.TextAlign == b.TextAlign &&
 		a.FontFamily == b.FontFamily && a.LetterSpacing == b.LetterSpacing && a.Display == b.Display &&
 		a.FlexDirection == b.FlexDirection && a.AlignItems == b.AlignItems && a.JustifyContent == b.JustifyContent &&
-		a.ColGap == b.ColGap && a.RowGap == b.RowGap && a.TextTransform == b.TextTransform && a.Cursor == b.Cursor
+		a.ColGap == b.ColGap && a.RowGap == b.RowGap && a.TextTransform == b.TextTransform && a.Cursor == b.Cursor &&
+		a.FlexWrap == b.FlexWrap && a.AlignContent == b.AlignContent && a.GridColumns == b.GridColumns && a.LineClamp == b.LineClamp
 }
 
 func (v *View) runSub(gtx layout.Context, s *scope, host *box) layout.Dimensions {
@@ -837,6 +966,7 @@ func (v *View) layoutKids(gtx layout.Context, fr *frame, n *Node, st *css.Style)
 		return layout.Dimensions{}
 	}
 	s := v.sub(subKey{b: b, kind: 1}, b, st)
+	s.kids = true
 	if s.boxes == nil || len(s.boxes) != len(b.lk) || len(b.lk) > 0 && &s.boxes[0] != &b.lk[0] {
 		s.boxes = b.lk
 		s.root.lk = b.lk
@@ -846,6 +976,13 @@ func (v *View) layoutKids(gtx layout.Context, fr *frame, n *Node, st *css.Style)
 }
 
 func (v *View) layoutNodes(gtx layout.Context, fr *frame, nodes []*Node, parent *Node, st *css.Style) layout.Dimensions {
+	return v.layoutNodesIn(gtx, fr, nodes, parent, st, false)
+}
+
+// layoutNodesIn is layoutNodes; kids: the nodes are the children of a
+// native's own element whose style is st (ClassDef.LayoutChildren), a
+// flex container's flex items (hostContainer).
+func (v *View) layoutNodesIn(gtx layout.Context, fr *frame, nodes []*Node, parent *Node, st *css.Style, kids bool) layout.Dimensions {
 	if len(nodes) == 0 {
 		return layout.Dimensions{}
 	}
@@ -887,6 +1024,9 @@ func (v *View) layoutNodes(gtx layout.Context, fr *frame, nodes []*Node, parent 
 		s.boxes = x.boxes
 		s.root.lk = x.boxes
 		s.ok = false
+	}
+	if s.kids != kids {
+		s.kids, s.ok = kids, false
 	}
 	if up != nil {
 		// The stack already ends in the native's own elements; pushing
@@ -932,13 +1072,26 @@ func (v *View) layoutText(gtx layout.Context, fr *frame, txt string, st *css.Sty
 
 var pendingRects map[int64][4]float32
 
+// measuring counts the native measure passes in progress (measureNative;
+// UI goroutine): what they lay out and paint is discarded, so the scopes
+// they run (a host's children) leave the boxes' rects, and the rects JS
+// has, as the frame's draw put them.
+var measuring int
+
 func (s *scope) flushRects() {
-	if !s.rectsDirty || bridge() == nil {
+	if bridge() == nil || measuring > 0 {
+		return
+	}
+	// A sub scope's origin follows its host, painted after the native
+	// that runs the scope: when only the host moved (its first frame, a
+	// placement after the measures), its boxes' rects move too.
+	ox, oy := s.windowOrigin()
+	if !s.rectsDirty && ox == s.rectsAt.X && oy == s.rectsAt.Y {
 		return
 	}
 	s.rectsDirty = false
+	s.rectsAt = f32.Pt(ox, oy)
 	v := s.v
-	ox, oy := s.windowOrigin()
 	for _, b := range s.painted {
 		k := b.k()
 		if k == 0 || b.rectFr != v.frameNo {

@@ -27,6 +27,8 @@ import (
 
 	"github.com/some-du6e/clack/internal/i18n"
 	"github.com/some-du6e/clack/internal/taut"
+	"github.com/some-du6e/clack/internal/ui/popups"
+	"github.com/some-du6e/clack/internal/ui/slackc"
 	"github.com/some-du6e/clack/internal/ui/theme"
 	"github.com/some-du6e/clack/internal/ui/uipref"
 )
@@ -236,7 +238,13 @@ var (
 // the ui root) over p where it changes Slack's --dt_color-theme-* tokens:
 // theme-base-pry (the selected tab's underline), theme-base-imp and
 // theme-content-imp (unread dots and count badges). With Slack's default
-// theme p is returned as is.
+// theme p is returned as is. The cascade is per variable: a stylesheet
+// that declares a token itself keeps it (Slick's :root declarations beat
+// the Theme component's stylesheet in Slack), and only that token. One
+// declaring only theme-base-imp keeps the account's theme-content-imp;
+// one that overrides only a ramp (Slick's AMOLED: the aubergine stops)
+// reaches none of the account's tokens, which its Theme stylesheet
+// spells on its own ramp (theme.Declares, as peekPalOf).
 func accountPal(th *theme.Theme, p *pal) *pal {
 	if th == nil {
 		return p
@@ -246,22 +254,23 @@ func accountPal(th *theme.Theme, p *pal) *pal {
 		def = theme.DarkPalette
 	}
 	tab := th.C.Accent != def.Accent
-	imp := th.C.ThemeImp.A != 0
-	if !tab && !imp {
+	imp, impText := th.C.ThemeImp.A != 0, th.C.ThemeImpText.A != 0
+	if !tab && !imp && !impText {
 		return p
 	}
 	acctMu.Lock()
 	defer acctMu.Unlock()
 	if acctTh != th || acctGen != th.Gen || acctIn != p {
+		declares := func(name string) bool { return theme.Declares(th.Tokens, name) }
 		o := *p
-		if tab {
+		if tab && !declares("--dt_color-theme-base-pry") {
 			o.TabLine = th.C.Accent
 		}
-		if imp {
+		if imp && !declares("--dt_color-theme-base-imp") {
 			o.Accent, o.Badge = th.C.ThemeImp, th.C.ThemeImp
-			if th.C.ThemeImpText.A != 0 {
-				o.AccentText = th.C.ThemeImpText
-			}
+		}
+		if impText && !declares("--dt_color-theme-content-imp") {
+			o.AccentText = th.C.ThemeImpText
 		}
 		acctTh, acctGen, acctIn, acctOut = th, th.Gen, p, o
 	}
@@ -316,6 +325,16 @@ type base struct {
 	th   *theme.Theme
 	p    *pal
 	rich richCache
+	// press is the last context press on a message body (content_menu.go)
+	press bodyPress
+	// mediaPane names the view's video players (media.go): set, its
+	// messages' lone videos play in place, as in Slack's Threads, Unreads
+	// and Later views
+	mediaPane string
+	media     map[string]*viewMedia
+	// bkView is this view's drawing of its messages' elements
+	// (blockkit.InView, elements.go)
+	bkView uint64
 	// tt is the Host's Taut plugin system (nil without plugins); tgen/tmemo
 	// cache its patched member/channel/message views for one frame.
 	tt    *taut.Taut
@@ -323,11 +342,38 @@ type base struct {
 	tmemo map[string]*memoEntry
 	// addBtns are the messages' add-reaction buttons (reactions_slack.go)
 	addBtns map[string]*widget.Clickable
+	// addTips are their "Add reaction…" tooltips (ReactionAddButton's)
+	addTips map[string]*popups.TipState
+	// pillTips are the reaction pills' ReactionTips (reactions_slack.go)
+	pillTips map[string]*pillTip
 	// pv caches Activity's preview documents (activity_rows.go)
 	pv map[string]pvEntry
+	// vers caches msgVer per message copy (msgVerOf); vsrc is the
+	// revision each message's patched view was last read for (viewMsg)
+	vers map[string]verMemo
+	vsrc map[string]viewRev
+	// vneed is the EmitSeq core had emitted when viewMsg first saw a
+	// message's current revision (JS's copy counts as that revision's once
+	// the mirror handled it); vready the revision of the message's last
+	// ready read (JS answered for it: its view stands through the marks
+	// that follow, a reaction, a reply count, a sweep); vdiff whether that
+	// view draws other than core's copy (viewDraws), worked out once per
+	// conversion (vconv): a plugin that rewrites the message keeps its view
+	// while JS answers for an edit
+	vneed  map[string]uint64
+	vready map[string]viewRev
+	vconv  map[string]uint64
+	vdiff  map[string]bool
+	// vheld is when viewMsg first saw a message's current revision: a hold
+	// of the revision before's view lasts taut.EditHold from it, the frame
+	// at its end asked for once (vwake)
+	vheld map[string]time.Time
+	vwake map[string]bool
 	// rec, while a row is described (recording), notes the members it
-	// drew without a name (missing_member.go)
-	rec *[]string
+	// drew without a name (missing_member.go); reads (recordingReads)
+	// every member it looked up
+	rec   *[]string
+	reads *[]string
 }
 
 func newBase(h Host) base { return base{h: h, rich: richCache{}} }
@@ -544,6 +590,9 @@ type tabs struct {
 	// Labels keep the English sources (Slack's keys); a view's own data
 	// (a custom view's name) passes through unchanged.
 	Tr func(i int, s string) string
+	// Hidden, when set, leaves tab i out of the strip (Directories' tabs
+	// a guest doesn't get); its index keeps its meaning.
+	Hidden func(i int) bool
 }
 
 // label is tab i's text as drawn.
@@ -557,6 +606,32 @@ func (t *tabs) label(i int) string {
 // trIn is a tabs.Tr for labels that are all Slack strings of ns.
 func trIn(ns i18n.NS) func(int, string) string {
 	return func(_ int, s string) string { return ns.T(s) }
+}
+
+// A tab strip's elements as the inspect tool sees them (slackc
+// ClassDef.Inspect: recorded for the picker alone, nothing draws
+// differently): Slack Kit's Tabs, a tablist of c-tabs__tab buttons
+// (--active for the selected one) with their titles.
+var (
+	insTabMenu  = slackc.Class("c-tabs__tab_menu", "role", "tablist")
+	insTab      = slackc.Class("c-button-unstyled c-tabs__tab", "role", "tab").Tag("button").Mods("c-tabs__tab--active")
+	insTabLabel = slackc.Class("c-tabs__tab_content").Tag("span")
+)
+
+// insMod is mods bit 0 when on.
+func insMod(on bool) uint64 {
+	if on {
+		return 1
+	}
+	return 0
+}
+
+// insLabel is l, the title of a tab, marked for the inspect tool.
+func insLabel(gtx C, l layout.Widget) D {
+	mk := insTabLabel.Inspect(0)
+	d := l(gtx)
+	mk.End(gtx, d.Size)
+	return d
 }
 
 func newTabs(labels ...string) *tabs {
@@ -584,6 +659,7 @@ func (b *base) tabStrip(gtx C, t *tabs, badges []int) D {
 }
 
 func (b *base) tabStripIcons(gtx C, t *tabs, icons []string, badges []int) D {
+	strip := insTabMenu.Inspect(0)
 	ch := make([]layout.FlexChild, 0, len(t.Labels))
 	for i := range t.Labels {
 		i := i
@@ -591,6 +667,7 @@ func (b *base) tabStripIcons(gtx C, t *tabs, icons []string, badges []int) D {
 			return t.clicks[i].Layout(gtx, func(gtx C) D {
 				pointerCursor(gtx)
 				sel := i == t.Sel
+				mk := insTab.Inspect(insMod(sel))
 				fg := b.p.Sec
 				if sel {
 					fg = b.p.Text
@@ -604,7 +681,9 @@ func (b *base) tabStripIcons(gtx C, t *tabs, icons []string, badges []int) D {
 							}
 							return layout.Inset{Right: 4}.Layout(gtx, func(gtx C) D { return b.icon(gtx, icons[i], 16, fg) })
 						}),
-						layout.Rigid(func(gtx C) D { return b.label(gtx, 13, wBold, fg, t.label(i)) }),
+						layout.Rigid(func(gtx C) D {
+							return insLabel(gtx, func(gtx C) D { return b.label(gtx, 13, wBold, fg, t.label(i)) })
+						}),
 						layout.Rigid(func(gtx C) D {
 							if i >= len(badges) || badges[i] <= 0 {
 								return D{}
@@ -624,11 +703,14 @@ func (b *base) tabStripIcons(gtx C, t *tabs, icons []string, badges []int) D {
 					h := gtx.Dp(2)
 					fill(gtx, image.Rect(0, d.Size.Y-h, d.Size.X, d.Size.Y), b.p.TabLine)
 				}
+				mk.End(gtx, d.Size)
 				return d
 			})
 		}))
 	}
-	return row(gtx, layout.End, ch...)
+	d := row(gtx, layout.End, ch...)
+	strip.End(gtx, d.Size)
+	return d
 }
 
 // pills is a row of filter chips (Files type filters, Directories filters).
@@ -852,6 +934,9 @@ func (b *base) emojiImg(gtx C, url string, size unit.Dp) D {
 	s := gtx.Dp(size)
 	if url != "" && b.h.Images() != nil {
 		if img, ok := b.h.Images().Get(url, s); ok {
+			if emojiDrawn != nil {
+				emojiDrawn(url, s)
+			}
 			return theme.Image(gtx, img, image.Pt(s, s), 0)
 		}
 	}
@@ -1151,6 +1236,14 @@ type async[T any] struct {
 // load starts f (cancelling any in-flight run). keep retains the previous
 // value while loading (pagination, refresh).
 func (a *async[T]) load(h Host, keep bool, f func(ctx context.Context) (T, error)) {
+	a.loadMerge(h, keep, f, nil)
+}
+
+// loadMerge is load with f's answer joined to the value held when it
+// lands (merge runs under the lock, given that value and the answer)
+// instead of replacing it: what mutate changed while f ran reaches the
+// merge. A failed f keeps load's rules.
+func (a *async[T]) loadMerge(h Host, keep bool, f func(ctx context.Context) (T, error), merge func(cur, got T) T) {
 	a.mu.Lock()
 	if a.cancel != nil {
 		a.cancel()
@@ -1171,7 +1264,9 @@ func (a *async[T]) load(h Host, keep bool, f func(ctx context.Context) (T, error
 		a.mu.Lock()
 		if gen == a.gen {
 			a.loading = false
-			if err == nil || !keep {
+			if err == nil && merge != nil {
+				a.val = merge(a.val, v)
+			} else if err == nil || !keep {
 				a.val = v
 			}
 			a.err = err
@@ -1216,6 +1311,7 @@ type debounce struct {
 	at   time.Time
 	q    string
 	sent string
+	wk   *wake // dueVia's repaint
 }
 
 func (d *debounce) set(q string, now time.Time) { d.q, d.at = q, now }
@@ -1233,6 +1329,73 @@ func (d *debounce) due(gtx C, wait time.Duration) (string, bool) {
 	}
 	d.sent = d.q
 	return d.q, true
+}
+
+// dueVia is due with its repaint asked of the host (wake) rather than
+// an op.InvalidateCmd executed mid-layout.
+func (d *debounce) dueVia(h Host, gtx C, wait time.Duration) (string, bool) {
+	if d.q == d.sent {
+		return "", false
+	}
+	if left := wait - gtx.Now.Sub(d.at); left > 0 {
+		if d.wk == nil {
+			d.wk = &wake{}
+		}
+		d.wk.schedule(h, gtx.Now, d.at.Add(wait))
+		return "", false
+	}
+	d.sent = d.q
+	return d.q, true
+}
+
+// wake asks the host for a frame at a time: time.AfterFunc and
+// Host.Invalidate, once per time. An op.InvalidateCmd executed in the
+// middle of layout takes the router's immediate path and replays the
+// input no later handler has read yet, which loses clicks on whatever
+// lays out after the caller (overlay scrims, the secondary pane; the
+// composer's 11-17 bug).
+type wake struct {
+	mu      sync.Mutex
+	at      time.Time
+	pending bool
+}
+
+// schedule asks for a frame at at (now on the frame's clock): at once
+// when it's due, else one timer per time.
+func (w *wake) schedule(h Host, now, at time.Time) {
+	if !at.After(now) {
+		h.Invalidate()
+		return
+	}
+	w.mu.Lock()
+	if w.pending && w.at.Equal(at) {
+		w.mu.Unlock()
+		return
+	}
+	w.at, w.pending = at, true
+	w.mu.Unlock()
+	time.AfterFunc(at.Sub(now), func() {
+		w.mu.Lock()
+		if w.at.Equal(at) {
+			w.pending = false
+		}
+		w.mu.Unlock()
+		h.Invalidate()
+	})
+}
+
+// due reports the time a frame was asked for and whether its timer is
+// still out (tests).
+func (w *wake) due() (time.Time, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.at, w.pending
+}
+
+// tipWake is a TipState's Wake through w: the hover delay's repaint
+// asked of the host.
+func tipWake(h Host, w *wake) func(now, at time.Time) {
+	return func(now, at time.Time) { w.schedule(h, now, at) }
 }
 
 // ---- time ----

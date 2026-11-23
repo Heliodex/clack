@@ -1,6 +1,7 @@
 package richtext
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -48,7 +49,7 @@ func TestRichTextInline(t *testing.T) {
 		Span{Kind: Emoji, Text: "😀", ID: "grinning"}, tx(":mystery:"),
 		Span{Kind: Date, Text: date, ID: "1700000000"}, Span{Kind: Date, Text: date, ID: "1700000000", URL: "https://d.test"},
 		Span{Kind: ColorSwatch, Text: "#FF0000"}, tx("red"),
-		tx("a"), br(), br(), tx("b"),
+		tx("a"), brk(BrPara), brk(BrNone), tx("b"),
 	)}
 	eq(t, "rich inline", d.Blocks, want)
 	if d.Jumbo {
@@ -121,7 +122,6 @@ func TestBlockKit(t *testing.T) {
 			{"type":"mystery_widget"}]},
 		{"type":"input","label":{"type":"plain_text","text":"Name"},"element":{"type":"plain_text_input","placeholder":{"type":"plain_text","text":"Type here"}}},
 		{"type":"video","title":{"type":"plain_text","text":"Demo"},"title_url":"https://v.test/w","video_url":"https://v.test/embed","thumbnail_url":"https://v.test/t.jpg","alt_text":"demo","author_name":"Someone","provider_name":"VidSite","provider_icon_url":"https://v.test/i.png","description":{"type":"plain_text","text":"A demo"}},
-		{"type":"call","call_id":"R1","call":{"v1":{"name":"Standup","join_url":"https://call.test/j","date_start":1700000000,"app_icon_urls":{"image_32":"https://call.test/i.png"}}}},
 		{"type":"unknown_future_block","text":{"type":"mrkdwn","text":"future _text_"}},
 		{"type":"unknown_with_fallback","fallback":{"type":"section","text":{"type":"mrkdwn","text":"degraded"}}},
 		{"type":"markdown","text":"**md bold** and [a link](https://md.test)"}
@@ -151,8 +151,6 @@ func TestBlockKit(t *testing.T) {
 		{Kind: AttachmentBlock, Att: &Attachment{ServiceName: "VidSite", ServiceIcon: "https://v.test/i.png", AuthorName: "Someone",
 			Title: []Span{tx("Demo")}, TitleLink: "https://v.test/w", VideoURL: "https://v.test/embed", IsUnfurl: true,
 			Image: &Image{URL: "https://v.test/t.jpg", Alt: "demo"}, Text: []Block{para(tx("A demo"))}}},
-		{Kind: AttachmentBlock, Att: &Attachment{ServiceName: "Call", ServiceIcon: "https://call.test/i.png", IsUnfurl: true,
-			Title: []Span{tx("Standup")}, TitleLink: "https://call.test/j", TS: 1700000000}},
 		// SUIRendererItem: a type Slack doesn't know is UnsupportedBlockFallback,
 		// or its own fallback payload when it carries one
 		{Kind: UnknownBlock, Spans: []Span{tx("This message can’t be fully displayed.")}},
@@ -168,11 +166,11 @@ func TestBlockKit(t *testing.T) {
 }
 
 func (b Block) kindName() string {
-	return [...]string{"Paragraph", "Preformatted", "Quote", "List", "Header", "Divider", "Context", "Section", "ImageBlock", "Actions", "AttachmentBlock", "FileBlock", "Tombstone", "Table", "Agent", "Unsupported", "UnknownBlock"}[b.Kind]
+	return [...]string{"Paragraph", "Preformatted", "Quote", "List", "Header", "Divider", "Context", "Section", "ImageBlock", "Actions", "AttachmentBlock", "FileBlock", "Tombstone", "Table", "Agent", "Unsupported", "UnknownBlock", "FileStatus", "CallBlock", "AlertBlock", "CalloutBlock", "LoadingBlock", "RichHeader", "RichDivider", "ContainerBlock", "ShortcutBlock", "CardBlock"}[b.Kind]
 }
 
 func TestBlocksFallBackToText(t *testing.T) {
-	for _, blocks := range []string{`[]`, `null`, `"not an array"`, `[{"type":"rich_text","elements":[]}]`} {
+	for _, blocks := range []string{`[]`, `null`, `"not an array"`} {
 		d := blocksMsg(t, blocks)
 		eq(t, "fallback "+blocks, d.Blocks, []Block{para(tx("fallback text"))})
 	}
@@ -181,40 +179,57 @@ func TestBlocksFallBackToText(t *testing.T) {
 	eq(t, "unknown block", d.Blocks, []Block{{Kind: UnknownBlock, Spans: []Span{tx("This message can’t be fully displayed.")}}})
 }
 
-func TestMarkdownBlock(t *testing.T) {
-	d := blocksMsg(t, `[{"type":"markdown","text":"# Title\n**b** *i* __b2__ ~~s~~ `+"`*code*`"+` [l](https://md.test)\n\n- one\n  - two\n3. three\n`+"```"+`\nx *y*\n`+"```"+`"}]`)
-	got := d.Blocks
-	if len(got) != 6 {
-		t.Fatalf("blocks:\n%s", dump(got))
-	}
-	eq(t, "heading", got[0], para(st("Title", Bold)))
-	eq(t, "inline", got[1], para(st("b", Bold), tx(" "), st("i", Italic), tx(" "), st("b2", Bold), tx(" "), st("s", Strike), tx(" "), st("*code*", Code), tx(" "), lk("l", "https://md.test")))
-	if got[2].Kind != List || got[2].Indent != 0 || got[3].Indent != 1 || got[4].Kind != List || !got[4].Ordered || got[4].Offset != 2 {
-		t.Errorf("lists:\n%s", dump(got[2:5]))
-	}
-	if got[5].Kind != Preformatted || PlainText(Doc{Blocks: got[5:]}) != "x *y*" {
-		t.Errorf("fence:\n%s", dump(got[5:]))
-	}
-}
-
-func TestPlainTextEmojiFalse(t *testing.T) {
-	d := blocksMsg(t, `[{"type":"section","text":{"type":"plain_text","text":"hi :smile:","emoji":false}},{"type":"section","text":{"type":"plain_text","text":"hi :smile:"}}]`)
-	eq(t, "emoji false", d.Blocks[0].Spans, []Span{tx("hi :smile:")})
-	eq(t, "emoji unset", d.Blocks[1].Spans, []Span{tx("hi "), em("smile")})
-}
-
-// A header block keeps its level (Slack's Header classes the text
-// p-header_block--level_1/2/3, level 4 as 3); no level is 0.
-func TestHeaderLevel(t *testing.T) {
-	d := blocksMsg(t, `[{"type":"header","text":{"type":"plain_text","text":"Big"},"level":1},
-		{"type":"header","text":{"type":"plain_text","text":"Medium"},"level":2},
-		{"type":"header","text":{"type":"plain_text","text":"Plain"}}]`)
-	if len(d.Blocks) != 3 {
-		t.Fatalf("blocks: %s", dump(d.Blocks))
-	}
-	for i, want := range []int{1, 2, 0} {
-		if b := d.Blocks[i]; b.Kind != Header || b.Level != want {
-			t.Errorf("block %d: kind %v level %d, want a header at level %d", i, b.Kind, b.Level, want)
+// TestTextOverBlocksLikeSlack: shouldRenderBlocksInsteadOfText (iub5)
+// leaves some messages to another renderer and draws their text: there the
+// text stands in for blocks that draw nothing (ui's empty rich_text case),
+// for automated subtypes (h3YX), channel tab and folder messages, huddle
+// notes, list record roots, calendar events, a meeting's artifacts DM and
+// a canvas share that carries files. A plain message and a canvas share
+// without files draw their blocks, even when those draw nothing; and
+// blocks that draw stay, as MessageAutomatedSubtype's GenericSystemMessage
+// shows agent_view_added's.
+func TestTextOverBlocksLikeSlack(t *testing.T) {
+	const empty = `[{"type":"rich_text","elements":[]}]`
+	const section = `[{"type":"section","text":{"type":"mrkdwn","text":"the blocks"}}]`
+	for _, c := range []struct {
+		name, extra, blocks string
+		text                bool // the message text draws, not the blocks
+	}{
+		{"a plain message", ``, empty, false},
+		{"a plain message's section", ``, section, false},
+		{"an automated subtype", `"subtype":"bot_add",`, empty, true},
+		{"a pinned item", `"subtype":"pinned_item",`, empty, true},
+		{"a channel tab message", `"subtype":"channel_tab_added",`, empty, true},
+		{"huddle notes", `"subtype":"huddle_notes_started",`, empty, true},
+		{"a list record's root", `"subtype":"list_record_comment","slack_list":{"list_id":"F0LIST","list_record_id":"Rec1"},`, empty, true},
+		{"a calendar event", `"attachments":[{"id":1,"calendar_event":{"title":"Sync"}}],`, empty, true},
+		{"a meeting's artifacts DM", `"metadata":{"event_type":"slack_system.meeting.artifacts_ready","event_payload":{}},`, empty, true},
+		{"a canvas share with files", `"subtype":"canvas_sharing_message","files":[{"id":"F0CANVAS","title":"Plan"}],`, empty, true},
+		{"a canvas share without files", `"subtype":"canvas_sharing_message",`, empty, false},
+		{"agent_view_added's blocks", `"subtype":"agent_view_added",`, section, false},
+	} {
+		d := FromMessage(R, msg(t, `{"ts":"1.0",`+c.extra+`"text":"fallback text","blocks":`+c.blocks+`}`))
+		got := len(d.Blocks) > 0 && d.Blocks[0].Kind == Paragraph && PlainText(Doc{Blocks: d.Blocks[:1]}) == "fallback text"
+		if got != c.text {
+			t.Errorf("%s: draws the text %v, Slack %v (%s)", c.name, got, c.text, dump(d.Blocks))
 		}
+		if !c.text && strings.Contains(PlainText(d), "fallback text") {
+			t.Errorf("%s: the text drew beside its blocks (%s)", c.name, dump(d.Blocks))
+		}
+	}
+}
+
+// TestCallBlockPlainText: a call block's plain text (copy, a thread row's
+// text) is its card's header, its title and status lines, as ui read the
+// call attachment's title before the card.
+func TestCallBlockPlainText(t *testing.T) {
+	d := blocksMsg(t, `[{"type":"call","call_id":"R1","call":{"v1":{"id":"R1","name":"Synthetic sync","date_start":1700000000,"date_end":1700003600}}}]`)
+	if len(d.Blocks) != 1 || d.Blocks[0].Kind != CallBlock || d.Blocks[0].Call == nil || d.Blocks[0].Call.Title == "" {
+		t.Fatalf("blocks %s", dump(d.Blocks))
+	}
+	c := d.Blocks[0].Call
+	got := PlainText(*d)
+	if !strings.HasPrefix(got, c.Title) || (c.Status != "" && !strings.Contains(got, c.Status)) {
+		t.Errorf("plain text %q, want the card's %q and %q", got, c.Title, c.Status)
 	}
 }

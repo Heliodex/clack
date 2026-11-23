@@ -181,7 +181,7 @@ Shared Slack shapes used below:
 #### ThreadSenderAndTimestampGeneric
 - **ShowSendingBot** P/ShowSendingBot.tsx:424-431. Reads `msg`. Context wrap (ThreadSenderContext).
 - **UserPronouns** P/UserPronouns.tsx:107-124. Reads `msg, adjacent, visible, omitTimestamp, omitLinebreak`. Unless `adjacent`, `visible===false` or the sender isn't a person, it renders `<><Original {...props} omitLinebreak/><Pronouns bulleted={!omitTimestamp}/>{props.omitLinebreak ? null : <br/>}</>`.
-- **Clack**: messages/row.go:`(*row).nameLine` as drawn in the ThreadView, and views/threads.go:`(*Threads).msg`, owned by **msgs/views**.
+- **Clack**: messages/row.go:`(*row).nameLine` as drawn in the ThreadView, and views/threads.go:`(*Threads).msg`, owned by **msgs/views**. Slack's (client-boot-shared 7aPN) is a fragment of MessageSender, `"\xa0\xa0"`, MeetingChannelRootTimeBadge, the Timestamp and, unless `omitLinebreak`, a `<br>`; `(*row).layoutThreadSender` takes the whole line only with that `<br>`, and under `omitLinebreak` is as wide as what it drew, so the plugin's pronouns stay on the sender's line.
 
 #### ThreadRootGeneric
 - **ShowRealUser** (same loop as MessageWrapper, P/ShowRealUser.tsx:185-201). Overrides `msg` with the fixed message.
@@ -796,7 +796,7 @@ return slackc.Render(gtx, "BaseAvatarStack", props, func(gtx layout.Context, p s
 // Props that are costly to build: built only when patched.
 return slackc.RenderLazy(gtx, "MessageBlocks", func() slackc.Props { return r.blocksProps() }, r.layoutBlocks)
 ```
-- **Props are Slack-shaped.** Use the names and shapes in §1 and in the live table (`message`/`msg` with Slack's message fields `ts`, `user`, `bot_id`, `subtype`, `blocks`, `reactions`, …, plus `channelId`, `memberId`, `userId`). Build them only inside the props func. Use `$key` (the message ts, the channel id) for list items so plugin hook state survives prop changes.
+- **Props are Slack-shaped.** Use the names and shapes in §1 and in the live table (`message`/`msg` with Slack's message fields `ts`, `user`, `bot_id`, `subtype`, `blocks`, `reactions`, …, plus `channelId`, `memberId`, `userId`). Build them only inside the props func. Use `$key` (the message ts, the channel id) for list items so plugin hook state survives prop changes. Activity's `ActivityThread` also carries `$rev`, a Clack-only number (not one of Slack's props) that is new with each `messageTs` the row sends: a tree that hands back another `$rev` was rendered from earlier props (JS hasn't drawn the new reply yet), so its count and sender aren't taken, unless it projected away from the message sent with that `$rev` (BetterBlock hiding a blocked person's reply), which stays until JS draws the new one. slackc has no channel to tell a tree's render apart besides the props (`$key` is dropped before JS, `$rev` isn't), so a plugin that spreads `{...props}` passes it on, and one that lists props sees it.
 - **The native's `p` is nil when unpatched.** Under a patch it is what the plugin passed to `<Original {...props}>`. Honour the overrides plugins make (§1, "overrides"): read them with `p.StrOr`, `p.Bool`, `p.Map`, `p.List`, and fall back to your own state when a key is missing.
 - **Children.** When Slack's component takes children, hand your sub-parts to JS as slots, so plugins can find and reorder them (UserPronouns, WhoReacted):
   ```go
@@ -965,9 +965,11 @@ From the `slick` workflow's acceptance run over Slick @ f52d55d (53 plugins, bui
 | LocalTimeRow | LocalTime | pop |
 | MemberProfileBaseEntity | LocalTime | pop |
 | MemberSlug | MentionProfiles | msgs |
+| MAMenu | BetterMessageMenu, ChatTabs before #473 (by a filter on its source); Slick's own for `api.menu.addMessageActions` | pop |
 | Menu | AccountSwitcher, MessageLogger | pop |
 | Message | BetterBlock | msgs |
 | MessageActionsMenu | MessageLogger | pop |
+| OrganizeMessageActionsSubmenu | BetterMessageMenu (a context its submenu's MAMenu reads). Clack draws an open Organize submenu through it and the submenu's own MAMenu, nested in the root MAMenu's tree, as Slack's renderSubmenu does; ConnectToAppsMessageActionsSubmenu the same way | pop |
 | MessageAttachmentYouTube | DeArrow | msgs |
 | MessageFile | BetterBlock, MessageLogger | msgs |
 | MessageFiles | BetterBlock, MessageLogger | msgs |
@@ -990,7 +992,7 @@ From the `slick` workflow's acceptance run over Slick @ f52d55d (53 plugins, bui
 
 Filter-only or source-matched patches: ShowSendingBot (memo whose source has `c-message_kit__gutter__left`, i.e. MessageKitGutter), CharacterCounter (`{filter: isTextyInput}`), BetterGifs (`{filter: isGifPicker}`), NoUpsell (`{filter}` over every known name), ChannelListTyping (`{displayName: 'Channel', filter: isSidebarChannel}`, the sidebar row).
 
-Thunks Slick plugins patch or dispatch beyond the PLUGINS-taut.md table: `currentUserEndedTyping` (SilentTyping), `openEditProfileModal` (Nicknames), `startHuddle` (BetterHuddles), `showSavedItemNotification`, `autocompleteMembers`, `getMemberContextMenuTemplate` (already listed), `handleDeepLink` (`{uri}`, ChatTabs, InstalledApps; default native: `UIHooks.DeepLink`). They are in `taut.ThunkCatalogue` and route through `taut.Dispatch` like the others; the UI dispatches them where Slack would. New slice: `reactions` (BetterBlock filters it), `_rxn_key` → the message's `reactions`, in PLUGINS-state.md.
+Thunks Slick plugins patch or dispatch beyond the PLUGINS-taut.md table: `currentUserEndedTyping` (SilentTyping), `openEditProfileModal` (Nicknames), `startHuddle` (BetterHuddles), `showSavedItemNotification`, `autocompleteMembers`, `getMemberContextMenuTemplate` (already listed), `handleDeepLink` (`{uri}`, ChatTabs, InstalledApps; default native: `UIHooks.DeepLink`), `navigate` (ChatTabs' "Thread only" tabs; default native: the view's deep link, PLUGINS-taut.md). A thunk Clack doesn't define rejects at once (Slick's `dispatchThunk` would wait 30 s for a chunk to bring it, and none will). They are in `taut.ThunkCatalogue` and route through `taut.Dispatch` like the others; the UI dispatches them where Slack would. New slice: `reactions` (BetterBlock filters it), `_rxn_key` → the message's `reactions`, in PLUGINS-state.md.
 
 ### 9.1 Where each Slick name is wired (taut-ui, 2026-11-07)
 
@@ -1000,7 +1002,7 @@ Every name in §9 is a `slackc` boundary. "Empty" means Clack has no such surfac
 |---|---|---|
 | messages, richview | Message, ThreadReplyGeneric (row.go `layoutMessage`); BaseMessageAvatar (between MessageAvatar and ConnectedBaseAvatar, as child slots); MessageText (wraps MessageBlocks → Blocks); MessageFiles, MessageKitAttachments (`tailParts`, filter the body by id); MessageFile (richview `compFile`); ThreadReplies, ReplyBarAvatar (thread bar); MemberSlug (MemberLink's child slot); MessageAttachmentYouTube → AttachmentTitle (YouTube unfurls); MessageKitGutter, UnstyledButton (already wired) | BaseVisuallyHiddenMessageText, CodeChannelEntityCard |
 | composer | TextyAutocomplete, TextyInput (the `isTextyInput` filter target, shaped like Slack's class in taut's 04_react.js, fed by composer/plugins.js), SendButton, MultiFileUploadItem (pending files in `pendingFileUploads`; AnonymiseFileNames' toggle renames them through `updatePendingFile`/`maybePersistPendingFileData`); `currentUserEndedTyping` dispatched | FileFieldset, EditFileDialogTitle |
-| popups | ProfileHoverCard, MemberProfileBaseEntity, Presence, LocalTimeRow, Menu (inside MenuFromTemplate), MessageActionsMenu, ContextMenuTriggerWithKeyboardFocus (channel menu inside ChannelContextMenu), BaseSearch, SearchInputBox, SearchAutocomplete, GifListItem, GifPicker (real-source markers for `isGifPicker`), Content, AppDetailsOverflow; `openEditProfileModal` dispatched | EditProfileFormPane (mounted briefly on Edit profile), AboutPage |
+| popups | ProfileHoverCard, MemberProfileBaseEntity, Presence, LocalTimeRow, Menu (inside MenuFromTemplate), MessageActionsMenu > MAMenu (every message menu, actions_mamenu.go), ContextMenuTriggerWithKeyboardFocus (channel menu inside ChannelContextMenu), BaseSearch, SearchInputBox, SearchAutocomplete, GifListItem, GifPicker (real-source markers for `isGifPicker`), Content, AppDetailsOverflow; `openEditProfileModal` dispatched | EditProfileFormPane (mounted briefly on Edit profile), AboutPage |
 | views | ActivityThread, ActivityDM, ActivityRowContentMultiLine/SingleLine/Detailed/Dense, DmsList, DmsListItem, DmsChannel, PeopleGrid, HuddleInviteWindowWithPreviewContent (a live huddle's Join on the Huddles page); `startHuddle` dispatched (its native is Clack's native huddle) | — |
 | huddleui | HuddleMvaWindowTitle (the call window's title), HuddleBottomBarContent → HuddleRecordingIndicator (the call controls; the indicator at their left), BaseDrawRenderer (over a shared screen), HuddleMiniPanel (the sidebar's huddle bar). taut's `clientHuddles` slice and Slack's `ClientStoreContext` export carry the live call (CallTimer) | HuddleRecordingIndicator (Clack doesn't record), BaseDrawRenderer (Clack draws no annotations) |
 | shell (ui root) | ChannelSidebar, ConnectedChannel → Channel (the sidebar row; real-source marker for `isSidebarChannel`) → ChannelContextMenu → ContextMenuTriggerWithKeyboardFocus → ListChannelEntity + BaseChannelSuffix, ClientPrimaryView → RenderedViewContents (see below) | ProgressiveDisclosureSuccessCoachmarkWrapper |

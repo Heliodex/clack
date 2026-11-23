@@ -75,8 +75,13 @@ func (a *App) accountGradients() bool { return !a.acct.set || a.acct.gradients }
 // goroutine.
 func (a *App) applyAccountPrefs(p core.Prefs) {
 	a.sw.themeFinal = true // the account's own prefs are known (startup.go)
-	a.applySpellPref()     // webapp_spellcheck (spellcheck_wire.go)
-	a.applyLocalePref()    // locale (locale_wire.go)
+	if a.pinAcct {
+		// the introduction's preview: the window's theme and locale, from
+		// the ui.json it was given, over the demo workspace's prefs
+		return
+	}
+	a.applySpellPref()  // webapp_spellcheck (spellcheck_wire.go)
+	a.applyLocalePref() // locale (locale_wire.go)
 	// Accessibility > "Allow animations" (a11y_animations): off, GIFs
 	// draw their stills (imgcache/anim.go, richview/animated.go)
 	a.images.SetAnimate(!p.NoAnimations)
@@ -250,5 +255,5 @@ func (a *App) followOSTheme() {
 // watcher runs off the UI goroutine); followOSTheme applies it if sync is
 // on.
 func (a *App) watchOSTheme() {
-	onOSScheme(func() { a.Post(a.followOSTheme) })
+	a.unhookAtRelease(onOSScheme(func() { a.Post(a.followOSTheme) }))
 }

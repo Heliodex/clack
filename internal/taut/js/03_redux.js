@@ -519,12 +519,32 @@ T.view = (slice, key) => {
   return encode(s[key])
 }
 /** Go → JS: several at once, [[slice, key], …] → values */
+/**
+ * Go → JS: the patched store's values for [slice, key, subs] triples: the
+ * slice (key null), its key's value, or with subs an array, only those
+ * entries of the key's object (a message bucket's messages); with subs
+ * {first: n}, that object's keys and its first n entries ({keys, part}).
+ * Go reads big buckets in chunks of entries, so one read never holds the
+ * thread long.
+ */
 T.views = (pairs) => {
   const st = getState()
-  return pairs.map(([slice, key]) => {
+  const pick = (v, keys) => {
+    const o = {}
+    for (const k of keys) if (v[k] !== undefined) o[k] = v[k]
+    return encode(o)
+  }
+  return pairs.map(([slice, key, subs]) => {
     const s = st[slice]
     if (key === null || key === undefined) return encode(s)
-    return s && typeof s === 'object' ? encode(s[key]) ?? null : null
+    const v = s && typeof s === 'object' ? s[key] : undefined
+    if (Array.isArray(subs)) return v && typeof v === 'object' ? pick(v, subs) : null
+    if (subs && typeof subs === 'object') {
+      if (!v || typeof v !== 'object') return null
+      const keys = Object.keys(v)
+      return { keys, part: pick(v, keys.slice(0, subs.first)) }
+    }
+    return encode(v) ?? null
   })
 }
 
@@ -584,6 +604,21 @@ const nativeArgs = (name, args) => (NATIVE_ARGS[name] ? NATIVE_ARGS[name](args) 
 
 /** a thunk whose work is Clack's native implementation, run in Go */
 function nativeThunk(name) {
+  if (name === 'navigate') {
+    // Slack's navigate resolves undefined (navigateInMainWindow), whatever
+    // Go answered; what it shows is Slack's view state too (setView)
+    return defineThunk(name, async (args) => {
+      notePrimaryThread(args[0])
+      await go('thunk', name, await encodeAsync(nativeArgs(name, args)))
+      return undefined
+    })
+  }
+  // Slack's apiCall settles as its API request does (05_slack.js
+  // apiCallThunk); apiCallExpedited (client-boot 0hZc T) dispatches
+  // apiCall's creator, patches and all, with EXPEDITED
+  if (name === 'apiCall') return defineThunk(name, (args, d, getState) => apiCallThunk(args[0], getState))
+  if (name === 'apiCallExpedited')
+    return defineThunk(name, (args, d) => d((thunkCreators.get('apiCall') ?? nativeThunk('apiCall'))({ ...args[0], EXPEDITED: true })))
   const changes = THUNK_CHANGES[name]
   if (!changes) return defineThunk(name, async (args) => decode(await go('thunk', name, await encodeAsync(nativeArgs(name, args)))))
   return defineThunk(name, async (args) => {
@@ -595,7 +630,40 @@ function nativeThunk(name) {
   })
 }
 
+// ---- Slack's view state (window, view) ----
+// The main window's active tab and its primary view, for plugins that read
+// them (ChatTabs' current tab: state.window.main.activeTab and
+// state.view['v2::main::<tab>::primary']). Clack's route (setView) is a
+// Channel view; a thread Slack's navigate thunk asked for in the primary
+// view (options.forceRenderInPrimary: ChatTabs' "Thread only" tabs) is that
+// Thread view while Clack shows it, beside its channel. No secondary pane
+// is mirrored: after such a navigate ChatTabs closes the one it reads
+// (closeFlexpane), which in Clack is the thread it just opened.
+let primaryThread = null // {id: 'C…-ts', shown}
+function notePrimaryThread(nav) {
+  const id = nav?.params?.threadId
+  primaryThread = nav?.viewType === 'Thread' && nav?.options?.forceRenderInPrimary && typeof id === 'string' ? { id, shown: false } : null
+}
+/** Go → JS (Slick's setRoute): the conversation and thread the window shows */
+T.setView = (channel, thread) => {
+  const id = channel && thread ? `${channel}-${thread}` : ''
+  if (primaryThread) {
+    if (primaryThread.id === id) primaryThread.shown = true
+    else if (primaryThread.shown) primaryThread = null // moved on from it
+  }
+  const primary =
+    primaryThread?.shown && primaryThread.id === id
+      ? { id: 'thread', viewType: 'Thread', params: { threadId: id } }
+      : channel
+        ? { id: channel, viewType: 'Channel' }
+        : undefined
+  setLocalSlice('window', { main: { activeTab: 'home' } })
+  setLocalSlice('view', primary ? { 'v2::main::home::primary': primary } : {})
+}
+
 const getThunkCreator = (name) => thunkCreators.get(name)
+/** Slick's redux.thunkNames (src/app/slack/redux.ts): the names of the thunk creators there are (Clack's: the ones it defines) */
+const thunkNames = () => [...thunkCreators.keys()]
 function waitForThunkCreator(name) {
   const known = thunkCreators.get(name)
   if (known) return Promise.resolve(known)
@@ -605,10 +673,27 @@ function waitForThunkCreator(name) {
     w.add(resolve)
   })
 }
-/** waitForThunkCreator that rejects with `message` after `ms` and drops its waiter (Slick gives up after 30 s; Taut waits) */
-function waitForThunkWithin(name, ms, message) {
+/**
+ * every thunk Clack defines is defined by T.init (its natives, from
+ * go('thunkNames')) or as Go registers it later (Taut.RegisterThunk
+ * defines its creator at once): Slack loads thunks with its chunks, Clack
+ * has no chunks to bring one
+ */
+let thunksComplete = false
+T.thunksDefined = () => {
+  thunksComplete = true
+}
+/**
+ * waitForThunkCreator that rejects with `message` after `ms` and drops its
+ * waiter (Slick gives up after 30 s; Taut waits). A name Clack doesn't
+ * define rejects at once, with `unknown`: no chunk will bring it, so the
+ * wait could only end in the same error (ChatTabs' tab bar sat locked for
+ * the 30 s).
+ */
+function waitForThunkWithin(name, ms, message, unknown = message) {
   const known = thunkCreators.get(name)
   if (known) return Promise.resolve(known)
+  if (thunksComplete) return Promise.reject(new Error(unknown))
   return new Promise((resolve, reject) => {
     let w = thunkWaiters.get(name)
     if (!w) thunkWaiters.set(name, (w = new Set()))
@@ -790,4 +875,4 @@ defineModule('redux-store', {
   }),
 })
 
-Object.assign(T, { redux, store, getState, getRawState, dispatch, defineThunk, nativeThunk, waitForThunkWithin, onAction, setLocalSlice, refresh })
+Object.assign(T, { redux, store, getState, getRawState, dispatch, defineThunk, nativeThunk, waitForThunkWithin, onAction, setLocalSlice, refresh, thunkNames })

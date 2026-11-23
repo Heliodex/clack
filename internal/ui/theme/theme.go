@@ -22,6 +22,7 @@ import (
 	"gioui.org/text"
 	"gioui.org/unit"
 	"gioui.org/widget"
+	"golang.org/x/image/math/fixed"
 
 	"github.com/some-du6e/clack/assets/fonts"
 )
@@ -32,8 +33,9 @@ import (
 // system-installed Lato (Ubuntu's fonts-lato, a different build) can never
 // win the family match: Gio's font map lists system fonts before the
 // embedded collection, so with the plain name every label rendered with
-// the system files (and parsed them into the heap).
-const Typeface font.Typeface = Family + ", " + ExtFamily + ", " + ExtFamily + "2"
+// the system files (and parsed them into the heap). KeysFamily, last,
+// draws the Mac key symbols (⌃⌥⇧⌘) the UI font lacks (keysface.go).
+const Typeface font.Typeface = Family + ", " + ExtFamily + ", " + ExtFamily + "2, " + KeysFamily
 
 // Font weights in Gio units (CSS weight minus 400).
 const (
@@ -110,7 +112,7 @@ func parseFace(b []byte) font.Face {
 // FacesFor returns the Lato collection (the same for both modes; text
 // weight is matched to Chrome with the Embolden stroke instead).
 func FacesFor(dark bool) []font.FontFace {
-	out := latoFaces()
+	out := append(latoFaces(), keysFaces()...)
 	// after Lato: the first face is the shaper's default. The emoji slot
 	// face goes last (slotIndex reads its index from the collection).
 	out = append(out, MonoFaces()...)
@@ -224,6 +226,7 @@ func (t *Theme) SetDark(dark bool) {
 		t.Restyle(t, &p)
 	}
 	t.C = Flatten(p)
+	notePrimaryPalette(t)
 	if !t.genInit || oldDark != dark || oldC != t.C || oldTok != tokensKey(t.Tokens) {
 		t.genInit = true
 		t.Gen++
@@ -270,7 +273,16 @@ func LinearAlpha(c, bg color.NRGBA) color.NRGBA {
 			continue
 		}
 		want := float64(ch[0])*a + float64(ch[1])*(1-a)
-		lw := srgbLin(uint8(math.Round(want)))
+		w8 := math.Round(want)
+		lw := srgbLin(uint8(w8))
+		if w8 == float64(ch[0]) || w8 == float64(ch[1]) {
+			// The 8-bit blend lands on c or bg itself (c close to bg,
+			// or an alpha near 0 or 1), so the rounded value says the
+			// alpha is 1 or 0: Verdant Circuit's scrim rgba(13,24,16,.98)
+			// over its #101d14 card came out opaque and hid the app.
+			// The exact blend keeps the alpha.
+			lw = srgbLinF(want / 255)
+		}
 		best, bestD = (lw-lb)/(lc-lb), d
 	}
 	best = math.Max(0, math.Min(1, best))
@@ -278,8 +290,10 @@ func LinearAlpha(c, bg color.NRGBA) color.NRGBA {
 	return c
 }
 
-func srgbLin(v uint8) float64 {
-	c := float64(v) / 255
+func srgbLin(v uint8) float64 { return srgbLinF(float64(v) / 255) }
+
+// srgbLinF is srgbLin for c in [0, 1].
+func srgbLinF(c float64) float64 {
 	if c <= 0.04045 {
 		return c / 12.92
 	}
@@ -370,6 +384,51 @@ func (t *Theme) Editor(gtx layout.Context, e *widget.Editor, size unit.Sp, col, 
 	return d
 }
 
+// EditorPlaceholder draws txt (Regular, one ellipsized line) on the
+// baseline a single-line Editor laid out with the same gtx puts its
+// line: an editor in a box taller than its line centres the line (Gio
+// patch 54: widget/text.go lineShift), and Blink puts an input's
+// placeholder on its editor's first baseline (BlockLayoutAlgorithm::
+// HandleTextControlPlaceholder). A label draws at its box's top whatever
+// the minimum height, so a placeholder drawn as a Label in the editor's
+// own box would sit above the text. Draw it just before the editor.
+func (t *Theme) EditorPlaceholder(gtx layout.Context, size unit.Sp, col color.NRGBA, txt string) layout.Dimensions {
+	minY := gtx.Constraints.Min.Y
+	g := gtx
+	g.Constraints.Min = image.Point{}
+	m := op.Record(gtx.Ops)
+	d := t.Label(g, size, Regular, col, txt)
+	call := m.Stop()
+	shift := 0
+	if free := minY - d.Size.Y; free > 0 {
+		asc, desc := t.lineMetrics(gtx, size)
+		b0 := d.Size.Y - d.Baseline
+		shift = min(max((minY-asc-desc)/2+asc-b0, 0), free)
+	}
+	st := op.Offset(image.Pt(0, shift)).Push(gtx.Ops)
+	call.Add(gtx.Ops)
+	st.Pop()
+	h := max(minY, d.Size.Y)
+	return layout.Dimensions{Size: image.Pt(d.Size.X, h), Baseline: h - (d.Size.Y - d.Baseline + shift)}
+}
+
+// lineMetrics is the UI font's ascent and descent at size, each rounded
+// (Blink's FontMetrics), as an editor's line has them.
+func (t *Theme) lineMetrics(gtx layout.Context, size unit.Sp) (asc, desc int) {
+	sh := t.Shaper
+	if sh == nil {
+		return 0, 0
+	}
+	sh.LayoutString(text.Parameters{Font: EditorFont(Font(Regular)), PxPerEm: fixed.I(gtx.Sp(size)), MaxWidth: 1 << 20, MaxLines: 1}, "x")
+	first := true
+	for g, ok := sh.NextGlyph(); ok; g, ok = sh.NextGlyph() {
+		if first {
+			asc, desc, first = g.Ascent.Round(), g.Descent.Round(), false
+		}
+	}
+	return asc, desc
+}
+
 // ---- drawing helpers ----
 
 // Fill fills r with c.
@@ -380,13 +439,38 @@ func Fill(gtx layout.Context, r image.Rectangle, c color.NRGBA) {
 }
 
 // RRect fills a rounded rectangle.
+//
+// The path is cached at the origin by size and radius and translated (see
+// PathPen): a path recorded where it's drawn is a new op every frame, so
+// Gio built and uploaded its vertices (a vertex buffer of its own) every
+// frame for every pill, button and avatar.
 func RRect(gtx layout.Context, r image.Rectangle, radius int, c color.NRGBA) {
-	defer clip.UniformRRect(r, radius).Push(gtx.Ops).Pop()
-	paint.ColorOp{Color: c}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
+	if radius <= 0 || r.Empty() || legacyShapes {
+		defer clip.UniformRRect(r, radius).Push(gtx.Ops).Pop()
+		paint.ColorOp{Color: c}.Add(gtx.Ops)
+		paint.PaintOp{}.Add(gtx.Ops)
+		return
+	}
+	defer op.Offset(r.Min).Push(gtx.Ops).Pop()
+	paint.FillShape(gtx.Ops, c, clip.Outline{Path: CachedRRect(clip.UniformRRect(image.Rectangle{Max: r.Size()}, radius))}.Op())
+}
+
+// rrClip is the clip of the rounded rectangle (0,0)-size: clip.RRect's
+// own with no radius (a rect clip), else its path cached by size and
+// radius (see RRect).
+func rrClip(ops *op.Ops, size image.Point, radius int) clip.Op {
+	rr := clip.UniformRRect(image.Rectangle{Max: size}, radius)
+	if radius <= 0 || size.X <= 0 || size.Y <= 0 || legacyShapes {
+		return rr.Op(ops)
+	}
+	return clip.Outline{Path: CachedRRect(rr)}.Op()
 }
 
 // Border strokes a rounded rectangle outline of width w px.
+//
+// A big outline's middle isn't touched: Gio draws a stroke of a rounded
+// rectangle in the bands around its hole, where it covers nothing (Gio
+// patch 42, clip.RRect.StrokeHole), when it draws at a whole-pixel offset.
 func Border(gtx layout.Context, r image.Rectangle, radius, w int, c color.NRGBA) {
 	// a cached path at the origin, translated: stable op identity, so Gio
 	// tessellates the stroke once instead of every frame (see PathPen)
@@ -394,17 +478,59 @@ func Border(gtx layout.Context, r image.Rectangle, radius, w int, c color.NRGBA)
 	paint.FillShape(gtx.Ops, c, clip.Stroke{Path: RRectPath(r.Dx(), r.Dy(), radius), Width: float32(w)}.Op())
 }
 
-// Circle fills a circle with the given center and diameter.
+// FillPanel fills the rounded panel rr, whose clip the caller pushed,
+// with c, in one fill: Gio draws its interior without the clip and its
+// edges through it, in whole pixels, at a whole-pixel offset (Gio
+// patches 38 and 42), and the fill whole under any other transform.
+func FillPanel(gtx layout.Context, rr clip.RRect, c color.NRGBA) {
+	Fill(gtx, rr.Rect, c)
+}
+
+// legacyShapes records rounded rects, circles and rounded image clips
+// where they're drawn, as before the frame-cost work (2026-11-16), for
+// tests that compare.
+var legacyShapes bool
+
+// SetLegacyFrameCost turns the old way of drawing rounded rects, circles
+// and rounded image clips (recorded where drawn, not cached at the origin)
+// on or off, for before/after comparisons in tests. Gio's own changes have
+// gpu.ClackLegacyClips. Use on the UI goroutine.
+func SetLegacyFrameCost(on bool) { legacyShapes = on }
+
+// frameCostProbe is a transparent ellipse FrameCostProbe draws.
+var frameCostProbe image.Rectangle
+
+// SetFrameCostProbe makes FrameCostProbe draw a transparent ellipse r
+// (empty: none), for tests measuring what moving every later path in
+// Gio's coverage atlas changes, when nothing else does: the pixels stay as
+// they are. Use on the UI goroutine.
+func SetFrameCostProbe(r image.Rectangle) { frameCostProbe = r }
+
+// FrameCostProbe draws SetFrameCostProbe's ellipse, if any; the window
+// calls it after the workspace's shadow.
+func FrameCostProbe(gtx layout.Context) {
+	if !frameCostProbe.Empty() {
+		paint.FillShape(gtx.Ops, color.NRGBA{}, clip.Ellipse(frameCostProbe).Op(gtx.Ops))
+	}
+}
+
+// Circle fills a circle with the given center and diameter, from a path
+// cached at the origin by size (see RRect).
 func Circle(gtx layout.Context, center image.Point, d int, c color.NRGBA) {
 	r := image.Rect(center.X-d/2, center.Y-d/2, center.X-d/2+d, center.Y-d/2+d)
-	defer clip.Ellipse(r).Push(gtx.Ops).Pop()
-	paint.ColorOp{Color: c}.Add(gtx.Ops)
-	paint.PaintOp{}.Add(gtx.Ops)
+	if d <= 0 || legacyShapes {
+		defer clip.Ellipse(r).Push(gtx.Ops).Pop()
+		paint.ColorOp{Color: c}.Add(gtx.Ops)
+		paint.PaintOp{}.Add(gtx.Ops)
+		return
+	}
+	defer op.Offset(r.Min).Push(gtx.Ops).Pop()
+	paint.FillShape(gtx.Ops, c, clip.Outline{Path: CachedEllipse(d, d)}.Op())
 }
 
 // Image draws img scaled to fill size (cover), clipped to a rounded rect.
 func Image(gtx layout.Context, img paint.ImageOp, size image.Point, radius int) layout.Dimensions {
-	defer clip.UniformRRect(image.Rectangle{Max: size}, radius).Push(gtx.Ops).Pop()
+	defer rrClip(gtx.Ops, size, radius).Push(gtx.Ops).Pop()
 	is := img.Size()
 	if is.X > 0 && is.Y > 0 {
 		sx := float32(size.X) / float32(is.X)
@@ -429,8 +555,10 @@ func (t *Theme) Placeholder(gtx layout.Context, size image.Point, radius int) la
 }
 
 // Shadow draws a soft drop shadow around r as concentric 1px rings of
-// decreasing alpha (cheap: only the perimeter is touched, which matters on
-// software GL). The area under r itself is not painted; draw r on top.
+// decreasing alpha, spread of them. Only the perimeter is touched: Gio
+// draws a stroked rounded rectangle in the bands around its hole (Gio
+// patch 42), so a ring the size of the window costs its outline, not its
+// box. The area under r itself is not painted; draw r on top.
 func Shadow(gtx layout.Context, r image.Rectangle, radius int, spread int, c color.NRGBA) {
 	if spread < 1 {
 		return

@@ -20,12 +20,14 @@ import (
 	"runtime"
 	"runtime/debug"
 	"runtime/pprof"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"gioui.org/app"
 	"gioui.org/f32"
 	"gioui.org/gpu/headless"
 	"gioui.org/io/input"
@@ -74,17 +76,41 @@ func perfServer(tb testing.TB) *fakeslack.Server {
 }
 
 type perfEnv struct {
-	tb    testing.TB
-	fs    *fakeslack.Server
-	a     *App
-	home  string
-	r     input.Router
-	ops   op.Ops
-	size  image.Point
-	gpu   *headless.Window
-	now   time.Time
-	start time.Time
-	scale float32 // px per dp (0: 1)
+	stopped bool // shutdown ran
+	tb      testing.TB
+	fs      *fakeslack.Server
+	a       *App
+	home    string
+	r       input.Router
+	ops     op.Ops
+	size    image.Point
+	gpu     *headless.Window
+	now     time.Time
+	start   time.Time
+	scale   float32 // px per dp (0: 1)
+	// frozen: the ops the last frame submitted when it was a frozen
+	// inspect session's (inspectFirst), nil when it was laid out
+	frozen *op.Ops
+	// deco is Gio's own title bar, as app.Window's decorate leaves it on
+	// Wayland without server-side decorations: the frame is laid out under
+	// op.Offset(deco) and the router's pointer events are that far off
+	// (move, scroll, click take frame coordinates). Zero: none.
+	deco image.Point
+}
+
+// decorate wraps a frame's layout as app.Window's processFrame does
+// (op.Offset(w.lastFrame.off)); the returned func pops it.
+func (e *perfEnv) decorate(gtx layout.Context) func() {
+	if e.deco == (image.Point{}) {
+		return func() {}
+	}
+	return op.Offset(e.deco).Push(gtx.Ops).Pop
+}
+
+// surface is p, in frame coordinates, as the router's pointer events
+// carry it (deco).
+func (e *perfEnv) surface(p f32.Point) f32.Point {
+	return p.Add(f32.Pt(float32(e.deco.X), float32(e.deco.Y)))
 }
 
 // newPerfEnv starts the client against the fake. warm reuses (or creates)
@@ -173,12 +199,27 @@ func copyTree(tb testing.TB, src, dst string) {
 	}
 }
 
+// startEnvHook, when set, sees each App startEnv makes (endrun_test.go
+// tracks them). A variable, so this file still builds on its own on an
+// older tree (perf.yml runs it on the base too).
+var startEnvHook func(tb testing.TB, a *App)
+
 func startEnv(tb testing.TB, fs *fakeslack.Server, home string) *perfEnv {
+	return startEnvCreds(tb, fs, home, fs.Creds())
+}
+
+// startEnvCreds is startEnv signed in with creds (a Hack Club enterprise
+// id, for the plugins that run only there).
+func startEnvCreds(tb testing.TB, fs *fakeslack.Server, home string, creds slack.Creds) *perfEnv {
 	e := &perfEnv{tb: tb, fs: fs, home: home, size: image.Pt(1440, 900), now: time.Now(), start: time.Now()}
 	images := imgcache.New(fs.Fetch, "", nil)
 	e.a = New(Options{ConfigDir: home, Started: e.start, NoRealtime: true}, images) // no first-run live-updates banner shifting the layout
+	if startEnvHook != nil {
+		startEnvHook(tb, e.a)
+	}
 	cache := filepath.Join(home, "cache")
-	svc := core.New(slack.New(fs.Creds()), store.New(cache))
+	svc := core.New(slack.New(creds), store.New(cache))
+	pinNetwork(svc)
 	e.a.Attach(svc, cache)
 	// what Run does once the window exists
 	images.SetInvalidate(func() {})
@@ -199,21 +240,81 @@ func startEnv(tb testing.TB, fs *fakeslack.Server, home string) *perfEnv {
 	return e
 }
 
-// shutdown stops the session's background work so it can be collected.
+// pinNetwork keeps the host's own network out of a session over a
+// loopback fakeslack (core.App.PinNetwork: no reconnect when the
+// machine's addresses change, no client_online flips). On 2026-11-21 a
+// macOS runner lost its address for two seconds in the middle of
+// TestIdleFrames' "realtime events about nothing on screen": two
+// reconnects and their catch-up loads drew 8 frames that weren't the
+// session's. The baseline tree perf runs against has no PinNetwork.
+func pinNetwork(c *core.App) {
+	if p, ok := any(c).(interface{ PinNetwork() }); ok {
+		p.PinNetwork()
+	}
+}
+
+// shutdown stops the session's background work, then ends it as a
+// sign-out does (backend.stop: plugins stopped, blockkit's realtime views,
+// core.Close and its Release), and drops what the process-wide registries
+// keep of the App (release), so all of it can be collected: before
+// ci-speed-3 nothing of a test's session was, and ui.test held 9 GB live
+// by its end. Each call after the first does nothing.
 func (e *perfEnv) shutdown() {
-	if e.a == nil || e.a.data == nil {
+	if e.a == nil || e.stopped {
 		return
 	}
-	if e.a.data.cancel != nil {
-		e.a.data.cancel()
+	e.stopped = true
+	// a test that signed out or switched accounts has no session left (its
+	// own stop ran); the App is let go all the same
+	if e.a.data != nil {
+		if e.a.data.cancel != nil {
+			e.a.data.cancel()
+		}
+		if c, ok := any(e.a.data.core).(interface{ Shutdown() }); ok { // core.App.Shutdown (absent in the baseline tree)
+			c.Shutdown()
+		}
+		if b, ok := any(e.a.data).(interface{ stop() <-chan struct{} }); ok {
+			select {
+			case <-b.stop():
+			case <-time.After(20 * time.Second):
+				e.tb.Logf("the session's stop didn't finish within 20 s")
+			}
+		}
 	}
-	if c, ok := any(e.a.data.core).(interface{ Shutdown() }); ok { // core.App.Shutdown (absent in the baseline tree)
-		c.Shutdown()
+	if r, ok := any(e.a).(interface{ release() }); ok { // absent in the baseline tree
+		r.release()
 	}
 	if e.gpu != nil {
 		e.gpu.Release()
 		e.gpu = nil
 	}
+}
+
+// frameTimes records each op's wall time in a benchmark's measured loop
+// and reports their median and 95th percentile (p50-ms, p95-ms): a mean
+// hides a slow tail, and perf.yml's regression gate reads both.
+type frameTimes struct {
+	b  *testing.B
+	ds []time.Duration
+	t0 time.Time
+}
+
+func newFrameTimes(b *testing.B) *frameTimes {
+	return &frameTimes{b: b, ds: make([]time.Duration, 0, b.N)}
+}
+
+func (f *frameTimes) start() { f.t0 = time.Now() }
+func (f *frameTimes) stop()  { f.ds = append(f.ds, time.Since(f.t0)) }
+
+func (f *frameTimes) report() {
+	if len(f.ds) == 0 {
+		return
+	}
+	s := slices.Clone(f.ds)
+	slices.Sort(s)
+	at := func(q float64) float64 { return float64(s[min(len(s)-1, int(q*float64(len(s))))]) / 1e6 }
+	f.b.ReportMetric(at(0.50), "p50-ms")
+	f.b.ReportMetric(at(0.95), "p95-ms")
 }
 
 // loopProfile writes allocation profiles right before and after a
@@ -246,13 +347,35 @@ func (e *perfEnv) frame() {
 	}
 	a.drain()
 	e.now = time.Now()
+	// as App.Run: the inspect tool first, before the ops are reset (a
+	// frozen session draws the frame they hold again, inspect_wire.go)
+	fc := e.frameContext()
+	fc.Ops = &e.ops // a frozen frame draws into the window's ops
+	if ops := a.inspectFirst(fc); ops != nil {
+		e.frozen = ops
+		e.r.Frame(ops)
+		if e.gpu != nil {
+			if err := e.gpu.Frame(ops); err != nil {
+				e.tb.Fatal(err)
+			}
+		}
+		return
+	}
+	e.frozen = nil
 	gtx := e.context()
 	before := a.router.Current()
+	a.beginFullFrame() // as App.Run: the images a quiet frame draws again (quiet.go)
+	undeco := e.decorate(gtx)
 	a.frame(gtx)
+	undeco()
 	if a.router.Current() != before {
 		gtx = e.context()
+		a.beginFullFrame()
+		undeco = e.decorate(gtx)
 		a.frame(gtx)
+		undeco()
 	}
+	a.noteFullFrame(e.size, gtx.Metric, app.Insets{}, false) // what quietFrame shows again
 	e.r.Frame(&e.ops)
 	if e.gpu != nil {
 		if err := e.gpu.Frame(&e.ops); err != nil {
@@ -263,11 +386,18 @@ func (e *perfEnv) frame() {
 
 func (e *perfEnv) context() layout.Context {
 	e.ops.Reset()
+	gtx := e.frameContext()
+	gtx.Ops = &e.ops
+	return gtx
+}
+
+// frameContext is context's, with no ops and e.ops left as they are.
+func (e *perfEnv) frameContext() layout.Context {
 	sc := e.scale
 	if sc == 0 {
 		sc = 1
 	}
-	return layout.Context{Ops: &e.ops, Now: e.now, Metric: unit.Metric{PxPerDp: sc, PxPerSp: sc},
+	return layout.Context{Now: e.now, Metric: unit.Metric{PxPerDp: sc, PxPerSp: sc},
 		Constraints: layout.Exact(e.size), Source: e.r.Source()}
 }
 
@@ -312,7 +442,7 @@ func (e *perfEnv) typeText(s string) {
 }
 
 func (e *perfEnv) click(p image.Point) {
-	pt := f32.Pt(float32(p.X), float32(p.Y))
+	pt := e.surface(f32.Pt(float32(p.X), float32(p.Y)))
 	e.r.Queue(
 		pointer.Event{Kind: pointer.Move, Source: pointer.Mouse, Position: pt},
 		pointer.Event{Kind: pointer.Press, Source: pointer.Mouse, Buttons: pointer.ButtonPrimary, Position: pt},
@@ -321,7 +451,7 @@ func (e *perfEnv) click(p image.Point) {
 }
 
 func (e *perfEnv) scroll(p image.Point, dy float32) {
-	pt := f32.Pt(float32(p.X), float32(p.Y))
+	pt := e.surface(f32.Pt(float32(p.X), float32(p.Y)))
 	e.r.Queue(
 		pointer.Event{Kind: pointer.Move, Source: pointer.Mouse, Position: pt},
 		pointer.Event{Kind: pointer.Scroll, Source: pointer.Mouse, Position: pt, Scroll: f32.Pt(0, dy)},
@@ -462,16 +592,20 @@ func BenchmarkScroll500(b *testing.B) {
 	b.ReportAllocs()
 	done := loopProfile(b)
 	defer done()
+	ft := newFrameTimes(b)
 	b.ResetTimer()
 	dir := float32(240)
 	for i := 0; i < b.N; i++ {
 		if i%100 == 0 {
 			dir = -dir
 		}
+		ft.start()
 		e.scroll(p, dir)
 		e.frame()
+		ft.stop()
 	}
 	b.StopTimer()
+	ft.report()
 	b.ReportMetric(float64(e.loadedMessages(ch)), "msgs")
 	b.ReportMetric(liveHeapMB(), "heap-MB")
 }
@@ -572,8 +706,10 @@ func BenchmarkTypingFrame(b *testing.B) {
 	b.ReportAllocs()
 	done := loopProfile(b)
 	defer done()
+	ft := newFrameTimes(b)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		ft.start()
 		if i%200 == 199 { // keep the draft short: select all, delete
 			e.key("A", key.ModShortcut)
 			e.key(key.NameDeleteBackward, 0)
@@ -581,7 +717,10 @@ func BenchmarkTypingFrame(b *testing.B) {
 		}
 		e.typeText(string(rune('a' + i%26)))
 		e.frame()
+		ft.stop()
 	}
+	b.StopTimer()
+	ft.report()
 }
 
 // BenchmarkIdleFrame is a frame with nothing changed (a redraw the app did
@@ -598,13 +737,18 @@ func BenchmarkIdleFrame(b *testing.B) {
 	b.ReportAllocs()
 	done := loopProfile(b)
 	defer done()
+	ft := newFrameTimes(b)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		ft.start()
 		e.frame()
+		ft.stop()
 		if t, ok := e.r.WakeupTime(); ok && t.Sub(e.now) < time.Second {
 			wake++
 		}
 	}
+	b.StopTimer()
+	ft.report()
 	b.ReportMetric(float64(wake)/float64(b.N), "wakeups/op")
 }
 

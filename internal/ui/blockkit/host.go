@@ -202,7 +202,7 @@ func (a *app) onEvent(ev core.ViewEvent) {
 			a.stack.update(ev.View)
 		}
 	case "home":
-		homeUpdated(ev.Channel, ev.View)
+		homeUpdated(a.h.Core(), ev.Channel, ev.View)
 	case "dialog":
 		openDialog(a.h, ev.Dialog)
 	case "ephemeral":
@@ -258,6 +258,17 @@ var (
 	stylesMu sync.Mutex
 	styles   = map[*text.Shaper]*styleEntry{}
 )
+
+func init() { // a finished App's shapers leave both caches (theme.ForgetShaper)
+	theme.OnForgetShaper(func(sh *text.Shaper) {
+		stylesMu.Lock()
+		delete(styles, sh)
+		stylesMu.Unlock()
+		agentStyleMu.Lock()
+		delete(agentStyles, sh)
+		agentStyleMu.Unlock()
+	})
+}
 
 // styleFor is a richview.Style like the message list's, for text inside
 // modals and App Home.

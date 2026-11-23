@@ -15,6 +15,7 @@ import (
 	"gioui.org/f32"
 	"gioui.org/font/gofont"
 	"gioui.org/gpu"
+	"gioui.org/internal/clickrule"
 	"gioui.org/internal/debug"
 	"gioui.org/internal/ops"
 	"gioui.org/io/event"
@@ -57,6 +58,11 @@ type Window struct {
 	animating    bool
 	hasNextFrame bool
 	nextFrame    time.Time
+	// asked, askedAt: what the window's own frames asked for since the last
+	// FrameEvent (Clack patch 35, FrameEvent.Asked): every frame
+	// setNextFrame asks for (askFrame) but an Invalidate's
+	asked   bool
+	askedAt time.Time
 	// viewport is the latest frame size with insets applied.
 	viewport image.Rectangle
 	// metric is the metric from the most recent frame.
@@ -152,6 +158,7 @@ func (w *Window) validateAndProcess(size image.Point, sync bool, frame *op.Ops, 
 				if err != nil {
 					return err
 				}
+				startupGPUContext.mark() // Clack patch (CLACK_PATCHES.md §56)
 				sync = true
 			}
 		}
@@ -183,6 +190,7 @@ func (w *Window) validateAndProcess(size image.Point, sync bool, frame *op.Ops, 
 				return err
 			}
 			w.gpu = gpu
+			startupGPU.mark() // Clack patch (CLACK_PATCHES.md §56)
 		}
 		if w.gpu != nil {
 			if err := w.frame(frame, size); err != nil {
@@ -192,11 +200,26 @@ func (w *Window) validateAndProcess(size image.Point, sync bool, frame *op.Ops, 
 					sync = true
 					continue
 				}
+				if errors.Is(err, errNoRenderTarget) {
+					// Clack patch (CLACK_PATCHES.md §32): nothing to draw
+					// into this time (macOS: no Metal drawable within a
+					// second). The frame's handlers still take the input,
+					// and the window asks for another frame, which the
+					// driver draws when it can.
+					w.queue.Frame(frame)
+					w.askFrame(time.Time{})
+					return nil
+				}
 				w.destroyGPU()
 				if errors.Is(err, gpu.ErrDeviceLost) {
 					continue
 				}
 				return err
+			}
+		}
+		if h := clackGPUFrames.Load(); h != nil && w.gpu != nil {
+			if st, ok := w.gpu.(gpu.ClackStats); ok {
+				(*h)(st.ClackFrameStats()) // Clack patch (CLACK_PATCHES.md §46)
 			}
 		}
 		w.queue.Frame(frame)
@@ -207,6 +230,9 @@ func (w *Window) validateAndProcess(size image.Point, sync bool, frame *op.Ops, 
 		if w.gpu != nil {
 			err = w.ctx.Present()
 			w.ctx.Unlock()
+			if err == nil {
+				startupPresented.mark() // Clack patch (CLACK_PATCHES.md §56)
+			}
 		}
 		return err
 	}
@@ -273,7 +299,7 @@ func (w *Window) updateState() {
 		w.driver.EditorStateChanged(oldState, newState)
 	}
 	if t, ok := q.WakeupTime(); ok {
-		w.setNextFrame(t)
+		w.askFrame(t)
 	}
 	w.updateAnimation()
 }
@@ -326,7 +352,7 @@ func (w *Window) Option(opts ...Option) {
 		}
 		opts = append(opts, decoHeightOpt(decoHeight))
 		w.driver.Configure(opts)
-		w.setNextFrame(time.Time{})
+		w.askFrame(time.Time{})
 		w.updateAnimation()
 	})
 }
@@ -402,6 +428,21 @@ func (w *Window) setNextFrame(at time.Time) {
 	if !w.hasNextFrame || at.Before(w.nextFrame) {
 		w.hasNextFrame = true
 		w.nextFrame = at
+	}
+}
+
+// askFrame is setNextFrame for a frame the window's own frames ask for
+// (Clack patch 35): the router's wake-ups (an op.InvalidateCmd, pending
+// events), input a handler took, a key press kept for Source.KeyPresses,
+// a focus change, options, a click focus, a frame that found nothing to
+// draw into. The next FrameEvent reports the earliest (Asked, AskedAt). An
+// Invalidate (callbacks.Invalidate) asks for a frame with setNextFrame
+// alone: from the window's point of view nothing asked for it, the client
+// knows why it invalidated.
+func (w *Window) askFrame(at time.Time) {
+	w.setNextFrame(at)
+	if !w.asked || at.Before(w.askedAt) {
+		w.asked, w.askedAt = true, at
 	}
 }
 
@@ -511,7 +552,7 @@ func (w *Window) moveFocus(dir key.FocusDirection) {
 
 func (c *callbacks) ClickFocus() {
 	c.w.queue.ClickFocus()
-	c.w.setNextFrame(time.Time{})
+	c.w.askFrame(time.Time{})
 	c.w.updateAnimation()
 }
 
@@ -569,6 +610,8 @@ func (w *Window) collectSemanticDiffs(diffs *[]input.SemanticID, n input.Semanti
 }
 
 func (c *callbacks) Invalidate() {
+	// a frame, but not one the window's frames asked for (Clack patch 35:
+	// setNextFrame, not askFrame): every Window.Invalidate comes here
 	c.w.setNextFrame(time.Time{})
 	c.w.updateAnimation()
 	// Guarantee a wakeup, even when not animating.
@@ -652,7 +695,20 @@ func (w *Window) processEvent(e event.Event) bool {
 		if e2.Size == (image.Point{}) {
 			panic(errors.New("internal error: zero-sized Draw"))
 		}
+		if e2.Metric.PxPerDp != w.metric.PxPerDp {
+			// Clack patch 48: the window's scale for the gestures' tap
+			// rule, whose distances are dp (clickrule.Tap)
+			w.queue.Source().SetValue(clickrule.PxPerDp{}, e2.Metric.PxPerDp)
+		}
 		w.metric = e2.Metric
+		// Clack patch 35: what the window's own frames asked for (askFrame:
+		// not an Invalidate's), and what a frame the client hasn't been
+		// handed yet was asked for
+		e2.Asked, e2.AskedAt = w.asked, w.askedAt
+		if p := w.coalesced.frame; p != nil && p.Asked && (!e2.Asked || p.AskedAt.Before(e2.AskedAt)) {
+			e2.Asked, e2.AskedAt = true, p.AskedAt
+		}
+		w.asked, w.askedAt = false, time.Time{}
 		w.hasNextFrame = false
 		e2.Frame = w.driver.Frame
 		e2.Source = w.queue.Source()
@@ -726,7 +782,7 @@ func (w *Window) processEvent(e event.Event) bool {
 		}
 		t, handled := w.queue.WakeupTime()
 		if handled {
-			w.setNextFrame(t)
+			w.askFrame(t)
 			w.updateAnimation()
 		}
 		return handled
@@ -760,8 +816,13 @@ func (w *Window) processEvent(e event.Event) bool {
 			t, handled = w.queue.WakeupTime()
 		}
 		w.updateCursor()
-		if handled {
-			w.setNextFrame(t)
+		// Clack patch 28: a press kept for Source.KeyPresses gets a
+		// frame, and stays unhandled
+		if logged := w.queue.KeyLogged(); handled || logged {
+			if !handled {
+				t = time.Time{}
+			}
+			w.askFrame(t)
 			w.updateAnimation()
 		}
 		return handled
@@ -820,6 +881,7 @@ func (w *Window) init() {
 	w.decorations.height = decoHeight
 	w.imeState.compose = key.Range{Start: -1, End: -1}
 	w.semantic.ids = make(map[input.SemanticID]input.SemanticNode)
+	startupGioInit.mark() // Clack patch (CLACK_PATCHES.md §56)
 	newWindow(&callbacks{w}, options)
 	for _, acts := range w.initialActions {
 		w.Perform(acts)

@@ -56,6 +56,10 @@ type gpu struct {
 	drawOps                                drawOps
 	ctx                                    driver.Device
 	renderer                               *renderer
+	// stats are the last frame's (Clack patch 36)
+	stats FrameStats
+	// partial is what partial frames keep between frames (Clack patch 46)
+	partial partialFrames
 }
 
 type renderer struct {
@@ -66,6 +70,20 @@ type renderer struct {
 	intersections packer
 	layers        packer
 	layerFBOs     fboSet
+	// the frame's counts so far, and the API's counts as it began (Clack
+	// patch 36)
+	stats  FrameStats
+	calls0 driver.Calls
+	// clear1x1 is drawn for an external image with nothing to draw (Clack
+	// patch 51)
+	clear1x1 driver.Texture
+	// fills are a partial frame's fill pipelines for coverage and layer
+	// pages, made on first use (Clack patch 46)
+	fills        [2]*pipeline
+	fillUniforms *blitColUniforms
+	// copyPipe draws the frame texture into a window's target (Metal)
+	copyPipe     *pipeline
+	copyUniforms *blitTexUniforms
 }
 
 type drawOps struct {
@@ -83,6 +101,12 @@ type drawOps struct {
 	pathOpCache  []pathOp
 	qs           quadSplitter
 	pathCache    *opCache
+	// statsDetail keeps each path's quad bounds for FrameStats.StencilPx
+	// (Clack patch 36)
+	statsDetail bool
+	// tessellated counts the frame's buildVerts of clip paths (Clack patch
+	// 46, FrameStats.PathsTessellated)
+	tessellated int
 }
 
 type opacityLayer struct {
@@ -133,6 +157,178 @@ type pathOp struct {
 	pathVerts []byte
 	parent    *pathOp
 	place     placement
+	// interior is where the path covers every pixel fully, in window
+	// coordinates; empty if not known (Clack patch 38)
+	interior image.Rectangle
+	// hole is where the path, a stroke, covers no pixel, in window
+	// coordinates; empty if not known (Clack patch 42)
+	hole image.Rectangle
+	// more are the path's other stencil regions (Clack patch 39): clip
+	// and place are its first.
+	more []pathRegion
+	// hash is the path's geometry as its vertices are built from it (Clack
+	// patch 46, pathHash)
+	hash [2]uint64
+	// raw: pathVerts is the path's data, not yet tessellated (Clack patch
+	// 46: its cache entry has no GPU data)
+	raw bool
+}
+
+// pathRegion is a region of the coverage atlas a path is stenciled in.
+type pathRegion struct {
+	clip  image.Rectangle
+	place placement
+}
+
+const (
+	// regionSlack is how many pixels that no op needs a region may grow
+	// by to take in another op's rectangle; past it the op gets a region
+	// of its own (Clack patch 39).
+	regionSlack = 32 << 10
+	// maxPathRegions bounds the stencil passes of one path.
+	maxPathRegions = 8
+)
+
+// addRegion makes room for an op drawn in r in the path's stencil
+// regions (Clack patch 39). Gio stenciled a path once over the box around
+// every op it clips. Each pixel's coverage only adds up the curves above
+// it, so a path can as well be stenciled in several regions: a rounded
+// panel clipping a hovered row near its top, a scroll bar along its right
+// edge and its corners isn't stenciled over the whole panel. r joins the
+// region it grows the least, unless that adds more than regionSlack
+// pixels no op needs.
+func (p *pathOp) addRegion(r image.Rectangle) {
+	if p.clip.Empty() {
+		p.clip = r
+		return
+	}
+	if clackLegacy.regions {
+		p.clip = p.clip.Union(r)
+		return
+	}
+	best, bestWaste := -1, int64(-1)
+	for i := -1; i < len(p.more); i++ {
+		c := p.clip
+		if i >= 0 {
+			c = p.more[i].clip
+		}
+		if r.In(c) {
+			return
+		}
+		waste := area(c.Union(r)) - area(c) - area(r) + area(c.Intersect(r))
+		if bestWaste < 0 || waste < bestWaste {
+			best, bestWaste = i, waste
+		}
+	}
+	if bestWaste > regionSlack && len(p.more) < maxPathRegions-1 {
+		p.more = append(p.more, pathRegion{clip: r})
+		return
+	}
+	if best < 0 {
+		p.clip = p.clip.Union(r)
+	} else {
+		p.more[best].clip = p.more[best].clip.Union(r)
+	}
+}
+
+// region is a stencil region of p holding r, and where it is in the
+// atlas.
+func (p *pathOp) region(r image.Rectangle) (image.Rectangle, placement) {
+	if r.In(p.clip) {
+		return p.clip, p.place
+	}
+	for _, m := range p.more {
+		if r.In(m.clip) {
+			return m.clip, m.place
+		}
+	}
+	return p.clip, p.place
+}
+
+// covers reports whether p is a clip path that leaves everything inside
+// r as it is (Clack patch 38): r lies in p's interior, where p's coverage
+// is exactly 1. An op there is drawn as if p weren't on its clip stack, so
+// a text run inside a rounded panel is one path instead of an
+// intersection of two, and p isn't stenciled for it.
+func (p *pathOp) covers(r image.Rectangle) bool {
+	return p.path && !p.interior.Empty() && r.In(p.interior) && !clackLegacy.interiors
+}
+
+// clackLegacy turns parts of Clack's renderer changes off, so tests can
+// compare the old way and the new: interiors keeps every clip path on
+// every op it clips (patch 38), regions stencils a path in one region
+// around all its ops (39), splits draws every op in one piece (42),
+// layers gives every nested opacity layer a page of its own (40).
+var clackLegacy struct{ interiors, regions, splits, layers bool }
+
+// ClackLegacyClips turns the renderer's clip handling from before Clack
+// patches 38, 39 and 42 on or off, for tests comparing the two. Call it
+// between frames.
+func ClackLegacyClips(on bool) { ClackLegacyParts(on, on, on) }
+
+// ClackLegacyParts sets the old way of patches 38 (interiors), 39
+// (regions) and 42 (splits) each on its own. Call it between frames.
+func ClackLegacyParts(interiors, regions, splits bool) {
+	clackLegacy.interiors, clackLegacy.regions, clackLegacy.splits = interiors, regions, splits
+}
+
+// ClackLegacyLayers turns patch 40's sharing of atlas pages by the
+// opacity layers of one depth off (on: every nested layer gets a page of
+// its own, as before). Call it between frames.
+func ClackLegacyLayers(on bool) { clackLegacy.layers = on }
+
+// splitMin is how many pixels a split must leave out of a stencil or
+// draw unclipped to be worth the ops it adds (Clack patch 42).
+const splitMin = 32 << 10
+
+// splitOp is the parts an op drawn in b through the clip path p should be
+// drawn in (Clack patch 42), if any: around p's hole, where a stroke
+// covers nothing, without what's inside it, or around and inside p's
+// interior, which patch 38 then draws with p left off. The parts are
+// whole pixels in window space and tile b (minus the hole), so every
+// pixel is drawn once with the coverage it had: a split made of clips
+// would blend twice where two parts' antialiased edges meet, under any
+// transform but an integer offset, and only there do paths have a hole or
+// an interior. Only a uniform colour can be drawn in parts as it is.
+func splitOp(p *pathOp, b image.Rectangle, m materialType) (parts [5]image.Rectangle, n int) {
+	if clackLegacy.splits || m != materialColor {
+		return parts, 0
+	}
+	if p != nil && p.path && !p.hole.Empty() {
+		if h := p.hole.Intersect(b); area(h) >= splitMin {
+			return around(b, h)
+		}
+	}
+	for ; p != nil; p = p.parent {
+		if !p.path || p.interior.Empty() {
+			continue
+		}
+		in := p.interior.Intersect(b)
+		if in == b || area(in) < splitMin {
+			return parts, 0
+		}
+		parts, n = around(b, in)
+		parts[n] = in
+		return parts, n + 1
+	}
+	return parts, 0
+}
+
+// around is the parts of b outside h, which lies in b: the rows above and
+// below h, the width of b, and the columns left and right of h, its height.
+func around(b, h image.Rectangle) (parts [5]image.Rectangle, n int) {
+	for _, r := range [...]image.Rectangle{
+		{Min: b.Min, Max: image.Pt(b.Max.X, h.Min.Y)},
+		{Min: image.Pt(b.Min.X, h.Min.Y), Max: image.Pt(h.Min.X, h.Max.Y)},
+		{Min: image.Pt(h.Max.X, h.Min.Y), Max: image.Pt(b.Max.X, h.Max.Y)},
+		{Min: image.Pt(b.Min.X, h.Max.Y), Max: b.Max},
+	} {
+		if !r.Empty() {
+			parts[n] = r
+			n++
+		}
+	}
+	return parts, n
 }
 
 type imageOp struct {
@@ -157,12 +353,20 @@ func decodeStrokeOp(data []byte) float32 {
 type quadsOp struct {
 	key opKey
 	aux []byte
+	// interior is the next clip's (Clack patch 38), hole its stroke's
+	// (42)
+	interior, hole image.Rectangle
 }
 
 type opKey struct {
 	outline        bool
 	strokeWidth    float32
 	sx, hx, sy, hy float32
+	// ox, oy are the fraction of a pixel the offset leaves after
+	// transformOffset takes its whole pixels: built into the vertices, so
+	// a path at another fraction is built again (Clack patch 42; Gio
+	// reused the vertices of the first fraction it drew a path at)
+	ox, oy float32
 	ops.Key
 }
 
@@ -179,6 +383,9 @@ type material struct {
 	data    imageOpData
 	tex     driver.Texture
 	uvTrans f32.Affine2D
+	// texID names tex's image (Clack patch 46): a texture made again, or
+	// another at the same address, gets another
+	texID uint64
 }
 
 const (
@@ -256,6 +463,8 @@ type resource interface {
 type texture struct {
 	src *image.RGBA
 	tex driver.Texture
+	// id names the image the texture holds (Clack patch 46)
+	id uint64
 }
 
 type blitter struct {
@@ -367,6 +576,7 @@ func (g *gpu) Clear(col color.NRGBA) {
 }
 
 func (g *gpu) Release() {
+	g.partialRelease()
 	g.renderer.release()
 	g.drawOps.pathCache.release()
 	g.cache.release()
@@ -397,40 +607,87 @@ func (g *gpu) collect(viewport image.Point, frameOps *op.Ops) {
 
 func (g *gpu) frame(target RenderTarget) error {
 	viewport := g.renderer.blitter.viewport
+	g.statsBegin()
+	defer g.statsEnd()
 	defFBO := g.ctx.BeginFrame(target, g.drawOps.clear, viewport)
 	defer g.ctx.EndFrame()
-	g.drawOps.buildPaths(g.ctx)
+	r := g.renderer
 	for _, img := range g.drawOps.imageOps {
 		expandPathOp(img.path, img.clip)
 	}
 	g.stencilTimer.begin()
-	g.renderer.packStencils(&g.drawOps.pathOps)
-	g.renderer.stencilClips(g.drawOps.pathCache, g.drawOps.pathOps)
-	g.renderer.packIntersections(g.drawOps.imageOps)
-	g.renderer.prepareIntersections(g.drawOps.imageOps)
-	g.renderer.intersect(g.drawOps.imageOps)
+	// Clack patch 46: everything the passes draw from is decided first (the
+	// atlases' packing and page sizes, the textures), so the frame can be
+	// compared with the last and drawn again only where it differs (dmg;
+	// nil: the whole frame), into a texture that keeps its pixels (out).
+	// The pages are sized, and aged (patch 40), even in a frame that
+	// needs none.
+	on := g.partialOn(target, viewport)
+	var sticky *stickyAtlas
+	if on {
+		sticky = &g.partial.atlas
+	}
+	r.packer.work = 0
+	var repacked int
+	if sticky != nil {
+		repacked = sticky.repacked
+	}
+	r.packStencils(&g.drawOps.pathOps, sticky)
+	r.stats.PackWork = r.packer.work
+	if sticky != nil {
+		r.stats.StickySlots, r.stats.StickyHoles = len(sticky.slots), sticky.holeSlots
+		r.stats.StickyRepacks = sticky.repacked - repacked
+	}
+	r.packIntersections(g.drawOps.imageOps)
+	r.uploadImages(g.cache, g.drawOps.imageOps)
+	g.drawOps.layers = r.packLayers(g.drawOps.layers)
+	r.pather.begin(r.packer.sizes)
+	r.pather.stenciler.beginIntersect(r.intersections.sizes)
+	r.layerFBOs.resize(r.ctx, driver.TextureFormatSRGBA, r.layers.sizes)
+	out, dmg := g.partialBegin(on, target, defFBO, viewport)
+	// the paths the frame stencils: a partial frame's are the ones in its
+	// damage
+	r.stats.PathsBuilt, r.stats.PathBytes = g.drawOps.buildPaths(g.ctx, dmg)
+	r.stats.PathsTessellated = g.drawOps.tessellated
+	r.stencilClips(g.drawOps.pathCache, g.drawOps.pathOps, dmg)
+	r.prepareIntersections(g.drawOps.imageOps)
+	r.intersect(g.drawOps.imageOps, dmg)
 	g.stencilTimer.end()
 	g.coverTimer.begin()
-	g.renderer.uploadImages(g.cache, g.drawOps.imageOps)
-	g.renderer.prepareDrawOps(g.drawOps.imageOps)
-	g.drawOps.layers = g.renderer.packLayers(g.drawOps.layers)
-	g.renderer.drawLayers(g.drawOps.layers, g.drawOps.imageOps)
+	r.prepareDrawOps(g.drawOps.imageOps)
+	r.drawLayers(g.drawOps.layers, g.drawOps.imageOps, dmg)
+	g.partialClear(out, dmg, viewport)
 	d := driver.LoadDesc{
 		ClearColor: g.drawOps.clearColor,
 	}
-	if g.drawOps.clear {
-		g.drawOps.clear = false
+	switch {
+	case dmg != nil:
+		// the last frame's pixels, its damage cleared (partialClear)
+		d.Action = driver.LoadActionKeep
+	case g.drawOps.clear:
 		d.Action = driver.LoadActionClear
+		r.stats.ClearPx += int64(viewport.X * viewport.Y)
 	}
-	g.ctx.BeginRenderPass(defFBO, d)
-	g.ctx.Viewport(0, 0, viewport.X, viewport.Y)
-	g.renderer.drawOps(false, image.Point{}, g.renderer.blitter.viewport, g.drawOps.imageOps)
+	g.drawOps.clear = false
+	if dmg == nil || len(dmg) > 0 {
+		r.stats.Passes++
+		g.ctx.BeginRenderPass(out.pass, d)
+		g.ctx.Viewport(0, 0, viewport.X, viewport.Y)
+		r.drawOps(false, image.Point{}, r.blitter.viewport, g.drawOps.imageOps, r.mainRects(dmg, viewport))
+		g.ctx.EndRenderPass()
+	}
 	g.coverTimer.end()
-	g.ctx.EndRenderPass()
+	g.partialEnd(defFBO, out, viewport)
 	g.cleanupTimer.begin()
 	g.cache.frame()
 	g.drawOps.pathCache.frame()
 	g.cleanupTimer.end()
+	// what the device holds once the caches let go (Clack patch 46)
+	r.stats.DeviceTextureBytes, r.stats.DeviceBufferBytes = -1, -1
+	if rd, ok := g.ctx.(driver.ClackResources); ok {
+		r.stats.DeviceTextureBytes, r.stats.DeviceBufferBytes = rd.ClackResourceBytes()
+	}
+	r.stats.FrameTextureBytes = g.partial.heldBytes()
 	if false && g.timers.ready() {
 		st, covt, cleant := g.stencilTimer.Elapsed, g.coverTimer.Elapsed, g.cleanupTimer.Elapsed
 		ft := st + covt + cleant
@@ -447,7 +704,32 @@ func (g *gpu) Profile() string {
 	return g.profile
 }
 
-func (r *renderer) texHandle(cache *textureCache, data imageOpData) driver.Texture {
+// liveImage is a live ImageOp's handle (paint.NewLiveImageOp, Clack patch
+// 35): the image to draw now and its texture's key.
+type liveImage interface {
+	LiveImage() (*image.RGBA, any)
+}
+
+// resolveLive is data drawing a live image's image as it is now: once a
+// paint of it is on screen (collect drops the ones outside the viewport
+// and their clips), so only what the frame shows asks. One with no image
+// now draws the image it was made with.
+func resolveLive(data imageOpData) imageOpData {
+	if l, ok := data.handle.(liveImage); ok {
+		if src, h := l.LiveImage(); src != nil && h != nil {
+			data.src, data.handle = src, h
+		}
+	}
+	return data
+}
+
+func (r *renderer) texHandle(cache *textureCache, data imageOpData) (driver.Texture, uint64) {
+	// external and live images (Clack patches 51 and 35)
+	rt, id, d, ok := r.resolveImage(cache, data)
+	if ok {
+		return rt, id
+	}
+	data = d
 	key := textureCacheKey{
 		filter: data.filter,
 		handle: data.handle,
@@ -456,14 +738,16 @@ func (r *renderer) texHandle(cache *textureCache, data imageOpData) driver.Textu
 	var tex *texture
 	t, exists := cache.get(key)
 	if !exists {
+		cache.nextID++
 		t = &texture{
 			src: data.src,
+			id:  cache.nextID,
 		}
 		cache.put(key, t)
 	}
 	tex = t.(*texture)
 	if tex.tex != nil {
-		return tex.tex
+		return tex.tex, tex.id
 	}
 
 	var minFilter, magFilter driver.TextureFilter
@@ -484,7 +768,7 @@ func (r *renderer) texHandle(cache *textureCache, data imageOpData) driver.Textu
 	}
 	driver.UploadImage(handle, image.Pt(0, 0), data.src)
 	tex.tex = handle
-	return tex.tex
+	return tex.tex, tex.id
 }
 
 func (t *texture) release() {
@@ -518,6 +802,18 @@ func (r *renderer) release() {
 	r.pather.release()
 	r.blitter.release()
 	r.layerFBOs.delete(r.ctx, 0)
+	for _, p := range r.fills {
+		if p != nil {
+			p.Release()
+		}
+	}
+	if r.copyPipe != nil {
+		r.copyPipe.Release()
+	}
+	if r.clear1x1 != nil {
+		r.clear1x1.Release()
+		r.clear1x1 = nil
+	}
 }
 
 func newBlitter(ctx driver.Device) *blitter {
@@ -664,28 +960,90 @@ func createColorPrograms(b driver.Device, vsSrc shader.Sources, fsSrc [3]shader.
 	return pipelines, nil
 }
 
-func (r *renderer) stencilClips(pathCache *opCache, ops []*pathOp) {
-	if len(r.packer.sizes) == 0 {
-		return
+// stencilClips stencils the frame's clip paths into the coverage atlas, in
+// each of their regions (Clack patch 39). A partial frame (dmg not nil,
+// Clack patch 46) stencils only the part of each region in the damage, at
+// the place the whole frame does, and clears just those texels first.
+// The pages are sized before (frame).
+func (r *renderer) stencilClips(pathCache *opCache, ops []*pathOp, dmg []image.Rectangle) {
+	var canary map[stickyRegion]bool // ClackCanaryTexels (tests)
+	if dmg == nil {
+		canary = canaryRegions(ops, int(clackFloor.canary.Load()))
 	}
-	fbo := -1
-	r.pather.begin(r.packer.sizes)
-	for _, p := range ops {
-		if fbo != p.place.Idx {
-			if fbo != -1 {
-				r.ctx.EndRenderPass()
+	// page by page: with sticky places (Clack patch 46) a page's regions
+	// aren't together in the ops' order, and a page begun again would be
+	// cleared again
+	for page := range r.packer.sizes {
+		begun := false
+		begin := func() {
+			if begun {
+				return
 			}
-			fbo = p.place.Idx
-			f := r.pather.stenciler.cover(fbo)
-			r.ctx.BeginRenderPass(f.tex, driver.LoadDesc{Action: driver.LoadActionClear})
+			begun = true
+			f := r.pather.stenciler.cover(page)
+			d := driver.LoadDesc{Action: driver.LoadActionClear}
+			if dmg != nil {
+				d.Action = driver.LoadActionKeep // only the damage's texels are read
+			} else {
+				r.stats.ClearPx += int64(f.size.X * f.size.Y)
+			}
+			r.ctx.BeginRenderPass(f.tex, d)
+			r.stats.Passes++
 			r.ctx.BindPipeline(r.pather.stenciler.pipeline.pipeline.pipeline)
 			r.ctx.BindIndexBuffer(r.pather.stenciler.indexBuf)
 		}
-		v, _ := pathCache.get(p.pathKey)
-		r.pather.stencilPath(p.clip, p.off, p.place.Pos, v.data)
+		for _, p := range ops {
+			var v opCacheValue
+			got := false
+			// the path in each of its regions (Clack patch 39)
+			for i := -1; i < len(p.more); i++ {
+				clip, place := p.clip, p.place
+				if i >= 0 {
+					clip, place = p.more[i].clip, p.more[i].place
+				}
+				if place.Idx != page {
+					continue
+				}
+				if !got {
+					v, _ = pathCache.get(p.pathKey)
+					got = true
+				}
+				if dmg == nil {
+					begin()
+					r.stencil(p, v, clip, place, clip)
+					if canary[stickyRegion{p, i}] {
+						r.canaryTexel(clip, place)
+					}
+					continue
+				}
+				for _, d := range dmg {
+					sc := passScissor(d, clip, place.Pos)
+					if sc.Empty() {
+						continue
+					}
+					begin()
+					r.fill(driver.TextureFormatFloat, place.Pos, clip.Size(), sc, f32color.RGBA{})
+					r.ctx.BindPipeline(r.pather.stenciler.pipeline.pipeline.pipeline)
+					r.ctx.BindIndexBuffer(r.pather.stenciler.indexBuf)
+					r.scissor(sc)
+					r.stencil(p, v, clip, place, d.Intersect(clip))
+				}
+			}
+		}
+		if begun {
+			r.ctx.EndRenderPass()
+		}
 	}
-	if fbo != -1 {
-		r.ctx.EndRenderPass()
+}
+
+// stencil draws path p's region clip at place, counting the stencil
+// fragments in in (window coordinates).
+func (r *renderer) stencil(p *pathOp, v opCacheValue, clip image.Rectangle, place placement, in image.Rectangle) {
+	r.pather.stencilPath(clip, p.off, place.Pos, v.data)
+	r.stats.StencilPaths++
+	r.stats.Draws += (v.data.ncurves/4 + pathBatchSize - 1) / pathBatchSize
+	if r.stats.StencilPx >= 0 {
+		r.stats.StencilPx += stencilPx(v.quads, image.Pt(int(p.off.X), int(p.off.Y)), in)
 	}
 }
 
@@ -694,65 +1052,104 @@ func (r *renderer) prepareIntersections(ops []imageOp) {
 		if img.clipType != clipTypeIntersection {
 			continue
 		}
-		fbo := r.pather.stenciler.cover(img.path.place.Idx)
-		r.ctx.PrepareTexture(fbo.tex)
+		// the paths of an intersection are read from any of the coverage
+		// pages, in their regions (Clack patch 39)
+		for _, f := range r.pather.stenciler.fbos.fbos {
+			r.ctx.PrepareTexture(f.tex)
+		}
+		return
 	}
 }
 
-func (r *renderer) intersect(ops []imageOp) {
+// intersect draws the coverage of the ops clipped by two paths or more
+// into the intersection atlas; a partial frame (Clack patch 46) only the
+// part in the damage, its texels set to 1 first. The pages are sized
+// before (frame).
+func (r *renderer) intersect(ops []imageOp, dmg []image.Rectangle) {
 	if len(r.intersections.sizes) == 0 {
 		return
 	}
 	fbo := -1
-	r.pather.stenciler.beginIntersect(r.intersections.sizes)
+	page := func(idx int) {
+		if fbo == idx {
+			return
+		}
+		if fbo != -1 {
+			r.ctx.EndRenderPass()
+		}
+		fbo = idx
+		f := r.pather.stenciler.intersections.fbos[fbo]
+		d := driver.LoadDesc{Action: driver.LoadActionClear}
+		d.ClearColor.R = 1.0
+		if dmg != nil {
+			d.Action = driver.LoadActionKeep
+		} else {
+			r.stats.ClearPx += int64(f.size.X * f.size.Y)
+		}
+		r.ctx.BeginRenderPass(f.tex, d)
+		r.stats.Passes++
+		r.ctx.BindPipeline(r.pather.stenciler.ipipeline.pipeline.pipeline)
+		r.ctx.BindVertexBuffer(r.blitter.quadVerts, 0)
+	}
 	for _, img := range ops {
 		if img.clipType != clipTypeIntersection {
 			continue
 		}
-		if fbo != img.place.Idx {
-			if fbo != -1 {
-				r.ctx.EndRenderPass()
+		if dmg == nil {
+			page(img.place.Idx)
+			r.ctx.Viewport(img.place.Pos.X, img.place.Pos.Y, img.clip.Dx(), img.clip.Dy())
+			r.intersectPath(img.path, img.clip, area(img.clip))
+			continue
+		}
+		for _, d := range dmg {
+			sc := passScissor(d, img.clip, img.place.Pos)
+			if sc.Empty() {
+				continue
 			}
-			fbo = img.place.Idx
-			f := r.pather.stenciler.intersections.fbos[fbo]
-			d := driver.LoadDesc{Action: driver.LoadActionClear}
-			d.ClearColor.R = 1.0
-			r.ctx.BeginRenderPass(f.tex, d)
+			page(img.place.Idx)
+			r.fill(driver.TextureFormatFloat, img.place.Pos, img.clip.Size(), sc, f32color.RGBA{R: 1})
 			r.ctx.BindPipeline(r.pather.stenciler.ipipeline.pipeline.pipeline)
 			r.ctx.BindVertexBuffer(r.blitter.quadVerts, 0)
+			r.ctx.Viewport(img.place.Pos.X, img.place.Pos.Y, img.clip.Dx(), img.clip.Dy())
+			r.scissor(sc)
+			r.intersectPath(img.path, img.clip, area(sc))
 		}
-		r.ctx.Viewport(img.place.Pos.X, img.place.Pos.Y, img.clip.Dx(), img.clip.Dy())
-		r.intersectPath(img.path, img.clip)
 	}
 	if fbo != -1 {
 		r.ctx.EndRenderPass()
 	}
 }
 
-func (r *renderer) intersectPath(p *pathOp, clip image.Rectangle) {
+// intersectPath multiplies the coverage of each path clip is clipped by
+// into the intersection atlas; px is how many of its texels are drawn
+// (the scissor's, in a partial frame).
+func (r *renderer) intersectPath(p *pathOp, clip image.Rectangle, px int64) {
 	if p.parent != nil {
-		r.intersectPath(p.parent, clip)
+		r.intersectPath(p.parent, clip, px)
 	}
-	if !p.path {
+	if !p.path || p.covers(clip) {
 		return
 	}
+	pclip, place := p.region(clip) // Clack patch 39
 	uv := image.Rectangle{
-		Min: p.place.Pos,
-		Max: p.place.Pos.Add(p.clip.Size()),
+		Min: place.Pos,
+		Max: place.Pos.Add(pclip.Size()),
 	}
-	o := clip.Min.Sub(p.clip.Min)
+	o := clip.Min.Sub(pclip.Min)
 	sub := image.Rectangle{
 		Min: o,
 		Max: o.Add(clip.Size()),
 	}
-	fbo := r.pather.stenciler.cover(p.place.Idx)
+	fbo := r.pather.stenciler.cover(place.Idx)
 	r.ctx.BindTexture(0, fbo.tex)
 	coverScale, coverOff := texSpaceTransform(f32.FRect(uv), fbo.size)
-	subScale, subOff := texSpaceTransform(f32.FRect(sub), p.clip.Size())
+	subScale, subOff := texSpaceTransform(f32.FRect(sub), pclip.Size())
 	r.pather.stenciler.ipipeline.uniforms.vert.uvTransform = [4]float32{coverScale.X, coverScale.Y, coverOff.X, coverOff.Y}
 	r.pather.stenciler.ipipeline.uniforms.vert.subUVTransform = [4]float32{subScale.X, subScale.Y, subOff.X, subOff.Y}
 	r.pather.stenciler.ipipeline.pipeline.UploadUniforms(r.ctx)
 	r.ctx.DrawArrays(0, 4)
+	r.stats.Draws++
+	r.stats.IntersectPx += px
 }
 
 func (r *renderer) packIntersections(ops []imageOp) {
@@ -761,7 +1158,7 @@ func (r *renderer) packIntersections(ops []imageOp) {
 		var npaths int
 		var onePath *pathOp
 		for p := img.path; p != nil; p = p.parent {
-			if p.path {
+			if p.path && !p.covers(img.clip) {
 				onePath = p
 				npaths++
 			}
@@ -769,8 +1166,8 @@ func (r *renderer) packIntersections(ops []imageOp) {
 		switch npaths {
 		case 0:
 		case 1:
-			place := onePath.place
-			place.Pos = place.Pos.Sub(onePath.clip.Min).Add(img.clip.Min)
+			pclip, place := onePath.region(img.clip) // Clack patch 39
+			place.Pos = place.Pos.Sub(pclip.Min).Add(img.clip.Min)
 			ops[i].place = place
 			ops[i].clipType = clipTypePath
 		default:
@@ -785,9 +1182,43 @@ func (r *renderer) packIntersections(ops []imageOp) {
 	}
 }
 
-func (r *renderer) packStencils(pops *[]*pathOp) {
+// packStencils places the paths' stencil regions in the coverage atlas;
+// with sticky (partial frames, Clack patch 46) a region that was in the
+// last frame keeps its place.
+func (r *renderer) packStencils(pops *[]*pathOp, sticky *stickyAtlas) {
 	r.packer.clear()
 	ops := *pops
+	if sticky != nil {
+		// the paths with a region, in order
+		k := 0
+		for _, p := range ops {
+			if !p.clip.Empty() {
+				ops[k] = p
+				k++
+			}
+		}
+		clear(ops[k:])
+		ops = ops[:k]
+		sticky.pack(&r.packer, ops)
+		*pops = ops
+		return
+	}
+	if seed := clackFloor.packSeed.Load(); seed != 0 {
+		// Clack patch 46, tests: the regions Gio keeps, in seed's order
+		// (ClackPackOrder)
+		var i int
+		for i < len(ops) {
+			if ops[i].clip.Empty() {
+				ops[i] = ops[len(ops)-1]
+				ops = ops[:len(ops)-1]
+				continue
+			}
+			i++
+		}
+		packShuffled(&r.packer, ops, seed)
+		*pops = ops
+		return
+	}
 	// Allocate atlas space for cover textures.
 	var i int
 	for i < len(ops) {
@@ -804,6 +1235,13 @@ func (r *renderer) packStencils(pops *[]*pathOp) {
 			panic(fmt.Errorf("clip area %v is larger than maximum texture size %v", p.clip, r.packer.maxDims))
 		}
 		p.place = place
+		for j := range p.more { // Clack patch 39
+			place, ok := r.packer.add(p.more[j].clip.Size())
+			if !ok {
+				panic(fmt.Errorf("clip area %v is larger than maximum texture size %v", p.more[j].clip, r.packer.maxDims))
+			}
+			p.more[j].place = place
+		}
 		i++
 	}
 	*pops = ops
@@ -829,6 +1267,11 @@ func (r *renderer) packLayers(layers []opacityLayer) []opacityLayer {
 		// Only layers of the same depth may be packed together.
 		if l.depth != depth {
 			r.layers.newPage()
+			// Clack patch 40: depth stayed 0, so every nested layer got a
+			// page (an FBO and a render pass) of its own
+			if !clackLegacy.layers {
+				depth = l.depth
+			}
 		}
 		place, ok := r.layers.add(l.clip.Size())
 		if !ok {
@@ -841,12 +1284,15 @@ func (r *renderer) packLayers(layers []opacityLayer) []opacityLayer {
 	return layers
 }
 
-func (r *renderer) drawLayers(layers []opacityLayer, ops []imageOp) {
+// drawLayers draws the opacity layers into their pages and replaces each
+// layer's ops with one op drawing its page; a partial frame (Clack patch
+// 46) draws only the layers in the damage and only there, their texels
+// cleared first. The pages are sized before (frame).
+func (r *renderer) drawLayers(layers []opacityLayer, ops []imageOp, dmg []image.Rectangle) {
 	if len(r.layers.sizes) == 0 {
 		return
 	}
 	fbo := -1
-	r.layerFBOs.resize(r.ctx, driver.TextureFormatSRGBA, r.layers.sizes)
 	for _, l := range slices.Backward(layers) {
 
 		if l.opStart >= l.opEnd || l.opEnd > len(ops) {
@@ -854,22 +1300,44 @@ func (r *renderer) drawLayers(layers []opacityLayer, ops []imageOp) {
 			// bounds while a render pass is open.
 			continue
 		}
-		if fbo != l.place.Idx {
-			if fbo != -1 {
-				r.ctx.EndRenderPass()
-				r.ctx.PrepareTexture(r.layerFBOs.fbos[fbo].tex)
+		var rects []passRect
+		for _, d := range dmg {
+			if sc := passScissor(d, l.clip, l.place.Pos); !sc.Empty() {
+				rects = append(rects, passRect{win: d.Intersect(l.clip), s: sc})
 			}
-			fbo = l.place.Idx
-			f := r.layerFBOs.fbos[fbo]
-			r.ctx.BeginRenderPass(f.tex, driver.LoadDesc{Action: driver.LoadActionClear})
 		}
+		if dmg == nil || len(rects) > 0 {
+			if fbo != l.place.Idx {
+				if fbo != -1 {
+					r.ctx.EndRenderPass()
+					r.ctx.PrepareTexture(r.layerFBOs.fbos[fbo].tex)
+				}
+				fbo = l.place.Idx
+				f := r.layerFBOs.fbos[fbo]
+				d := driver.LoadDesc{Action: driver.LoadActionClear}
+				if dmg != nil {
+					d.Action = driver.LoadActionKeep
+				} else {
+					r.stats.ClearPx += int64(f.size.X * f.size.Y)
+				}
+				r.ctx.BeginRenderPass(f.tex, d)
+				r.stats.Passes++
+			}
+			for _, pr := range rects {
+				r.fill(driver.TextureFormatSRGBA, l.place.Pos, l.clip.Size(), pr.s, f32color.RGBA{})
+			}
+			v := image.Rectangle{
+				Min: l.place.Pos,
+				Max: l.place.Pos.Add(l.clip.Size()),
+			}
+			r.ctx.Viewport(v.Min.X, v.Min.Y, v.Dx(), v.Dy())
+			r.drawOps(true, l.clip.Min.Mul(-1), l.clip.Size(), ops[l.opStart:l.opEnd], rects)
+		}
+		f := r.layerFBOs.fbos[l.place.Idx]
 		v := image.Rectangle{
 			Min: l.place.Pos,
 			Max: l.place.Pos.Add(l.clip.Size()),
 		}
-		r.ctx.Viewport(v.Min.X, v.Min.Y, v.Dx(), v.Dy())
-		f := r.layerFBOs.fbos[fbo]
-		r.drawOps(true, l.clip.Min.Mul(-1), l.clip.Size(), ops[l.opStart:l.opEnd])
 		sr := f32.FRect(v)
 		uvScale, uvOffset := texSpaceTransform(sr, f.size)
 		uvTrans := f32.AffineId().Scale(f32.Point{}, uvScale).Offset(uvOffset)
@@ -908,6 +1376,7 @@ func (d *drawOps) reset(viewport image.Point) {
 	d.transStack = d.transStack[:0]
 	d.layers = d.layers[:0]
 	d.opacityStack = d.opacityStack[:0]
+	d.tessellated = 0
 }
 
 func (d *drawOps) collect(root *op.Ops, viewport image.Point) {
@@ -922,17 +1391,57 @@ func (d *drawOps) collect(root *op.Ops, viewport image.Point) {
 	d.collectOps(&d.reader, viewf)
 }
 
-func (d *drawOps) buildPaths(ctx driver.Device) {
+// buildPaths uploads the vertices of the paths the cache doesn't hold,
+// and reports how many and their bytes (Clack patch 36). A partial frame
+// (dmg not nil, Clack patch 46) uploads only the ones it stencils, in its
+// damage: a path recorded anew every frame (a new key) costs a vertex
+// buffer made and released each frame.
+func (d *drawOps) buildPaths(ctx driver.Device, dmg []image.Rectangle) (n int, bytes int64) {
 	for _, p := range d.pathOps {
+		if dmg != nil && !p.inDamage(dmg) {
+			p.pathVerts = nil
+			continue
+		}
 		if v, exists := d.pathCache.get(p.pathKey); !exists || v.data.data == nil {
-			data := buildPath(ctx, p.pathVerts)
-			d.pathCache.put(p.pathKey, opCacheValue{
+			verts := p.pathVerts
+			if p.raw {
+				// its path data, from a cache entry no frame uploaded
+				// (Clack patch 46)
+				k := p.pathKey
+				verts, _ = d.buildVerts(verts, f32.NewAffine2D(k.sx, k.hx, k.ox, k.hy, k.sy, k.oy), k.outline, k.strokeWidth)
+				d.tessellated++
+			}
+			n++
+			bytes += int64(len(verts))
+			data := buildPath(ctx, verts)
+			val := opCacheValue{
 				data:   data,
 				bounds: p.bounds,
-			})
+				hash:   p.hash,
+			}
+			if d.statsDetail {
+				val.quads = quadBounds(verts)
+			}
+			d.pathCache.put(p.pathKey, val)
 		}
 		p.pathVerts = nil
 	}
+	return n, bytes
+}
+
+// inDamage reports whether a stencil region of p overlaps the damage.
+func (p *pathOp) inDamage(dmg []image.Rectangle) bool {
+	for _, d := range dmg {
+		if p.clip.Overlaps(d) {
+			return true
+		}
+		for _, m := range p.more {
+			if m.clip.Overlaps(d) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (d *drawOps) newPathOp() *pathOp {
@@ -940,7 +1449,7 @@ func (d *drawOps) newPathOp() *pathOp {
 	return &d.pathOpCache[len(d.pathOpCache)-1]
 }
 
-func (d *drawOps) addClipPath(state *drawState, aux []byte, auxKey opKey, bounds f32.Rectangle, off f32.Point) {
+func (d *drawOps) addClipPath(state *drawState, aux []byte, auxKey opKey, bounds f32.Rectangle, off f32.Point, interior, hole image.Rectangle, hash [2]uint64, raw bool) {
 	npath := d.newPathOp()
 	*npath = pathOp{
 		parent:    state.cpath,
@@ -948,6 +1457,9 @@ func (d *drawOps) addClipPath(state *drawState, aux []byte, auxKey opKey, bounds
 		off:       off,
 		intersect: bounds.Add(off),
 		rect:      true,
+		interior:  interior,
+		hole:      hole,
+		hash:      hash,
 	}
 	if npath.parent != nil {
 		npath.rect = npath.parent.rect
@@ -958,6 +1470,7 @@ func (d *drawOps) addClipPath(state *drawState, aux []byte, auxKey opKey, bounds
 		npath.pathKey = auxKey
 		npath.path = true
 		npath.pathVerts = aux
+		npath.raw = raw
 		d.pathOps = append(d.pathOps, npath)
 	}
 	state.cpath = npath
@@ -973,11 +1486,12 @@ func (d *drawOps) save(id int, state f32.Affine2D) {
 }
 
 func (k opKey) SetTransform(t f32.Affine2D) opKey {
-	sx, hx, _, hy, sy, _ := t.Elems()
+	sx, hx, ox, hy, sy, oy := t.Elems()
 	k.sx = sx
 	k.hx = hx
 	k.hy = hy
 	k.sy = sy
+	k.ox, k.oy = ox, oy
 	return k
 }
 
@@ -1039,12 +1553,32 @@ loop:
 			quads.aux = encOp.Data[ops.TypeAuxLen:]
 			quads.key.Key = encOp.Key
 
+		case ops.TypeClipInterior:
+			quads.interior = ops.DecodeClipInterior(encOp.Data)
+		case ops.TypeClipHole:
+			quads.hole = ops.DecodeClipHole(encOp.Data)
 		case ops.TypeClip:
 			var op ops.ClipOp
 			op.Decode(encOp.Data)
 			quads.key.outline = op.Outline
 			bounds := f32.FRect(op.Bounds)
 			trans, off := transformOffset(state.t)
+			// the interior and the hole hold under an integer offset
+			// only (Clack patches 38, 42)
+			var interior, hole image.Rectangle
+			if len(quads.aux) > 0 && trans == f32.AffineId() {
+				o := image.Pt(int(off.X), int(off.Y))
+				if !quads.interior.Empty() {
+					interior = quads.interior.Add(o)
+				}
+				if !quads.hole.Empty() {
+					hole = quads.hole.Add(o)
+				}
+			}
+			// hash: the path's geometry, for partial frames (Clack patch 46);
+			// raw: aux is path data still to be tessellated
+			var hash [2]uint64
+			raw := false
 			if len(quads.aux) > 0 {
 				// There is a clipping path, build the gpu data and update the
 				// cache key such that it will be equal only if the transform is the
@@ -1054,22 +1588,38 @@ loop:
 					// Since the GPU data exists in the cache aux will not be used.
 					// Why is this not used for the offset shapes?
 					bounds = v.bounds
+					hash = v.hash
+					// Clack patch 46: an entry without GPU data keeps the path
+					// data, tessellated only if this frame uploads it
+					// (buildPaths). A partial frame uploads only the paths its
+					// damage stencils, and a path no op needs stenciled (all
+					// in its interior) never: the same ops drawn again (a
+					// quiet frame) left their data to be uploaded as if it
+					// were vertices, and building them again every frame cost
+					// the CPU what Gio tessellated once.
+					raw = v.data.data == nil
 				} else {
+					hash = pathHash(quads.aux, quads.key)
 					var pathData []byte
 					pathData, bounds = d.buildVerts(
 						quads.aux, trans, quads.key.outline, quads.key.strokeWidth,
 					)
+					d.tessellated++
 					quads.aux = pathData
 					// add it to the cache, without GPU data, so the transform can be
 					// reused.
-					d.pathCache.put(quads.key, opCacheValue{bounds: bounds})
+					d.pathCache.put(quads.key, opCacheValue{bounds: bounds, hash: hash})
 				}
 			} else {
 				quads.aux, bounds, _ = d.boundsForTransformedRect(bounds, trans)
 				quads.key = opKey{Key: encOp.Key}
 				quads.key = quads.key.SetTransform(trans)
+				if len(quads.aux) > 0 {
+					// a rectangle under a transform: its vertices are its geometry
+					hash = pathHash(quads.aux, opKey{})
+				}
 			}
-			d.addClipPath(&state, quads.aux, quads.key, bounds, off)
+			d.addClipPath(&state, quads.aux, quads.key, bounds, off, interior, hole, hash, raw)
 			quads = quadsOp{}
 		case ops.TypePopClip:
 			state.cpath = state.cpath.parent
@@ -1114,7 +1664,7 @@ loop:
 				// this transformed rectangle.
 				k := opKey{Key: encOp.Key}
 				k = k.SetTransform(t)
-				d.addClipPath(&state, clipData, k, bnd, off)
+				d.addClipPath(&state, clipData, k, bnd, off, image.Rectangle{}, image.Rectangle{}, pathHash(clipData, opKey{}), false)
 			}
 
 			bounds := cl.Round()
@@ -1150,7 +1700,16 @@ loop:
 				}
 			}
 
-			d.imageOps = append(d.imageOps, img)
+			if parts, n := splitOp(img.path, img.clip, mat.material); n > 0 {
+				// in whole-pixel parts (Clack patch 42)
+				for _, c := range parts[:n] {
+					part := img
+					part.clip = c
+					d.imageOps = append(d.imageOps, part)
+				}
+			} else {
+				d.imageOps = append(d.imageOps, img)
+			}
 			if clipData != nil {
 				// we added a clip path that should not remain
 				state.cpath = state.cpath.parent
@@ -1166,14 +1725,17 @@ loop:
 	}
 }
 
+// expandPathOp gives every clip path the op drawn in clip is clipped by
+// room for it in the path's stencil regions: one region around all of a
+// path's ops, as Gio had it, or several (Clack patch 39). A path that
+// leaves clip as it is isn't stenciled for it (patch 38). Rect clips have
+// no regions.
 func expandPathOp(p *pathOp, clip image.Rectangle) {
-	for p != nil {
-		pclip := p.clip
-		if !pclip.Empty() {
-			clip = clip.Union(pclip)
+	for ; p != nil; p = p.parent {
+		if !p.path || p.covers(clip) {
+			continue
 		}
-		p.clip = clip
-		p = p.parent
+		p.addRegion(clip)
 	}
 }
 
@@ -1225,7 +1787,7 @@ func (r *renderer) uploadImages(cache *textureCache, ops []imageOp) {
 		img := &ops[i]
 		m := img.material
 		if m.material == materialTexture {
-			img.material.tex = r.texHandle(cache, m.data)
+			img.material.tex, img.material.texID = r.texHandle(cache, m.data)
 		}
 	}
 }
@@ -1251,11 +1813,33 @@ func (r *renderer) prepareDrawOps(ops []imageOp) {
 	}
 }
 
-func (r *renderer) drawOps(isFBO bool, opOff, viewport image.Point, ops []imageOp) {
+// drawOps draws ops into the open pass; with rects (a partial frame, Clack
+// patch 46) only the ops in each damage rectangle, scissored to it.
+func (r *renderer) drawOps(isFBO bool, opOff, viewport image.Point, ops []imageOp, rects []passRect) {
+	if rects == nil {
+		r.drawOpsIn(isFBO, opOff, viewport, ops, image.Rectangle{}, false)
+		return
+	}
+	for _, pr := range rects {
+		r.scissor(pr.s)
+		r.drawOpsIn(isFBO, opOff, viewport, ops, pr.win, true)
+	}
+}
+
+// drawOpsIn draws ops, only the ones overlapping win if only.
+func (r *renderer) drawOpsIn(isFBO bool, opOff, viewport image.Point, ops []imageOp, win image.Rectangle, only bool) {
 	var coverTex driver.Texture
 	for i := 0; i < len(ops); i++ {
 		img := ops[i]
 		i += img.layerOps
+		if only && !img.clip.Overlaps(win) {
+			continue
+		}
+		// the pixels it draws: in a partial frame, its part in the damage
+		px := area(img.clip.Add(opOff).Intersect(image.Rectangle{Max: viewport}))
+		if only {
+			px = area(img.clip.Intersect(win))
+		}
 		m := img.material
 		switch m.material {
 		case materialTexture:
@@ -1269,8 +1853,11 @@ func (r *renderer) drawOps(isFBO bool, opOff, viewport image.Point, ops []imageO
 		if isFBO {
 			fboIdx = 1
 		}
+		r.stats.Draws++
 		switch img.clipType {
 		case clipTypeNone:
+			r.stats.Blits++
+			r.stats.BlitPx += px
 			p := r.blitter.pipelines[fboIdx][m.material]
 			r.ctx.BindPipeline(p.pipeline)
 			r.ctx.BindVertexBuffer(r.blitter.quadVerts, 0)
@@ -1279,8 +1866,11 @@ func (r *renderer) drawOps(isFBO bool, opOff, viewport image.Point, ops []imageO
 		case clipTypePath:
 			fbo = r.pather.stenciler.cover(img.place.Idx)
 		case clipTypeIntersection:
+			r.stats.Intersections++
 			fbo = r.pather.stenciler.intersections.fbos[img.place.Idx]
 		}
+		r.stats.Covers++
+		r.stats.CoverPx += px
 		if coverTex != fbo.tex {
 			coverTex = fbo.tex
 			r.ctx.BindTexture(1, coverTex)

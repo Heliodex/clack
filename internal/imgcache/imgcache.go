@@ -13,6 +13,11 @@
 // backoff (retryAfter), and the window repaints when the retry is due, so
 // a visible avatar that hit a timeout or a dropped connection loads by
 // itself.
+//
+// Every decode, and the scale after it, charges what it allocates to the
+// process-wide decode memory (decmem.go): decoding never takes more than
+// DecodeMemory in all, and one that can't have its memory now tries again
+// shortly.
 package imgcache
 
 import (
@@ -22,11 +27,16 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"image"
-	"image/draw"
+	// The standard decoders stay registered with package image for its
+	// DecodeConfig (core's photo checks, the composer's and the emoji
+	// dialog's size checks read headers through it); imgcache itself
+	// decodes only through the budgeted copies in internal (decmem.go).
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -36,19 +46,47 @@ import (
 	"time"
 
 	"gioui.org/op/paint"
-	xdraw "golang.org/x/image/draw"
-	_ "golang.org/x/image/webp"
+	_ "golang.org/x/image/bmp" // registered for DecodeConfig too (composer attachments)
 
 	"github.com/some-du6e/clack/internal/emoji"
+	"github.com/some-du6e/clack/internal/imgcache/internal/budget"
+	"github.com/some-du6e/clack/internal/imgcache/internal/webp"
 	"github.com/some-du6e/clack/internal/localimg"
 	"github.com/some-du6e/clack/internal/slack"
+	"github.com/some-du6e/clack/internal/slackasset"
 )
+
+// WebP is decoded by the vendored, budget-charging decoder in
+// internal/webp and internal/vp8l (webpanim.go), never x/image/webp's,
+// whose vp8l allocates its Huffman groups before reading them. x/image's
+// webp is not imported for its init, which would register that unbounded
+// decoder with package image, so image.Decode would run it. Instead the
+// format is registered here with the vendored decoder's header reader —
+// what image.DecodeConfig needs to size-gate a WebP everywhere — and a
+// full decode that routes through the budgeted Decode, so even a direct
+// image.Decode of a WebP can't allocate out of proportion.
+func init() {
+	image.RegisterFormat("webp", "RIFF????WEBPVP8", decodeWebPRegistered, webp.DecodeConfig)
+}
+
+// decodeWebPRegistered is the package image decoder for WebP: it buffers
+// the reader (capped, as the bytes are untrusted) and hands them to
+// Decode, so a registry decode is gated and budgeted like every other.
+func decodeWebPRegistered(r io.Reader) (image.Image, error) {
+	data, err := io.ReadAll(io.LimitReader(r, MaxFetchBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	return Decode(data)
+}
 
 // Fetcher downloads url. For files.slack.com it must authenticate (core.Fetch).
 type Fetcher func(ctx context.Context, url string) ([]byte, error)
 
 // Cache is safe for concurrent use.
 type Cache struct {
+	done       chan struct{} // closed by Close: sweepLoop returns
+	closeOnce  sync.Once
 	fetch      Fetcher
 	dir        string // the disk tier ("" for none); under mu
 	invalidate func()
@@ -65,6 +103,10 @@ type Cache struct {
 	maxBytes int
 	inflight map[key]bool
 	failed   map[key]failure
+	// held: busy loads' bytes for their next try (holdLocked), heldBytes of
+	// them, counted in bytes and at most 1/heldShare of the budget
+	held      map[key]held
+	heldBytes int
 
 	// Two fetch lanes: avatars and emoji (DiskOK URLs, a few KB each) never
 	// wait behind message images, files and unfurls, which can take the
@@ -73,12 +115,44 @@ type Cache struct {
 	// asked for (under mu). A goroutine per request waiting its turn cost
 	// 8 KB of stack each: scrolling the emoji picker through Hack Club's
 	// 65,000 emoji parked 30,000 of them, 250 MB.
+	//
+	// An image asked for again while it waits (Get draws it every frame:
+	// it's on screen) also goes in its lane's hot queue, which the workers
+	// take first: the emoji of the message list don't wait behind the
+	// thousands a picker scroll or the last channel left queued. A hot one
+	// no frame drew in the last animGrace of frames by the time its turn
+	// comes goes back to its place in the queue. Every queued image still
+	// loads: after hotRunMax hot ones in a row a lane takes its queue's
+	// head.
 	queue   [2][]key
+	hot     [2][]key
+	hotRun  [2]int         // hot loads each lane took in a row
+	waiting map[key]queued // queued, not started yet
 	workers [2]int
 	ctx     context.Context
+	// drawnAt is when Get last drew anything (unix milliseconds): the
+	// latest frame. An idle window draws none, and what it showed last is
+	// on screen still.
+	drawnAt int64
+	// the frame being laid out (FrameBegin) and what its Gets drew: the
+	// entries and the waiting loads a frame drawn again from its ops
+	// (FrameRedrawn) draws again
+	gen      uint32
+	genEls   []*list.Element
+	genLoads []key
 
-	wakeAt time.Time // the next repaint: an animation frame (anim.go) or a retry
-	wakeT  *time.Timer
+	// the next repaints (anim.go wakeLocked): wake for a load's retry, a
+	// layout's worth (invalidate); animWake for an animation's next frame
+	// or a player's start (animInvalidate, which a window may answer by
+	// showing its last frame again with its animated images moved on)
+	wake, animWake waker
+	animInvalidate func() // nil: invalidate
+	// liveOps: Get hands out an animated image as a live ImageOp (anim.go
+	// SetLiveOps); liveHeld: the live images show the frame they showed
+	// when hold holdGen began (HoldLive)
+	liveOps  bool
+	liveHeld bool
+	holdGen  uint32
 
 	// animations (anim.go): whether Get plays them (SetAnimate), the
 	// entries with a player playing, and the sweep that stops them once
@@ -87,6 +161,7 @@ type Cache struct {
 	playing  map[*entry]struct{}
 	animT    *time.Timer
 	advances uint64 // frames the players moved on (Stats)
+	skipped  uint64 // frames their timelines passed over, late (Stats)
 	gifBytes int    // the entries' encoded GIF bytes (e.gif): at most gifShare of the budget
 }
 
@@ -95,23 +170,90 @@ type Cache struct {
 // image on screen comes back on its own after a dropped connection, a
 // timeout or a 5xx, instead of staying a placeholder until something else
 // redraws the window.
+//
+// A final failure (bytes that arrived whole and don't decode:
+// ErrUndecodable) isn't tried again for finalFailureTTL while the account
+// is signed in: the same bytes would fail the same way. Slack's <img>
+// doesn't retry an onError either. A busy one (ErrBusy: other decodes held
+// the decode memory) is tried again within RetryBusyMax, with the bytes it
+// already fetched (held), and for busyTries tries isn't a failure to the
+// surfaces asking (Failed): the image is still loading. Past them it has
+// failed (the lightbox shows the file's largest thumbnail instead) and is
+// tried again as a failure that may pass, RetryMin doubling to RetryMax,
+// still with its bytes: so under memory pressure that doesn't end, nothing
+// spins for good, and the image loads once the pressure is over.
 type failure struct {
 	at    time.Time
 	n     int
 	retry time.Time
+	final bool
+	busy  bool // busy and still loading (Failed is false)
+	busyN int  // busy failures in a row
+}
+
+// busyTries is how many busy failures in a row an image is still loading
+// for; after them it has failed (and is tried again later).
+const busyTries = 3
+
+// errBusyLong is a load busy past busyTries: tried again as an error that
+// may pass (RetryMin doubling to RetryMax), not every RetryBusyMax.
+var errBusyLong = errors.New("imgcache: decode memory busy for a while")
+
+// held is a busy load's bytes (and its disk-tier save), kept for its next
+// try so it isn't downloaded again.
+type held struct {
+	data []byte
+	save func()
+	at   time.Time
+}
+
+// heldShare: busy loads' kept bytes are counted in the cache's byte budget
+// (c.bytes, as its images are) and take at most 1/heldShare of it; past
+// that the oldest go, and a file bigger than that isn't kept (its next try
+// downloads it again).
+const heldShare = 4
+
+// ErrUndecodable marks bytes in an image format this package reads
+// (PNG, JPEG, GIF, WebP) that don't decode: a final failure, never
+// retried. Before it, an animated WebP behind a .png URL (x/image/webp
+// reads only stills) failed with "webp: invalid format", which wasn't
+// permanent, so the emoji was fetched again every minute for good and
+// stayed a blank tile.
+var ErrUndecodable = errors.New("imgcache: undecodable image")
+
+// undecodable wraps a format decoder's error as ErrUndecodable; ErrTooBig,
+// image.ErrFormat (not an image at all, e.g. an error page) and ErrBusy
+// (the decode memory was taken: nothing about the bytes) stay as they are.
+func undecodable(err error) error {
+	if err == nil || errors.Is(err, ErrTooBig) || errors.Is(err, image.ErrFormat) || errors.Is(err, ErrUndecodable) || errors.Is(err, ErrBusy) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", ErrUndecodable, err)
 }
 
 // Retry backoff: RetryMin doubling up to RetryMax for errors that may pass
 // (network, timeouts, HTTP 429 and 5xx); RetryPermanent for bytes that
-// aren't an image or are too big, and URLs that are refused outright.
+// aren't an image or are too big, and URLs that are refused outright;
+// RetryBusy doubling up to RetryBusyMax for a decode the decode memory was
+// too full for (ErrBusy), which loads as soon as the decodes holding it
+// are done.
 const (
 	RetryMin       = time.Second
 	RetryMax       = time.Minute
 	RetryPermanent = 10 * time.Minute
+	RetryBusy      = 250 * time.Millisecond
+	RetryBusyMax   = 4 * time.Second
 )
 
 // retryAfter is the wait before the n-th retry (n ≥ 1) after err.
 func retryAfter(n int, err error) time.Duration {
+	if errors.Is(err, ErrBusy) {
+		d := RetryBusy
+		for i := 1; i < n && d < RetryBusyMax; i++ {
+			d *= 2
+		}
+		return min(d, RetryBusyMax)
+	}
 	if permanent(err) {
 		return RetryPermanent
 	}
@@ -123,9 +265,12 @@ func retryAfter(n int, err error) time.Duration {
 }
 
 // permanent reports errors a retry can't fix: undecodable or oversized
-// bytes and URLs the fetchers refuse.
+// bytes and URLs the fetchers refuse. ErrBusy never is.
 func permanent(err error) bool {
-	if errors.Is(err, ErrTooBig) || errors.Is(err, image.ErrFormat) || errors.Is(err, ErrBlockedAddr) {
+	if errors.Is(err, ErrBusy) {
+		return false
+	}
+	if errors.Is(err, ErrTooBig) || errors.Is(err, image.ErrFormat) || errors.Is(err, ErrBlockedAddr) || errors.Is(err, ErrUndecodable) {
 		return true
 	}
 	s := err.Error()
@@ -158,9 +303,18 @@ type entry struct {
 	play     *player
 	starting bool
 	retry    time.Time
+	// playFails: player starts in a row that failed (a busy decode
+	// memory, a fetch): each waits longer (retryAfter)
+	playFails int
 	// seenFrom..seenAt: the stretch Get has drawn it without a gap of
 	// animGrace (a player starts once it's animSettle long)
 	seenFrom, seenAt time.Time
+	// live: its live ImageOps (SetLiveOps), for Get and GetPlaying, and
+	// their LiveImages
+	live  [2]paint.ImageOp
+	lives [2]*live
+	// gen: the frame (FrameBegin) whose Gets drew it last
+	gen uint32
 }
 
 // IdleAfter: images not asked for in this long are dropped by a sweep every
@@ -201,6 +355,7 @@ func New(fetch Fetcher, diskDir string, invalidate func()) *Cache {
 		ctx:        context.Background(),
 		diskLimit:  DiskLimit,
 		animate:    true,
+		done:       make(chan struct{}),
 	}
 	go c.sweepLoop()
 	return c
@@ -226,6 +381,7 @@ func (c *Cache) SetDir(dir string) {
 	c.lru.Init()
 	c.bytes = 0
 	c.failed = map[key]failure{}
+	c.held, c.heldBytes = nil, 0 // the last account's
 	c.written = 0
 	c.mu.Unlock()
 	if dir != "" {
@@ -313,9 +469,39 @@ func (c *Cache) trim(dir string) {
 func (c *Cache) sweepLoop() {
 	t := time.NewTicker(IdleAfter / 2)
 	defer t.Stop()
-	for range t.C {
-		c.sweep(time.Now().Add(-IdleAfter).UnixMilli())
+	for {
+		select {
+		case <-t.C:
+			c.sweep(time.Now().Add(-IdleAfter).UnixMilli())
+		case <-c.done:
+			return
+		}
 	}
+}
+
+// Close stops the cache's sweeps, its goroutine, for a cache nothing draws
+// from again: a finished App's (internal/ui's tests). The goroutine kept
+// the cache, every decoded image in it, reachable for good (ci-speed-3);
+// the process's own cache is never closed.
+func (c *Cache) Close() {
+	c.closeOnce.Do(func() {
+		if c.done != nil {
+			close(c.done)
+		}
+		// and the players: animSweep re-arms itself while any plays, and a
+		// kept one nothing draws any more plays for good, its timer (a
+		// runtime root) holding the cache and the window it repaints
+		// (ci-speed-3: a heap dump's commonest root once the rest went)
+		c.mu.Lock()
+		if c.animT != nil {
+			c.animT.Stop()
+			c.animT = nil
+		}
+		for e := range c.playing {
+			c.releaseLocked(e)
+		}
+		c.mu.Unlock()
+	})
 }
 
 // sweep drops entries last used before cutoff (unix milliseconds).
@@ -329,20 +515,64 @@ func (c *Cache) sweep(cutoff int64) {
 		}
 		el = prev
 	}
+	finals := 0
 	for k, f := range c.failed {
-		// a failure nobody asked about since (its retry is long due) goes;
-		// one still backing off stays, or the backoff would start over
-		if f.retry.UnixMilli() < cutoff {
+		switch {
+		case f.final && f.at.UnixMilli() >= cutoff-finalFailureTTL.Milliseconds():
+			finals++
+		case f.final, f.retry.UnixMilli() < cutoff:
+			// a final failure past its time goes, and so does one nobody
+			// asked about since its retry was due; one still backing off
+			// stays, or the backoff would start over
+			delete(c.failed, k)
+			c.unholdLocked(k)
+		}
+	}
+	for k := range c.held { // held for a failure that went
+		if _, ok := c.failed[k]; !ok {
+			c.unholdLocked(k)
+		}
+	}
+	if finals > maxFinalFailures { // the oldest go
+		ks := make([]key, 0, finals)
+		for k, f := range c.failed {
+			if f.final {
+				ks = append(ks, k)
+			}
+		}
+		sort.Slice(ks, func(i, j int) bool { return c.failed[ks[i]].at.Before(c.failed[ks[j]].at) })
+		for _, k := range ks[:finals-maxFinalFailures] {
 			delete(c.failed, k)
 		}
 	}
 }
+
+// Final failures are kept for finalFailureTTL, at most maxFinalFailures
+// of them (one per URL and size, the oldest going first), so a session
+// that meets many broken images doesn't hold them all for good. One that
+// goes is fetched once more the next time it's drawn.
+const (
+	finalFailureTTL  = 6 * time.Hour
+	maxFinalFailures = 4096
+)
 
 // SetInvalidate replaces the repaint callback (the window may be created
 // after the cache).
 func (c *Cache) SetInvalidate(f func()) {
 	c.mu.Lock()
 	c.invalidate = f
+	c.mu.Unlock()
+}
+
+// SetAnimInvalidate sets the callback for repaints only animations need
+// (any goroutine): an animated image's next frame is due, a player started
+// or decoded its next frame. Nothing about the layout changed: with live
+// ImageOps (SetLiveOps) a window may show its last frame's ops again, and
+// the GPU draws each animation's frame due then. nil: those go to the
+// SetInvalidate callback.
+func (c *Cache) SetAnimInvalidate(f func()) {
+	c.mu.Lock()
+	c.animInvalidate = f
 	c.mu.Unlock()
 }
 
@@ -378,13 +608,19 @@ func (c *Cache) get(url string, sizePx int, forced bool) (paint.ImageOp, bool) {
 	now := time.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.drawnAt = now.UnixMilli()
 	el, ok := c.entries[k]
 	if ok {
 		c.lru.MoveToFront(el)
 	} else {
 		e := c.deriveLocked(k)
 		if e == nil {
-			c.startLocked(k)
+			c.startLocked(k, true)
+			if w, ok := c.waiting[k]; ok && w.gen != c.gen { // this frame's (FrameRedrawn)
+				w.gen = c.gen
+				c.waiting[k] = w
+				c.genLoads = append(c.genLoads, k)
+			}
 			return paint.ImageOp{}, false
 		}
 		// the exact decode replaces it: always for a standard emoji's own
@@ -394,7 +630,7 @@ func (c *Cache) get(url string, sizePx int, forced bool) (paint.ImageOp, bool) {
 		c.putLocked(e)
 		c.evict()
 		if e.interim {
-			c.startLocked(k)
+			c.startLocked(k, true)
 		}
 		if el, ok = c.entries[k]; !ok {
 			return e.op, true
@@ -402,7 +638,71 @@ func (c *Cache) get(url string, sizePx int, forced bool) (paint.ImageOp, bool) {
 	}
 	e := el.Value.(*entry)
 	e.used = now.UnixMilli()
-	return c.frameLocked(e, now, forced), true
+	if e.gen != c.gen { // this frame's (FrameRedrawn)
+		e.gen = c.gen
+		c.genEls = append(c.genEls, el)
+	}
+	if c.liveHeld && c.liveOps && e.frames > 1 && (c.animate || forced) {
+		// HoldLive (anim.go): its live op shows the held frame; nothing
+		// moves on and nothing asks for a repaint, whichever window Gets
+		return c.liveOpLocked(e, forced), true
+	}
+	op := c.frameLocked(e, now, forced)
+	if c.liveOps && e.frames > 1 && (c.animate || forced) {
+		return c.liveOpLocked(e, forced), true
+	}
+	return op, true
+}
+
+// FrameBegin says a window's frame is being laid out: what Get draws from
+// now until the next FrameBegin is that frame's images, which
+// FrameRedrawn draws again (any goroutine).
+func (c *Cache) FrameBegin() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.gen++
+	clear(c.genEls)
+	c.genEls = c.genEls[:0]
+	clear(c.genLoads)
+	c.genLoads = c.genLoads[:0]
+	c.mu.Unlock()
+}
+
+// FrameRedrawn says the frame laid out since FrameBegin was drawn again
+// from its ops, with no Get (ui's quiet frames): its images count as drawn
+// now, as that frame's Gets drew them. They're used now (the idle sweep
+// drops what wasn't drawn in IdleAfter, and room is made from what wasn't
+// drawn in animGrace first), they come first in the LRU, and the loads
+// they wait for stay hot. Without it a minute of quiet frames dropped
+// every still on screen while the GPU kept drawing them from the old ops,
+// and the next layout showed placeholders while they loaded again. Its
+// animated images are asked for their frames by the GPU (SetLiveOps), which
+// counts as their draw (any goroutine).
+func (c *Cache) FrameRedrawn() {
+	if c == nil {
+		return
+	}
+	now := time.Now().UnixMilli()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := len(c.genEls) - 1; i >= 0; i-- { // the first drawn ends up first
+		el := c.genEls[i]
+		e := el.Value.(*entry)
+		if c.entries[e.k] != el { // gone since
+			continue
+		}
+		e.used = now
+		c.lru.MoveToFront(el)
+	}
+	for _, k := range c.genLoads {
+		if w, ok := c.waiting[k]; ok {
+			w.asked = now
+			c.waiting[k] = w
+		}
+	}
+	c.drawnAt = now
 }
 
 // Loaded reports whether some size of url is decoded.
@@ -432,7 +732,9 @@ type Stats struct {
 	Animated              int         // entries of animated GIFs, playing or not
 	EncodedBytes          int         // animated GIFs' encoded bytes kept for playing again
 	Advances              uint64      // frames the players have moved on, ever
+	Skipped               uint64      // frames their timelines passed over to catch up, ever
 	LargestFrame          image.Point // the largest frame a player plays now
+	LiveHeld              bool        // the live images are held (HoldLive)
 }
 
 // Stats reports the memory tier.
@@ -442,7 +744,7 @@ func (c *Cache) Stats() Stats {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	s := Stats{Entries: len(c.entries), Bytes: c.bytes, Limit: c.maxBytes, Advances: c.advances}
+	s := Stats{Entries: len(c.entries), Bytes: c.bytes, Limit: c.maxBytes, Advances: c.advances, Skipped: c.skipped, LiveHeld: c.liveHeld}
 	for el := c.lru.Front(); el != nil; el = el.Next() {
 		e := el.Value.(*entry)
 		if e.frames > 1 {
@@ -480,40 +782,61 @@ func (c *Cache) Prefetch(url string, sizePx int) {
 	c.mu.Lock()
 	k := key{url, sizePx}
 	if _, ok := c.entries[k]; !ok {
-		c.startLocked(k)
+		c.startLocked(k, false)
 	}
 	c.mu.Unlock()
 }
 
 // Failed reports whether the last fetch of url failed (so callers can show a
-// broken-image state instead of a spinner).
+// broken-image state instead of a spinner). One the decode memory was too
+// full for (ErrBusy) hasn't: it's still loading, and tries again shortly.
 func (c *Cache) Failed(url string, sizePx int) bool {
 	if c == nil {
 		return false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	_, ok := c.failed[key{url, sizePx}]
-	return ok
+	f, ok := c.failed[key{url, sizePx}]
+	return ok && !f.busy
 }
 
-func (c *Cache) startLocked(k key) {
+// startLocked queues k's load. drawn: Get asked (it's on screen), not
+// Prefetch; asked again while it waits, it moves to the hot queue.
+func (c *Cache) startLocked(k key, drawn bool) {
 	if c.inflight[k] {
+		if w, ok := c.waiting[k]; ok && drawn {
+			w.asked = time.Now().UnixMilli()
+			if !w.hot {
+				w.hot = true
+				lane := laneOf(k)
+				c.hot[lane] = append(c.hot[lane], k)
+			}
+			c.waiting[k] = w
+		}
 		return
 	}
-	if f, ok := c.failed[k]; ok && time.Now().Before(f.retry) {
+	if f, ok := c.failed[k]; ok && (f.final || time.Now().Before(f.retry)) {
 		return
 	}
 	c.inflight[k] = true
-	lane := laneOther
-	if DiskOK(k.url) {
-		lane = laneSmall
+	lane := laneOf(k)
+	if c.waiting == nil {
+		c.waiting = map[key]queued{}
 	}
+	c.waiting[k] = queued{asked: time.Now().UnixMilli()}
 	c.queue[lane] = append(c.queue[lane], k)
 	if c.workers[lane] < laneWorkers {
 		c.workers[lane]++
 		go c.work(lane)
 	}
+}
+
+// queued is a waiting load: when Get last asked for it and whether it's
+// in the hot queue.
+type queued struct {
+	asked int64 // unix milliseconds
+	hot   bool
+	gen   uint32 // the frame that last asked (FrameRedrawn)
 }
 
 // The fetch lanes (Cache.queue) and how many loads each runs at once.
@@ -523,27 +846,95 @@ const (
 	laneWorkers = 8
 )
 
-// work loads the lane's queued images in order until it is empty.
+func laneOf(k key) int {
+	if DiskOK(k.url) {
+		return laneSmall
+	}
+	return laneOther
+}
+
+// work loads the lane's queued images until it is empty: the hot queue's
+// first, then the rest in the order they were asked for.
 func (c *Cache) work(lane int) {
 	for {
 		c.mu.Lock()
-		q := c.queue[lane]
-		if len(q) == 0 {
-			c.queue[lane] = nil // a drained burst's array goes too
+		k, ok := c.nextLocked(lane)
+		if !ok {
+			c.queue[lane], c.hot[lane], c.hotRun[lane] = nil, nil, 0 // a drained burst's arrays go too
 			c.workers[lane]--
 			c.mu.Unlock()
 			return
 		}
-		k := q[0]
-		q[0] = key{}
-		c.queue[lane] = q[1:]
+		delete(c.waiting, k)
 		c.mu.Unlock()
 		c.load(k)
 	}
 }
 
+// hotRunMax is how many hot loads a lane takes in a row while its queue
+// has others waiting. On-screen images that need more than the budget
+// keep coming back hot (each load evicts another one still drawn), and
+// would hold up the rest of the queue for good.
+const hotRunMax = laneWorkers
+
+// nextLocked takes the lane's next load: the first hot one still drawn,
+// else (and after hotRunMax hot ones in a row) the queue's first not
+// started yet (a hot one started already is still in the queue too, and
+// skipped there).
+func (c *Cache) nextLocked(lane int) (key, bool) {
+	if c.hotRun[lane] < hotRunMax {
+		if k, ok := c.nextHotLocked(lane); ok {
+			c.hotRun[lane]++
+			return k, true
+		}
+	}
+	c.hotRun[lane] = 0
+	for q := c.queue[lane]; len(q) > 0; q = c.queue[lane] {
+		k := q[0]
+		q[0] = key{}
+		c.queue[lane] = q[1:]
+		if _, ok := c.waiting[k]; ok {
+			return k, true
+		}
+	}
+	if k, ok := c.nextHotLocked(lane); ok { // the queue held only hot ones, started already
+		c.hotRun[lane] = 1
+		return k, true
+	}
+	return key{}, false
+}
+
+// nextHotLocked takes the lane's first hot load that's still drawn. One
+// Get hasn't asked for within animGrace of the latest frame (drawnAt) is
+// off screen, and goes back to its turn in the queue: the latest frame,
+// not the clock, as a load landing on an idle window comes before the
+// window draws again, and the frame it showed last is still on screen
+// however long ago that was.
+func (c *Cache) nextHotLocked(lane int) (key, bool) {
+	for h := c.hot[lane]; len(h) > 0; h = c.hot[lane] {
+		k := h[0]
+		h[0] = key{}
+		c.hot[lane] = h[1:]
+		w, ok := c.waiting[k]
+		if !ok || !w.hot {
+			continue
+		}
+		if c.drawnAt-w.asked > animGrace.Milliseconds() {
+			w.hot = false
+			c.waiting[k] = w
+			continue
+		}
+		return k, true
+	}
+	return key{}, false
+}
+
 func (c *Cache) load(k key) {
-	op, sz, n, an, px, err := c.loadImage(k)
+	c.mu.Lock()
+	h := c.held[k] // the bytes a busy try kept
+	c.unholdLocked(k)
+	c.mu.Unlock()
+	op, sz, n, an, px, h, err := c.loadFrom(k, h)
 	c.mu.Lock()
 	delete(c.inflight, k)
 	if err != nil {
@@ -551,9 +942,29 @@ func (c *Cache) load(k key) {
 		f := c.failed[k]
 		f.n++
 		f.at = now
-		f.retry = now.Add(retryAfter(f.n, err))
+		busy := errors.Is(err, ErrBusy)
+		if busy {
+			f.busyN++
+		} else {
+			f.busyN = 0
+		}
+		f.final = errors.Is(err, ErrUndecodable)
+		f.busy = busy && f.busyN <= busyTries
+		switch {
+		case f.busy: // still loading: again shortly
+			f.retry = now.Add(retryAfter(f.busyN, err))
+		case busy: // busy for a while: failed, and again later
+			f.retry = now.Add(retryAfter(f.busyN-busyTries, errBusyLong))
+		default:
+			f.retry = now.Add(retryAfter(f.n, err))
+		}
+		if busy && h.data != nil {
+			c.holdLocked(k, h)
+		}
 		c.failed[k] = f
-		c.wakeLocked(f.retry) // the surface asks again when the retry is due
+		if !f.final {
+			c.wakeLocked(f.retry) // the surface asks again when the retry is due
+		}
 	} else {
 		delete(c.failed, k)
 		e := &entry{k: k, op: op, size: sz, n: n, used: time.Now().UnixMilli(), px: px}
@@ -575,26 +986,99 @@ func (c *Cache) load(k key) {
 	inv()
 }
 
+// holdLocked keeps h for k's next try, in the cache's byte budget: the
+// oldest held go first past the budget's 1/heldShare, and what nobody drew
+// lately makes room (shedLocked); bytes that don't fit then aren't kept.
+func (c *Cache) holdLocked(k key, h held) {
+	c.unholdLocked(k)
+	limit := c.maxBytes / heldShare
+	if len(h.data) > limit {
+		return
+	}
+	for c.heldBytes+len(h.data) > limit {
+		var old key
+		var at time.Time
+		first := true
+		for hk, hv := range c.held {
+			if first || hv.at.Before(at) {
+				old, at, first = hk, hv.at, false
+			}
+		}
+		c.unholdLocked(old)
+	}
+	if !c.shedLocked(c.maxBytes-len(h.data), time.Now()) {
+		return // what's drawn now has the budget
+	}
+	if c.held == nil {
+		c.held = map[key]held{}
+	}
+	h.at = time.Now()
+	c.held[k] = h
+	c.heldBytes += len(h.data)
+	c.bytes += len(h.data)
+}
+
+// unholdLocked lets k's held bytes go.
+func (c *Cache) unholdLocked(k key) {
+	if h, ok := c.held[k]; ok {
+		c.heldBytes -= len(h.data)
+		c.bytes -= len(h.data)
+		delete(c.held, k)
+	}
+}
+
 // evict brings the decoded bytes back under the budget: first what
 // nobody drew in the last animGrace (an animated GIF's encoded bytes
-// before its still, least recently used first), then the animations
-// playing on screen (the largest first; each draws its still until
-// animRetry has passed), and only then, as before, images on screen.
+// before its still, least recently used first), then busy loads' kept
+// bytes (oldest first: their next try downloads them again), then the
+// animations playing on screen (the largest first; each draws its still
+// until animRetry has passed), and only then, as before, images on
+// screen.
 func (c *Cache) evict() {
 	now := time.Now()
 	if c.shedLocked(c.maxBytes, now) {
 		return
 	}
+	for c.bytes > c.maxBytes && len(c.held) > 0 { // busy loads' bytes: downloaded again if need be
+		var old key
+		var at time.Time
+		first := true
+		for hk, hv := range c.held {
+			if first || hv.at.Before(at) {
+				old, at, first = hk, hv.at, false
+			}
+		}
+		c.unholdLocked(old)
+	}
+	// players stop, largest first: the streaming ones (each holds a canvas
+	// and three frames of a large animation), then keeping ones past
+	// their share of the budget. A keeping player is its image's frames,
+	// decoded once (an emoji's 13 frames are 53 KB), and plays on while
+	// stills fill the budget, as Chromium's animations do; a burst of
+	// them (the picker's animated emoji) still can't take the budget.
 	for c.bytes > c.maxBytes && len(c.playing) > 0 {
 		var big *entry
+		kept := 0
 		for e := range c.playing {
-			if big == nil || e.play.n > big.play.n {
+			if p := e.play; p.keep {
+				kept += p.n
+			} else if big == nil || p.n > big.play.n {
 				big = e
 			}
 		}
+		if big == nil && kept > c.maxBytes/keepShare {
+			for e := range c.playing {
+				if big == nil || e.play.n > big.play.n {
+					big = e
+				}
+			}
+		}
+		if big == nil {
+			break
+		}
 		c.releaseLocked(big)
 		big.retry = now.Add(animRetry)
-		c.wakeLocked(big.retry)
+		c.wakeAnimLocked(big.retry)
 	}
 	for c.bytes > c.maxBytes && c.lru.Len() > 1 {
 		c.dropLocked(c.lru.Back())
@@ -641,6 +1125,10 @@ func (c *Cache) putLocked(e *entry) {
 	c.bytes += e.n
 }
 
+// keepShare: keeping players' frames (anim.go) stop for room only past
+// this share of the budget (a quarter).
+const keepShare = 4
+
 // gifShare is the most of the budget animated GIFs' encoded bytes (kept
 // for playing them again) take; past it the least recently used go
 // first, the ones playing last. The rest of the budget is pixels.
@@ -670,7 +1158,8 @@ func (c *Cache) dropGIFLocked(e *entry) {
 	e.gif = nil
 }
 
-// dropLocked removes entry el.
+// dropLocked removes entry el. Its live images (a last frame's ops may
+// still draw them) are left on its still, which those ops hold already.
 func (c *Cache) dropLocked(el *list.Element) {
 	e := el.Value.(*entry)
 	c.releaseLocked(e)
@@ -755,30 +1244,87 @@ func (c *Cache) rawFor(k key) ([]byte, func(), error) {
 	return data, save, err
 }
 
-// loadImage decodes k. A GIF decodes its first frame only (gifstream.go);
-// an animated one also returns its bytes and their index (anim.go).
+// loadImage decodes k. A GIF or an animated WebP decodes its first frame
+// only (gifstream.go, webpanim.go); an animated one also returns its
+// bytes and their index (anim.go). Bytes that don't decode are
+// ErrUndecodable; a decode the decode memory is too full for now is
+// ErrBusy (decmem.go).
+//
+// Everything the decode and its scale allocate is charged to one Budget,
+// given back once the display-size copy (the cache's now) is all that's
+// kept.
 func (c *Cache) loadImage(k key) (paint.ImageOp, image.Point, int, *gifSource, []*image.RGBA, error) {
-	data, save, err := c.rawFor(k)
-	if err != nil {
-		return paint.ImageOp{}, image.Point{}, 0, nil, nil, err
-	}
-	if isGIF(data) {
-		if err := checkSize(data); err != nil {
-			return paint.ImageOp{}, image.Point{}, 0, nil, nil, err
+	op, sz, n, an, px, _, err := c.loadFrom(k, held{})
+	return op, sz, n, an, px, err
+}
+
+// loadFrom is loadImage from h's bytes when a busy try kept them (else
+// fetched as loadImage fetches them), and returns the bytes it decoded
+// for a busy failure to keep.
+func (c *Cache) loadFrom(k key, h held) (paint.ImageOp, image.Point, int, *gifSource, []*image.RGBA, held, error) {
+	data, save := h.data, h.save
+	if data == nil {
+		var err error
+		if data, save, err = c.rawFor(k); err != nil {
+			return paint.ImageOp{}, image.Point{}, 0, nil, nil, held{}, err
 		}
-		ix, err := indexGIF(data)
+	}
+	h = held{data: data, save: save}
+	op, sz, n, an, px, err := c.decodeLoad(k, data, save)
+	return op, sz, n, an, px, h, err
+}
+
+// decodeLoad decodes data for k (loadImage), save writing it to the disk
+// tier once it has decoded.
+func (c *Cache) decodeLoad(k key, data []byte, save func()) (paint.ImageOp, image.Point, int, *gifSource, []*image.RGBA, error) {
+	b := NewBudget()
+	defer b.Release()
+	if slackasset.IsSVG(k.url) {
+		// a bundled SVG (svg.go), drawn at the size asked for; only the
+		// shipped bytes, never ones fetched for that URL
+		if want, _ := slackasset.Get(k.url); !bytes.Equal(data, want) {
+			return paint.ImageOp{}, image.Point{}, 0, nil, nil, undecodable(errUnsupported)
+		}
+		rgba, err := rasterSVG(data, k.size, b)
 		if err != nil {
-			return paint.ImageOp{}, image.Point{}, 0, nil, nil, err
+			return paint.ImageOp{}, image.Point{}, 0, nil, nil, undecodable(err)
+		}
+		return paint.NewImageOp(rgba), rgba.Bounds().Size(), len(rgba.Pix), nil, []*image.RGBA{rgba}, nil
+	}
+	if isAnim(data) {
+		fail := func(err error) (paint.ImageOp, image.Point, int, *gifSource, []*image.RGBA, error) {
+			return paint.ImageOp{}, image.Point{}, 0, nil, nil, undecodable(budgetErr(err))
+		}
+		if err := checkSize(data); err != nil {
+			return fail(err)
+		}
+		ix, err := indexAnim(data, b)
+		if err != nil {
+			return fail(err)
 		}
 		if ix.w*ix.h > bigPixels { // its canvas, as a big image's decode
 			bigSem <- struct{}{}
 			defer func() { <-bigSem }()
 		}
-		d := newGIFDecoder(ix, data)
-		d.compose()
-		still := image.NewRGBA(image.Rectangle{Max: scaledSize(ix.w, ix.h, k.size)})
+		d, err := newGIFDecoder(ix, data, b)
+		if err != nil {
+			return fail(err)
+		}
+		if _, err := d.compose(); err != nil {
+			return fail(err)
+		}
+		if d.werr != nil { // an animated WebP whose first frame doesn't decode
+			return fail(d.werr)
+		}
+		sz := scaledSize(ix.w, ix.h, k.size)
+		if err := b.Charge(rgbaBytes(sz)); err != nil {
+			return fail(err)
+		}
+		still := image.NewRGBA(image.Rectangle{Max: sz})
 		var sc frameScaler
-		sc.scale(still, d.canvas)
+		if err := sc.scale(still, d.canvas, b); err != nil {
+			return fail(err)
+		}
 		save()
 		var an *gifSource
 		if len(ix.frames) > 1 {
@@ -786,21 +1332,23 @@ func (c *Cache) loadImage(k key) (paint.ImageOp, image.Point, int, *gifSource, [
 		}
 		return paint.NewImageOp(still), still.Rect.Size(), len(still.Pix), an, []*image.RGBA{still}, nil
 	}
-	// A big image decodes to its full size and scales through a temporary
-	// buffer as big again (x/image/draw's kernel scaler: 32 bytes per
-	// destination column per source row) before the display-size copy is
-	// all that's kept. Eight of them at once while a channel of screenshots
-	// scrolled by held 150 MB for a moment: at most bigDecodes at a time.
+	// A big image decodes to its full size and scales (a band at a time:
+	// internal/catmullrom) before the display-size copy is all that's kept.
+	// The decode memory bounds what they hold together; at most bigDecodes
+	// at a time bounds the CPU they take.
 	if big := isBig(data); big {
 		bigSem <- struct{}{}
 		defer func() { <-bigSem }()
 	}
-	img, err := Decode(data)
+	img, err := decodeImage(data, MaxPixels, MaxSide, b)
 	if err != nil {
-		return paint.ImageOp{}, image.Point{}, 0, nil, nil, err
+		return paint.ImageOp{}, image.Point{}, 0, nil, nil, undecodable(err)
 	}
 	save() // only bytes that decoded as an image reach the disk tier
-	rgba := Scale(img, k.size)
+	rgba, err := ScaleBudget(img, k.size, b)
+	if err != nil {
+		return paint.ImageOp{}, image.Point{}, 0, nil, nil, undecodable(err)
+	}
 	return paint.NewImageOp(rgba), rgba.Bounds().Size(), len(rgba.Pix), nil, []*image.RGBA{rgba}, nil
 }
 
@@ -815,37 +1363,71 @@ var bigSem = make(chan struct{}, bigDecodes)
 
 // isBig reports whether data's header says it has more than bigPixels.
 func isBig(data []byte) bool {
-	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+	cfg, _, err := decodeConfig(data)
 	return err == nil && cfg.Width*cfg.Height > bigPixels
 }
 
-// MaxPixels bounds the decoded size of one image (width × height), so a
-// tiny file that claims to be 60000×60000 (a decompression bomb) can't
-// allocate gigabytes. MaxSide bounds either dimension.
+// MaxPixels bounds the decoded size of one image (width × height), and
+// MaxSide either dimension: an image past them isn't decoded at all. What
+// a decode may allocate is bounded by its budget (MaxDecode), which a
+// photo of 64 MP may or may not fit in by its format (a 48 MP phone photo,
+// 8064×6048, does), so this bounds the work: a tiny file claiming to be
+// 60000×60000 is refused by its header before anything decodes.
 const (
-	MaxPixels = 40 << 20
+	MaxPixels = 64 << 20
 	MaxSide   = 16384
 )
 
-// ErrTooBig is returned for images over MaxPixels or MaxSide.
+// ErrTooBig is returned for images over MaxPixels or MaxSide, and for one
+// whose decode would need more than MaxDecode (or a WebP picture's budget).
 var ErrTooBig = errors.New("imgcache: image dimensions too large")
 
-// Decode decodes data after checking its header's dimensions.
+// Decode is the one safe entry point for decoding untrusted image bytes:
+// the cache's own loads, and every UI path that decodes bytes some
+// workspace member or a picked file could control (Copy Image, custom
+// emoji, profile photos, email icons). It decodes PNG, JPEG, GIF (its
+// first frame), WebP and BMP only, each through a vendored decoder that
+// charges every allocation to a Budget from the decode memory before
+// making it (decmem.go): it rejects a header claiming more than MaxPixels
+// or MaxSide before decoding, a decode that would need more than MaxDecode
+// fails with ErrTooBig before the allocation that doesn't fit, and one the
+// decode memory is too full for now is tried again for a while
+// (WithBudget) before failing with ErrBusy. A bomb comes back as an error,
+// so a caller on an overlay or popup with no recover shows a failure
+// instead of crashing the app. The image is the caller's once it returns
+// (no longer charged); one that works with it after (scales, converts)
+// uses DecodeBudget under its own WithBudget instead.
 func Decode(data []byte) (image.Image, error) {
-	if err := checkSize(data); err != nil {
-		return nil, err
-	}
-	img, _, err := image.Decode(bytes.NewReader(data))
-	return img, err
+	return DecodeWithin(data, MaxPixels, MaxSide)
 }
 
-// checkSize reads the header's dimensions only.
-func checkSize(data []byte) error {
-	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+// DecodeWithin is Decode with the caller's own decoded-size limits, for a
+// surface that legitimately decodes larger images than the cache's
+// MaxPixels (the composer's attachment thumbnails, at attMaxPixels). The
+// decode is still bounded by MaxDecode, and a WebP's by its picture's
+// budget too.
+func DecodeWithin(data []byte, maxPixels, maxSide int) (image.Image, error) {
+	var img image.Image
+	err := WithBudget(context.Background(), func(b *Budget) error {
+		var err error
+		img, err = decodeImage(data, maxPixels, maxSide, b)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return img, nil
+}
+
+// checkSize reads the header's dimensions only, against the cache budget.
+func checkSize(data []byte) error { return checkSizeWithin(data, MaxPixels, MaxSide) }
+
+func checkSizeWithin(data []byte, maxPixels, maxSide int) error {
+	cfg, _, err := decodeConfig(data)
 	if err != nil {
 		return err
 	}
-	if cfg.Width <= 0 || cfg.Height <= 0 || cfg.Width > MaxSide || cfg.Height > MaxSide || cfg.Width*cfg.Height > MaxPixels {
+	if cfg.Width <= 0 || cfg.Height <= 0 || cfg.Width > maxSide || cfg.Height > maxSide || cfg.Width*cfg.Height > maxPixels {
 		return ErrTooBig
 	}
 	return nil
@@ -861,6 +1443,9 @@ func (c *Cache) raw(u string) ([]byte, func(), error) {
 			return b, nop, nil
 		}
 		return nil, nop, errors.New("imgcache: local image gone")
+	}
+	if b, ok := slackasset.Get(u); ok { // one of Slack's bundled assets: shipped
+		return b, nop, nil
 	}
 	c.mu.Lock()
 	dir := c.dir
@@ -930,37 +1515,12 @@ func (c *Cache) raw(u string) ([]byte, func(), error) {
 }
 
 // Scale converts img to *image.RGBA (premultiplied, what Gio uploads
-// fastest) with its larger side at most max px (0 = 2048 cap).
+// fastest) with its larger side at most max px (0 = 2048 cap): the pixels
+// x/image/draw's CatmullRom.Scale draws, a band at a time (ScaleBudget,
+// uncharged: for images already decoded and small, as derive's).
 func Scale(img image.Image, max int) *image.RGBA {
-	if max <= 0 {
-		max = 2048
-	}
-	b := img.Bounds()
-	w, h := b.Dx(), b.Dy()
-	if w > max || h > max {
-		if w >= h {
-			h = max * h / w
-			w = max
-		} else {
-			w = max * w / h
-			h = max
-		}
-		if w < 1 {
-			w = 1
-		}
-		if h < 1 {
-			h = 1
-		}
-		dst := image.NewRGBA(image.Rect(0, 0, w, h))
-		xdraw.CatmullRom.Scale(dst, dst.Bounds(), img, b, xdraw.Src, nil)
-		return dst
-	}
-	if r, ok := img.(*image.RGBA); ok && b.Min == (image.Point{}) {
-		return r
-	}
-	dst := image.NewRGBA(image.Rect(0, 0, w, h))
-	draw.Draw(dst, dst.Bounds(), img, b.Min, draw.Src)
-	return dst
+	r, _ := ScaleBudget(img, max, budget.Unlimited()) // an unlimited budget refuses nothing
+	return r
 }
 
 // DiskOK reports whether an image URL may be persisted: avatars and emoji

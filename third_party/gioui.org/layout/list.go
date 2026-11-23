@@ -27,6 +27,11 @@ type List struct {
 	// false draws its content with the last item at the bottom of the list
 	// area.
 	ScrollToEnd bool
+	// StartAligned lays out content shorter than the list from the list's
+	// start even when ScrollToEnd is set, where it would be end aligned.
+	// The list still stays at the far end once the content outgrows it
+	// (Clack patch 45).
+	StartAligned bool
 	// Alignment is the cross axis alignment of list elements.
 	Alignment Alignment
 	// ScrollAnyAxis allows any scroll axis to scroll the list, not just the main axis.
@@ -146,6 +151,19 @@ func (l *List) scrollToEnd() bool {
 // Dragging reports whether the List is being dragged.
 func (l *List) Dragging() bool {
 	return l.scroll.State() == gesture.StateDragging
+}
+
+// ScrollDelta is the distance, in pixels, the list's own scrolling (a
+// wheel, a drag, a fling) moved it in the last Layout: 0 when only a
+// change to Position or to its children's sizes moved it. Clack patch 50.
+func (l *List) ScrollDelta() int {
+	return l.scrollDelta
+}
+
+// StopScroll ends the list's own running scroll (a wheel notch's curve,
+// a fling), as a programmatic scroll does a browser's. Clack patch 50.
+func (l *List) StopScroll() {
+	l.scroll.Stop()
 }
 
 func (l *List) update(gtx Context) {
@@ -310,8 +328,8 @@ func (l *List) layout(ops *op.Ops, macro op.MacroOp) Dimensions {
 	}
 	l.Position.Count = len(children)
 	l.Position.OffsetLast = mainMax - size
-	// ScrollToEnd lists are end aligned.
-	if space := l.Position.OffsetLast; l.ScrollToEnd && space > 0 {
+	// ScrollToEnd lists are end aligned (unless StartAligned).
+	if space := l.Position.OffsetLast; l.ScrollToEnd && !l.StartAligned && space > 0 {
 		l.Position.Offset -= space
 	}
 	pos := -l.Position.Offset

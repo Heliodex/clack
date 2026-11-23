@@ -49,6 +49,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/some-du6e/clack/internal/logtag"
 	"github.com/some-du6e/clack/internal/slack"
 )
 
@@ -98,7 +99,7 @@ type pinsTabChan struct {
 	items []PinsTabItem
 }
 
-var pinsTabs sync.Map // *App -> *pinsTabState
+var pinsTabs = newPerApp() // *App -> *pinsTabState
 
 func (a *App) pinsTab() *pinsTabState {
 	v, _ := pinsTabs.LoadOrStore(a, &pinsTabState{chs: map[string]*pinsTabChan{}, seen: map[string]bool{}})
@@ -149,9 +150,12 @@ func (a *App) liveMessage(ch, ts string) (*Message, bool) {
 }
 
 // slowConnections is the socket store's slowConnectionCount.
-var slowConnections sync.Map // *App → *atomic.Int64
+var slowConnections = newPerApp() // *App → *atomic.Int64
 
 func (a *App) slowConnectionCount() *atomic.Int64 {
+	if v, ok := slowConnections.Load(a); ok { // read every frame (the + button's gate): no allocation
+		return v.(*atomic.Int64)
+	}
 	v, _ := slowConnections.LoadOrStore(a, new(atomic.Int64))
 	return v.(*atomic.Int64)
 }
@@ -159,12 +163,14 @@ func (a *App) slowConnectionCount() *atomic.Int64 {
 // socketConnected is the socket store's connected(isFast): a slow
 // connect bumps slowConnectionCount. The open Pins tabs read again (the
 // store update reruns their selectors), and so refetch when the count
-// moved.
+// moved; so do the app cards (app_card.go).
 func (a *App) socketConnected(fast bool) {
 	if fast {
 		return
 	}
 	a.slowConnectionCount().Add(1)
+	a.appCardsReconnected()
+	a.memberDNDReconnected() // dnd_members.go
 	v, ok := pinsTabs.Load(a)
 	if !ok {
 		return
@@ -251,7 +257,7 @@ func (a *App) fetchPinsTab(ch string) {
 		st.chs[ch] = c
 	}
 	if err != nil {
-		log.Printf("pins tab %s: pins.list: %v", ch, err)
+		log.Printf("pins tab %s: pins.list: %v", logtag.ID(ch), err)
 		c.state = pinsNotLoaded
 		delete(st.seen, ch) // the next read tries again
 		st.mu.Unlock()
@@ -299,6 +305,53 @@ func (a *App) pinsTabEvent(ch string, added bool, raw pinsListItem) {
 	}
 	st.mu.Unlock()
 	a.emit(Event{Type: "pins_tab", Channel: ch})
+}
+
+// pinsTabPrepend is prependPinnedItem for the viewer's own pin: the item
+// goes first unless it's there, while ch's pins are loaded or loading
+// (Slack's list exists from the first read; Clack's first read fetches).
+func (a *App) pinsTabPrepend(ch string, it PinsTabItem) {
+	st := a.pinsTab()
+	st.mu.Lock()
+	c := st.chs[ch]
+	if c == nil || c.state == pinsNotLoaded || slices.ContainsFunc(c.items, it.same) {
+		st.mu.Unlock()
+		return
+	}
+	c.items = append([]PinsTabItem{it}, c.items...)
+	st.mu.Unlock()
+	a.emit(Event{Type: "pins_tab", Channel: ch})
+}
+
+// pinsTabRemove is removePinnedItem: it leaves ch's rows.
+func (a *App) pinsTabRemove(ch string, it PinsTabItem) {
+	st := a.pinsTab()
+	st.mu.Lock()
+	c := st.chs[ch]
+	i := -1
+	if c != nil {
+		i = slices.IndexFunc(c.items, it.same)
+	}
+	if i < 0 {
+		st.mu.Unlock()
+		return
+	}
+	c.items = slices.Delete(slices.Clone(c.items), i, i+1)
+	st.mu.Unlock()
+	a.emit(Event{Type: "pins_tab", Channel: ch})
+}
+
+// pinsTabRow is ch's row for it, when its pins hold one.
+func (a *App) pinsTabRow(ch string, it PinsTabItem) (PinsTabItem, bool) {
+	st := a.pinsTab()
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if c := st.chs[ch]; c != nil {
+		if i := slices.IndexFunc(c.items, it.same); i >= 0 {
+			return c.items[i], true
+		}
+	}
+	return PinsTabItem{}, false
 }
 
 // pinsTabSee keeps the rows' message copies current from the events

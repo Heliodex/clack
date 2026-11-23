@@ -25,6 +25,7 @@ import (
 
 	"github.com/some-du6e/clack/internal/core"
 	"github.com/some-du6e/clack/internal/i18n"
+	"github.com/some-du6e/clack/internal/richtext"
 	"github.com/some-du6e/clack/internal/ui/composer"
 
 	"github.com/some-du6e/clack/internal/ui/icons"
@@ -70,9 +71,11 @@ type ThreadView struct {
 }
 
 // ContentHeight is the height the pane needs to show the whole thread (header,
-// parent, divider and replies) as of the last frame, or 0 when the thread is
-// taller than the pane. Slack top-aligns a short thread with its reply
-// composer right under the last reply; the ui root places the composer with it.
+// parent, divider and replies) as of its last layout, or 0 when the thread
+// is taller than the pane. Slack top-aligns a short thread with its reply
+// composer right under the last reply: the list draws a short thread from
+// its top (Gio patch 45), and the ui root reads this right after laying it
+// out to put the composer under it in the same frame.
 func (v *ThreadView) ContentHeight() int {
 	if v.s.contentH <= 0 || len(v.s.items) == 0 {
 		return 0
@@ -84,6 +87,15 @@ func (v *ThreadView) ContentHeight() int {
 // the root's) bottom edge as of the last frame, false when it wasn't on
 // screen.
 func (v *ThreadView) NewestRowBottom() (int, bool) { return v.s.newestBottom() }
+
+// Prepare brings the pane's copy of the thread up to date for the frame
+// gtx lays out, before the ui root reads it to decide on the reply box
+// (HidesComposer). The list then draws that same copy (it doesn't sync
+// again in the frame), so the frame that draws the first replies draws
+// the box under them: the replies' load wakes the window once, and a
+// decision from the last frame's copy left the box out until some other
+// input drew another frame.
+func (v *ThreadView) Prepare(gtx layout.Context) { v.s.prepare(v.h, gtx.Now) }
 
 // NewThreadView returns the thread pane for the thread rooted at ts.
 func NewThreadView(h Host, ch, ts string) *ThreadView { return NewThreadViewIn(h, ch, ts, "") }
@@ -99,16 +111,25 @@ func NewThreadViewIn(h Host, ch, ts, pane string) *ThreadView {
 }
 
 // Reopen is the pane showing the thread again (Slack mounts a new
-// ThreadsFlexpane): the "New" marker is decided afresh from the
-// subscription's lastRead, and the reading position is kept, as Slack
-// restores the scrollmark it saved on close (maybeSaveThreadScrollmarks),
-// except in a public channel the viewer isn't in, where it saves none
-// and the pane opens at its start position again.
+// ThreadsFlexpane, or a new thread list after a thread switch): the "New"
+// marker is decided afresh from the subscription's lastRead, and the
+// reading position is kept, as Slack restores the scrollmark it saved on
+// close (maybeSaveThreadScrollmarks), except in a public channel the
+// viewer isn't in, where it saves none and the pane opens at its start
+// position again, as it does after a thread switch, which saves none
+// (CloseThread; the start picked again, repickThread). The thread leaves
+// ThreadsMarkedUnread, as the pane's componentDidMount and a thread switch
+// (componentDidUpdate) call removeThreadFromManuallyMarkedUnreadArray:
+// showing it is reading it.
 func (v *ThreadView) Reopen() {
-	v.closeFind(false) // ThreadSearchBar unmounts with the pane
+	v.s.thrOpening = true // a new pane: a jump starts it at getThreadStartPosition's message
+	v.closeFind(false)    // ThreadSearchBar unmounts with the pane
 	v.s.thr = threadRead{}
-	v.s.snap.rev = 0 // rebuild the rows with the new marker
+	v.s.rootHandedOn = false   // opened with a reply's ts again: hand on again (ReplyRootRedirector)
+	v.s.snap.rev = 0           // rebuild the rows with the new marker
+	v.s.hb.repickThread(v.s.m) // a list mounting after a thread switch: getThreadStartTs again
 	if app := v.h.Core(); app != nil {
+		app.ForgetThreadMarkedUnread(v.ch, v.ts)
 		if cv, ok := app.Conv(v.ch); ok && cv.Kind == "channel" && cv.Preview {
 			v.s.positioned = false
 		}
@@ -127,6 +148,10 @@ func (v *ThreadView) Esc() bool {
 	v.h.Invalidate()
 	return true
 }
+
+// PaneID is the list's slackc pane: the thread's composer draws its
+// plugin components in it too (composer.LayoutIn).
+func (v *ThreadView) PaneID() string { return v.s.paneID }
 
 // Channel and TS identify the thread.
 func (v *ThreadView) Channel() string { return v.ch }
@@ -147,8 +172,10 @@ func (v *ThreadView) EditComposer() *composer.Composer { return v.s.editComposer
 // Typing returns the "X is typing" text for this thread.
 func (v *ThreadView) Typing() string { return typingText(v.s.snap.typing) }
 
-// ScrollToBottom jumps to the newest reply.
-func (v *ThreadView) ScrollToBottom() { v.s.list.Position = layout.Position{} }
+// ScrollToBottom jumps to the newest reply drawn: the list's end (toEnd:
+// Position{} is the top of a slice short of the thread's end, which
+// doesn't keep to its end).
+func (v *ThreadView) ScrollToBottom() { v.s.toEnd() }
 
 // JumpToOwnSend is the pane's reply box sending the viewer's reply, with
 // or without files (composer.OnSend): the list goes to its end, and its
@@ -166,9 +193,10 @@ func (v *ThreadView) ScrollToBottom() { v.s.list.Position = layout.Position{} }
 // list is, so the send puts the list where Slack's is when you send.
 func (v *ThreadView) JumpToOwnSend(cid string, files bool) {
 	s := v.s
-	s.list.Position = layout.Position{}
+	s.toEnd() // the list's end, kept to or not (a slice short of the thread's end)
 	s.positioned = true
 	s.pendingJump = "" // a JumpTo still waiting for its reply
+	s.place = jumpPlace{}
 	v.h.Invalidate()
 }
 
@@ -176,30 +204,53 @@ func (v *ThreadView) JumpToOwnSend(cid string, files bool) {
 // pane opens at a message (client-boot 6IaZ over CSo3 GC, from toThread's
 // replyTs and uiState.highlightTs): the list starts at ts (startTs) and,
 // with flash, ts is highlighted (highlightTs) the way a permalink's
-// message is (ChannelView.Highlight). The thread loads whole
-// (conversations.replies, every page), so a ts it doesn't hold is
-// dropped once it's in, and the pane keeps its own start position.
+// message is (ChannelView.Highlight). The pane draws the slice ts falls
+// in (thread_load.go): one that doesn't hold it gives way to the store's
+// slice at ts, read around ts (two pages of 28) when the store has none,
+// and a ts the thread doesn't have is dropped once that is in. Where the
+// list starts is the thread list's (ThreadsFlexpane, boot-shared 4M8N;
+// its BaseMessageList Twp/), once that slice is in (placeThreadJump waits
+// for it):
+//   - a pane that just opened starts at getThreadStartPosition's message,
+//     100px under the top or at the top (placeThreadJump, threadStart),
+//     and with no highlight its saved place wins (the scrollmark);
+//   - a pane already showing the thread scrolls the reply's top to the
+//     list's top unless that's on screen already (a new highlightKey:
+//     scrollToKey(startTs, {lazy: true}), the anchor line at the top).
+//
+// Nothing holds the reply there after (the anchor drops at the scroll's
+// echo).
 func (v *ThreadView) JumpTo(ts string, flash bool) {
 	s := v.s
-	s.highlight = ""
-	if flash {
-		s.highlight, s.highlightAt = ts, time.Now()
+	opening := s.thrOpening || !s.positioned
+	s.thrOpening = false
+	if !flash && opening && (s.positioned && s.laidOut || s.thrMark.key != "") {
+		s.highlight = ""
+		return // no highlight: the reopened pane's own place (getThreadStartPosition's scrollmark)
 	}
-	s.pendingJump = ts
-	for i, it := range s.items {
-		if it.kind == itMsg && it.idx < len(s.snap.msgs) && s.snap.msgs[it.idx].m.TS == ts {
-			// there now; the next sync places it again after any rebuild
-			s.list.Position = layout.Position{BeforeEnd: true, First: max(0, i-2)}
-			s.positioned = true
-			break
-		}
+	// the slice ts falls in first: placeThreadJump places and flashes the
+	// reply once it is loaded
+	if s.hb.jumpThread(s.m, ts) {
+		s.snap.rev = 0 // the slice at ts: rebuild from it
 	}
+	flashing := flash && s.highlight == ts && time.Since(s.highlightAt) < highlightFor && s.mounted()
+	switch {
+	case flashing: // a repeat jump: the running flash goes on (rFp4)
+	case flash:
+		s.highlight, s.highlightAt, s.hlSeen = ts, time.Now(), false
+	default:
+		s.highlight = ""
+	}
+	s.hlRestart = !flashing
+	s.pendingJump, s.jumpLazy = ts, !opening
+	s.place = jumpPlace{}
+	s.positioned = true // the jump places the list, not the thread's start position
 }
 
 // Highlighted is the message the pane highlights now (JumpTo's flash),
 // "" for none.
 func (v *ThreadView) Highlighted() string {
-	if s := v.s; s.highlight != "" && time.Since(s.highlightAt) < 4*time.Second {
+	if s := v.s; s.highlight != "" && time.Since(s.highlightAt) < highlightFor {
 		return s.highlight
 	}
 	return ""
@@ -210,6 +261,7 @@ func (v *ThreadView) JumpPending() string { return v.s.pendingJump }
 
 // Layout draws the header and the list: Slack's Serialized(ThreadsFlexpane).
 func (v *ThreadView) Layout(gtx layout.Context) layout.Dimensions {
+	defer slackc.EndPane(slackc.Pane(v.s.paneID))
 	return slackc.Component(gtx, "Serialized(ThreadsFlexpane)", v, (*ThreadView).flexpaneProps, (*ThreadView).layoutPane)
 }
 
@@ -308,7 +360,8 @@ type PrimaryHost interface {
 // Slack's threads Header (client-boot-shared NCqL). Channels draw
 // InlineChannelEntity (an icon from getChannelIconType, then the name,
 // " (archived)" after an archived one's); a DM the partner's name; a
-// group DM "Direct message with N others" with the members in a tooltip.
+// group DM "Direct message with N others" with the members in a tooltip;
+// a canvas's file channel the canvas (thread_file.go).
 type HeaderSubtitle struct {
 	Icon string // Slack icon name, "" for DMs
 	Text string
@@ -316,6 +369,13 @@ type HeaderSubtitle struct {
 	// Link: the name links to the root's permalink (once the root is
 	// loaded, like Slack's permalink prop).
 	Link bool
+	// File: a canvas's SmallFileEntity, Icon in its 20px box or the image
+	// Emoji instead, then the title Spans (Text their plain text) in bold.
+	// Without File, Spans is another file channel's name with its emoji
+	// (ChannelName's FormatText), drawn in place of Text.
+	File  bool
+	Emoji string
+	Spans []richtext.Span
 }
 
 // subtitle is what the header shows after "Thread", false for nothing:
@@ -334,7 +394,7 @@ type HeaderSubtitle struct {
 // be, is looked up through core (ResolveConv) and an unknown DM partner
 // with users.info.
 func (v *ThreadView) subtitle() (HeaderSubtitle, bool) {
-	if ph, ok := v.h.(PrimaryHost); ok && ph.PrimaryChannel() == v.ch {
+	if v.besideCanvas() { // hideChannelName (thread_file.go)
 		return HeaderSubtitle{}, false
 	}
 	app := v.h.Core()
@@ -374,6 +434,12 @@ func (v *ThreadView) subtitle() (HeaderSubtitle, bool) {
 		n, names := mpimMembers(app, cv) // members it misses are asked for
 		return HeaderSubtitle{Text: "Direct message with " + strconv.Itoa(n-1) + " others", Tip: names}, true
 	}
+	// a canvas's or list's conversation names its file (thread_file.go)
+	if cv.File {
+		if sub, ok := v.fileSubtitle(app, cv); ok {
+			return sub, true
+		}
+	}
 	// getChannelIconType: archived (or frozen) first, then private, else
 	// the channel hash; InlineChannelIcon asks for the filled variant for a
 	// private channel. Shared channels draw the same icons. ChannelName
@@ -398,8 +464,18 @@ func (v *ThreadView) subtitleWidth(gtx layout.Context, th *theme.Theme) int {
 	if !ok {
 		return 0
 	}
+	if sub.File {
+		return v.fileEntityWidth(gtx, th, sub)
+	}
 	ns := textStyle{size: 13, lineH: 18}
 	w := measure(gtx, th, ns, sub.Text).X
+	if len(sub.Spans) > 0 { // a file channel's name with its emoji (thread_file.go)
+		m := op.Record(gtx.Ops)
+		g := gtx
+		g.Constraints = layout.Constraints{Max: image.Pt(1<<20, gtx.Sp(unit.Sp(ns.lineH)))}
+		w = v.fileTitle(g, th, sub.Spans, ns).Size.X
+		m.Stop()
+	}
 	if sub.Icon != "" {
 		w += gtx.Sp(unit.Sp(ns.size)) + dp(gtx, 2)
 	}
@@ -456,12 +532,50 @@ func mpimMembers(app *core.App, cv core.Conv) (int, string) {
 	return n, strings.Join(names, ", ")
 }
 
-// root is the thread's parent message, once loaded.
+// replyRoot is the thread a thread list's root is a reply in, once its
+// messages loaded: its ts was a reply's (Slack's isReply, a thread_ts
+// that isn't its own ts). "" for a real root, or before the load.
+func (s *listState) replyRoot() string {
+	if !s.thread {
+		return ""
+	}
+	for i := range s.snap.msgs {
+		if m := &s.snap.msgs[i].m; m.TS == s.ts {
+			if m.ThreadTS != "" && m.ThreadTS != m.TS {
+				return m.ThreadTS
+			}
+			return ""
+		}
+	}
+	return ""
+}
+
+// RootLoaded reports whether the pane's root message has loaded, and
+// whether it turned out to be a reply (the pane was opened with a reply's
+// ts and hands on to its thread): the ui root records the thread's visit
+// only for a root.
+func (v *ThreadView) RootLoaded() (isReply, loaded bool) {
+	m, ok := v.root()
+	if !ok {
+		return false, false
+	}
+	return m.ThreadTS != "" && m.ThreadTS != m.TS, true
+}
+
+// root is the thread's parent message, once loaded: the slice's row when
+// the slice holds it, else the store's copy (rootMsg) wherever the slice
+// is, as Slack's thread Header reads getMessage(channel, threadTs) (O+gL
+// mapStateToProps) for its permalink. A thread opened at a reply far from
+// its root (a mention deep in a huge thread) never has the root in its
+// slice, and its header's name was no link.
 func (v *ThreadView) root() (core.Message, bool) {
 	for i := range v.s.snap.msgs {
 		if m := &v.s.snap.msgs[i].m; m.TS == v.ts {
 			return *m, true
 		}
+	}
+	if r, ok := v.s.threadRoot(); ok {
+		return *r, true
 	}
 	return core.Message{}, false
 }
@@ -686,14 +800,28 @@ func (v *ThreadView) layoutSubtitle(gtx layout.Context, th *theme.Theme, c *colo
 	if !ok || maxX <= x {
 		return
 	}
+	// a known file's permalink comes from the file, not the root
+	// (O+gL: getFilePermalink with focus_thread_ts)
+	link = link || sub.File || sub.Icon == "lists"
 	if link && v.nameBtn.Clicked(gtx) {
 		v.h.Navigate("c/" + v.ch + "/m/" + v.ts)
 	}
 	ns := textStyle{size: 13, col: c.Text2, lineH: 18}
+	if sub.File { // SmallFileEntity's 20px line
+		ns.lineH = 20
+	}
 	top := bl - cssBaseline(gtx, ns.size, ns.lineH)
 	d := at(gtx, x, top, func(gtx layout.Context) layout.Dimensions {
 		gtx.Constraints = layout.Constraints{Max: image.Pt(maxX-x, gtx.Sp(unit.Sp(ns.lineH)))}
 		w := func(gtx layout.Context) layout.Dimensions {
+			if sub.File {
+				d := v.layoutFileEntity(gtx, th, sub, ns.col)
+				if link {
+					defer clip.Rect{Max: d.Size}.Push(gtx.Ops).Pop()
+					pointer.CursorPointer.Add(gtx.Ops)
+				}
+				return d
+			}
 			// a channel is Slack's InlineChannelEntity (className
 			// p-threads_flexpane__header_channel_name, truncate): its icon
 			// and name are the elements plugins' rules see (StreamerMode
@@ -719,6 +847,9 @@ func (v *ThreadView) layoutSubtitle(gtx layout.Context, th *theme.Theme, c *colo
 			g.Constraints.Max.X = max(0, gtx.Constraints.Max.X-ix)
 			td := at(g, ix, 0, func(gtx layout.Context) layout.Dimensions {
 				name := func(gtx layout.Context) layout.Dimensions {
+					if len(sub.Spans) > 0 { // ChannelName formats a file channel's emoji (16px)
+						return v.fileTitle(gtx, th, sub.Spans, ns)
+					}
 					return lineBox(gtx, ns, func(gtx layout.Context) layout.Dimensions { return label(gtx, th, ns, sub.Text) })
 				}
 				if nst.Active() {
@@ -863,13 +994,21 @@ func (s *listState) threadLoading() bool {
 //     initializing = isEmpty(timestamps) and fetchReplies clears it, so a
 //     loading thread has no reply box;
 //   - with timestamps, until reachedEnd or prevReachedEnd: the
-//     "loading-end" row takes its place. Clack fetches every page at once,
-//     and a model stays loaded once it was (both ends reached);
+//     "loading-end" row takes its place (a slice short of the thread's
+//     end: thread_load.go); a pane that was at the end when a slow
+//     connect made it stale keeps the box until its read past the old end
+//     lands (endGap: list.go build);
 //   - ThreadsError or LargeOfflineIndicator replaces the whole pane.
 //
 // Signed out, the list's sign-in prompt keeps the old composer.
 func (v *ThreadView) HidesComposer() bool {
 	s := v.s
+	if s.replyRoot() != "" {
+		return true // a reply as the root: loading until the Host moves on (layoutList)
+	}
+	if s.thread && s.snap.loaded && len(s.snap.msgs) > 0 && !s.snap.th.reachedEnd && !s.snap.th.prevReachedEnd && !s.snap.th.endGap {
+		return true // the "loading-end" row in its place
+	}
 	if !s.thread || s.snap.loaded {
 		return false
 	}

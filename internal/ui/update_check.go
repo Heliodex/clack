@@ -47,6 +47,12 @@ type updateSched struct {
 	Limited time.Time // GitHub's rate limit: no request before this
 	retry   time.Time // a failed check: no automatic retry before this
 	fails   int
+	// soon: a newer release's files were still uploading
+	// (ErrUpdatePending), so a check is due at soon whatever Last says;
+	// pending counts those answers in a row (the wait doubles, like
+	// fails', in case a release stays half uploaded)
+	soon    time.Time
+	pending int
 	// found: the last check found a newer release this build isn't
 	// (Options' UpdateFound), so the launch check runs within the hour
 	found bool
@@ -72,6 +78,9 @@ func (s *updateSched) due(now time.Time) bool {
 	if now.Before(s.retry) {
 		return false
 	}
+	if !s.soon.IsZero() && !now.Before(s.soon) {
+		return true
+	}
 	if s.Last.IsZero() {
 		return true
 	}
@@ -96,6 +105,13 @@ func (s *updateSched) record(now time.Time, err error) {
 	switch {
 	case err == nil:
 		s.Last, s.Limited, s.retry, s.fails = now, time.Time{}, time.Time{}, 0
+		s.soon, s.pending = time.Time{}, 0
+	case errors.Is(err, ErrUpdatePending):
+		// GitHub answered, but the release isn't ready: again in 5,
+		// 10, 20… minutes (not the hour a clean answer waits)
+		s.pending = min(s.pending+1, 8)
+		s.soon = now.Add(min(updateEvery, updateRetry<<(s.pending-1)))
+		s.retry = s.soon
 	case errors.As(err, &rl):
 		s.Limited = rl.RetryAt().Round(0)
 		if s.Limited.Before(now.Add(time.Minute)) {
@@ -239,7 +255,11 @@ type updateCheckState struct {
 	notify   bool   // a menu asked: answer in a message box
 	upToDate bool   // the last answer: nothing newer
 	err      string // the last manual check failed: why, in plain words
-	at       time.Time
+	// pending: the last manual check found a newer release (pendingTag)
+	// whose files are still uploading
+	pending    bool
+	pendingTag string
+	at         time.Time
 }
 
 // updateChecked takes a check's result (UI goroutine).
@@ -265,16 +285,26 @@ func (a *App) updateChecked(r updateResult) {
 		a.savePrefs()
 	}
 	switch {
+	case errors.Is(r.err, ErrUpdatePending):
+		if !r.manual {
+			break // automatic: a normal race with the release; the loop checks again soon
+		}
+		c.err, c.upToDate, c.at = "", false, r.at
+		c.pending, c.pendingTag = true, r.info.Tag
+		if notify {
+			a.updateMessageBox(updRowOnTheWay, updatePendingText(c.pendingTag))
+		}
 	case r.err != nil:
 		if !r.manual {
 			break // automatic: logged; Preferences keeps the last answer
 		}
+		c.pending = false
 		c.err = updateErrText(r.err, r.at)
 		if notify { // Slack's yR
 			a.updateMessageBox("Couldn’t update "+AppName, c.err)
 		}
 	case r.ok:
-		c.err, c.upToDate, c.at = "", false, r.at
+		c.err, c.upToDate, c.pending, c.at = "", false, false, r.at
 		a.updateFound(r.info, r.manual)
 		if notify && a.update.phase == updAvailable {
 			// Slack's manual check downloads what it finds; Clack's
@@ -288,7 +318,7 @@ func (a *App) updateChecked(r updateResult) {
 			}
 		}
 	default:
-		c.err, c.upToDate, c.at = "", true, r.at
+		c.err, c.upToDate, c.pending, c.at = "", true, false, r.at
 		if notify { // Slack's yI
 			a.updateMessageBox("You’re all good", "You’ve got the latest version of "+AppName+"; thanks for staying on the ball.")
 		}
@@ -323,6 +353,16 @@ func updateErrText(err error, now time.Time) string {
 		return "Couldn’t reach GitHub. Check your internet connection and try again."
 	}
 	return "Couldn’t check for updates: " + err.Error()
+}
+
+// updatePendingText is a manual check's answer when the newer release is
+// still uploading. tag is "v0.1.0-alpha.83", or "" when unknown.
+func updatePendingText(tag string) string {
+	what := "A new version of " + AppName
+	if tag != "" {
+		what = AppName + " " + tag
+	}
+	return what + " is still being published. Try again in a minute."
 }
 
 // waitText is a wait in minutes ("1 minute", "12 minutes", "2 hours").
@@ -381,6 +421,9 @@ const (
 	updRowTry     = "Try Again"
 	updRowCancel  = "Cancel"
 	updRowGet     = "Download"
+	// a manual check's answer while a newer release is still uploading
+	// (Clack's own: Slack's updater never sees a half-published release)
+	updRowOnTheWay = "A new version is on the way"
 )
 
 // updateStatusAt is the row's state at now (UI goroutine).
@@ -415,6 +458,8 @@ func (a *App) updateStatusAt(now time.Time) updateStatus {
 	switch {
 	case c.checking:
 		st.title = updMenuChecking
+	case c.pending:
+		st.title, st.desc = updRowOnTheWay, updatePendingText(c.pendingTag)
 	case c.err != "":
 		st.title, st.desc = updRowFailed, c.err
 	case c.upToDate:

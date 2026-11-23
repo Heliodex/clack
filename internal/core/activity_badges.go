@@ -7,7 +7,10 @@ package core
 // and badge_counts_updated brings new ones (zuQH
 // handleBadgeCountsUpdatedRTMEvent). The tabs read them (cR).
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 func (a *App) setActivityBadges(m map[string]int) {
 	if m == nil {
@@ -19,22 +22,101 @@ func (a *App) setActivityBadges(m map[string]int) {
 	}
 	a.mu.Lock()
 	a.actBadges = cp
+	a.actBadgesAt = a.S.NextSeq()
 	a.mu.Unlock()
 }
 
-// onActivityBadges takes badge_counts_updated's activity_v2. Under
-// activity_inbox Slack applies it as it is and stops there (render 37DU
-// handleBadgeCountsUpdatedRTMEvent: updateActivityV2BadgeCounts, no
-// client.counts), so the rail's badge moves with the event; the UI hears
+// setActivityBadgesSince installs a client.counts answer's activity_v2
+// fetched at the store journal's position since, unless the badges
+// changed after since (items marked read meanwhile, a
+// badge_counts_updated): those are newer, so they stay. It reports
+// whether it installed them.
+func (a *App) setActivityBadgesSince(m map[string]int, since uint64) bool {
+	if m == nil {
+		return false
+	}
+	a.mu.Lock()
+	newer := a.actBadgesAt > since
+	a.mu.Unlock()
+	if newer {
+		return false
+	}
+	cp := make(map[string]int, len(m))
+	for k, v := range m {
+		cp[k] = v
+	}
+	a.mu.Lock()
+	if a.actBadgesAt > since { // changed while this copied
+		a.mu.Unlock()
+		return false
+	}
+	a.actBadges = cp
+	a.mu.Unlock()
+	return true
+}
+
+// ActivityBadgesZero is the Name of the "activity_badges" event of a
+// badge_counts_updated whose activity_v2 sums to 0: Activity marks its
+// unread rows read, locally.
+const ActivityBadgesZero = "zero"
+
+// onActivityBadges takes badge_counts_updated (boot-render VxbD
+// handleBadgeCountsUpdatedRTMEvent). Under activity_inbox Slack applies
+// its activity_v2 as it is (updateActivityV2BadgeCounts, no
+// client.counts), so the rail's badge moves with the event, and when the
+// counts sum to 0 (activity_v2 absent sums to 0 too: `e.activity_v2 ||
+// {}`) it marks every unread row of the root list read, locally (Japw m$
+// with isLocalOnlyUpdate: no activity.markRead, and a row whose message
+// the store doesn't hold stays): the event says so (ActivityBadgesZero),
+// and Activity marks its rows. Without the inbox it reads the event's
+// counts and alerts instead (classic_badges.go onClassicBadges), and marks
+// the All list's unread rows read the same way when the event carries at
+// least one count or alert and every one is 0 (`s.length>0 &&
+// s.every(e=>0===e)` over counts' and alerts' values). The UI hears
 // "activity_badges".
 func (a *App) onActivityBadges(raw json.RawMessage) {
+	if !a.ActivityInbox() {
+		var e struct {
+			Counts map[string]json.RawMessage `json:"counts"`
+			Alerts map[string]json.RawMessage `json:"alerts"`
+		}
+		zero := false
+		if json.Unmarshal(raw, &e) == nil && len(e.Counts)+len(e.Alerts) > 0 {
+			zero = true
+			for _, vals := range []map[string]json.RawMessage{e.Counts, e.Alerts} {
+				for _, v := range vals {
+					// a number other than 0 (or anything else) isn't 0
+					zero = zero && strings.TrimSpace(string(v)) == "0"
+				}
+			}
+		}
+		if changed := a.onClassicBadges(raw); changed || zero {
+			ev := Event{Type: "activity_badges"}
+			if zero {
+				ev.Name = ActivityBadgesZero
+			}
+			a.emit(ev)
+		}
+		return
+	}
 	var e struct {
 		ActivityV2 map[string]int `json:"activity_v2"`
 	}
-	if json.Unmarshal(raw, &e) == nil && e.ActivityV2 != nil {
-		a.setActivityBadges(e.ActivityV2)
-		a.emit(Event{Type: "activity_badges"})
+	if json.Unmarshal(raw, &e) != nil {
+		return
 	}
+	if e.ActivityV2 != nil {
+		a.setActivityBadges(e.ActivityV2)
+	}
+	sum := 0
+	for _, n := range e.ActivityV2 {
+		sum += n
+	}
+	ev := Event{Type: "activity_badges"}
+	if sum == 0 {
+		ev.Name = ActivityBadgesZero
+	}
+	a.emit(ev)
 }
 
 // decActivityBadges is P0K2 decrementBadgeCounts after
@@ -60,6 +142,7 @@ func (a *App) decActivityBadges(items []ActivityItem) {
 		}
 		if changed {
 			a.actBadges = cp
+			a.actBadgesAt = a.S.NextSeq() // newer than a counts answer still out
 		}
 	}
 	a.mu.Unlock()
@@ -68,13 +151,18 @@ func (a *App) decActivityBadges(items []ActivityItem) {
 	}
 }
 
-// ActivityBadgeCount is the rail's Activity badge under activity_inbox:
-// 3x6A getActivityBadgeCount, which with the inbox on (5Ns/ Lh) is H, the
+// ActivityBadgeCount is the rail's Activity badge: 3x6A
+// getActivityBadgeCount, which with the inbox on (5Ns/ Lh) is H, the
 // activity_v2 counts of the badged entry types summed without
-// message_reaction (the All tab's count). yEMG hands it to the rail's
-// Activity tab (ActivityTabContent, InjD useGetMentions); 0 before
-// client.counts answered (unreadActivityV2BadgeCounts starts {}).
+// message_reaction (the All tab's count). Without the inbox it is
+// channel_badges' and the alerts' (classic_badges.go). yEMG hands it to
+// the rail's Activity tab (ActivityTabContent, InjD useGetMentions); 0
+// before client.counts answered (unreadActivityV2BadgeCounts starts {}).
 func (a *App) ActivityBadgeCount() int {
+	if !a.ActivityInbox() {
+		n, _ := a.classicActivityBadge()
+		return n
+	}
 	c, _ := a.ActivityTabCounts()
 	return c[0]
 }
@@ -82,6 +170,11 @@ func (a *App) ActivityBadgeCount() int {
 // activityBadgeTypes is 3x6A H's set: the entry types the All tab's count
 // sums (message_reaction is in the set but never summed), with the ones
 // behind a setting or an experiment as Clack has them.
+//
+// team_joiner_invite is never summed. Build c07ab895506f (2026-11-15) lists
+// TeamJoinerInvite with mpdm, bot_dm and thread_reply as types the selector
+// skips, and no chunk in that build reads inviter_joiner_first_dm_v2. Before
+// that, Clack counted it under that experiment's treatment group.
 func (a *App) activityBadgeTypes() map[string]bool {
 	t := map[string]bool{}
 	for _, k := range []string{"thread_v2", "channel", "internal_channel_invite", "list_record_edited", "bot_dm_bundle",
@@ -98,9 +191,6 @@ func (a *App) activityBadgeTypes() map[string]bool {
 	}
 	if a.experiment("code_review_requested_in_activity") == "on" {
 		t["code_review_requested"] = true // ysZt f
-	}
-	if a.experiment("inviter_joiner_first_dm_v2") == "treatment" {
-		t["team_joiner_invite"] = true // vydz wy inviterJoinerFirstDmIsTreatment
 	}
 	return t
 }

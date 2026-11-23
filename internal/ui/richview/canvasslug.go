@@ -2,8 +2,10 @@ package richview
 
 import (
 	"image"
+	"image/color"
 
 	"github.com/some-du6e/clack/internal/richtext"
+	"github.com/some-du6e/clack/internal/ui/icons"
 )
 
 // canvasSlug lays out a rich_text canvas element (richtext canvasslug.go):
@@ -16,20 +18,25 @@ import (
 // as focus_section_id).
 func (l *lay) canvasSlug(sp *richtext.Span, fs *flowStyle, k faceKey, pt uint8) {
 	p := &l.st.Palette
-	bg, fg := p.MentionBg, p.MentionText
+	bg, fg, see := p.MentionBg, p.MentionText, p.raw.MentionBg
 	var tg int16 = -1
 	if sp.Off {
-		bg, fg = rgba(p.Text.R, p.Text.G, p.Text.B, 0.06), p.Text
+		bg, fg, see = rgba(p.Text.R, p.Text.G, p.Text.B, 0.06), p.Text, color.NRGBA{} // drawn translucent
 	} else if sp.URL != "" {
 		tg = l.d.addTarget(target{kind: tLink, url: sp.URL, slug: true})
 	}
 	pad, padV := l.dpf(2), l.dpf(1)
-	l.decos = append(l.decos, deco{kind: 1, bg: bg, padL: pad, padR: pad, padT: padV, padB: padV, radius: l.dp(3), target: tg, face: k, self: sp.Off, part: pt})
+	l.decos = append(l.decos, deco{kind: 1, bg: bg, see: see, padL: pad, padR: pad, padT: padV, padB: padV, radius: l.dp(3), target: tg, face: k, self: sp.Off, part: pt})
 	dc := int16(len(l.decos) - 1)
-	l.addPad(pad, dc, k)
+	l.addOpen(pad, dc, k)
 	icon := sp.Icon
 	if icon == "" {
 		icon = "canvas-content"
+	}
+	if !icons.Has(icon) && !icons.HasSlack(icon) {
+		// a file type glyph Clack's set lacks (richtext FileTypeIcon):
+		// getFileTypeSvgIconName's own default, never the crossed box
+		icon = "file"
 	}
 	l.addIcon(icon, fs.size, k, fg, dc, tg)
 	l.addPad(l.dpf(3), dc, k) // svg margin-right 4 (the icon item ends with 1px)
@@ -47,7 +54,7 @@ func (l *lay) canvasSlug(sp *richtext.Span, fs *flowStyle, k faceKey, pt uint8) 
 			l.addText(s.Text, fs, k, fg, sp.Style|s.Style, dc, tg)
 		}
 	}
-	l.addPad(pad, dc, k)
+	l.addClose(pad, dc, k)
 }
 
 // channelTabSlug lays out a resolved channel-tab slug (richtext
@@ -61,9 +68,9 @@ func (l *lay) channelTabSlug(sp *richtext.Span, fs *flowStyle, k faceKey, pt uin
 	bg, fg := p.MentionBg, p.MentionText
 	tg := l.d.addTarget(target{kind: tLink, url: sp.URL, id: sp.ID, tab: tabOfSlug(sp.URL), slug: true})
 	pad, padV := l.dpf(2), l.dpf(1)
-	l.decos = append(l.decos, deco{kind: 1, bg: bg, padL: pad, padR: pad, padT: padV, padB: padV, radius: l.dp(3), target: tg, face: k, part: pt})
+	l.decos = append(l.decos, deco{kind: 1, bg: bg, see: p.raw.MentionBg, padL: pad, padR: pad, padT: padV, padB: padV, radius: l.dp(3), target: tg, face: k, part: pt})
 	dc := int16(len(l.decos) - 1)
-	l.addPad(pad, dc, k)
+	l.addOpen(pad, dc, k)
 	if sp.Icon != "" {
 		l.addIcon(sp.Icon, fs.size, k, fg, dc, tg)
 		l.addPad(l.dpf(3), dc, k) // svg margin-right 4 (the icon item ends with 1px)
@@ -77,7 +84,7 @@ func (l *lay) channelTabSlug(sp *richtext.Span, fs *flowStyle, k faceKey, pt uin
 	if txt != "" {
 		l.addText(txt, fs, k, fg, sp.Style, dc, tg)
 	}
-	l.addPad(pad, dc, k)
+	l.addClose(pad, dc, k)
 }
 
 // quipAnchor lays out a canvas-section unfurl (document_section):

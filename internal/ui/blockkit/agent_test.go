@@ -140,9 +140,14 @@ func TestAgentPayloads(t *testing.T) {
 	}
 }
 
-// slotSize is the agent slot's size for the message's first agent block.
+// slotSize is the agent slot's size for the message's first agent block,
+// settled: a change of state the test made takes effect at once, with no
+// height transition.
 func slotSize(t *testing.T, me *Message, m *core.Message, w int) image.Point {
 	t.Helper()
+	st := me.agentState()
+	clear(st.anim)
+	clear(st.target)
 	for _, b := range m.Doc.Blocks {
 		if b.Kind == richtext.Agent {
 			sz, _ := me.ElementsSize(b.Buttons, w, false, unit.Metric{PxPerDp: 1, PxPerSp: 1})
@@ -184,7 +189,7 @@ func TestAgentSlotSizes(t *testing.T) {
 		t.Errorf("open plan %v not taller than collapsed %v by two tasks", open, closed)
 	}
 	// a plan task collapses on its own (tasks start open)
-	st.open["task\x00p1\x00t1\x000"] = false
+	st.open["task\x00p1\x00t1"] = false
 	if fold := slotSize(t, me, &m, 480); fold.Y >= open.Y {
 		t.Errorf("collapsing a task: %v, open %v", fold, open)
 	}
@@ -615,5 +620,32 @@ func TestAgentCardShots(t *testing.T) {
 			_ = png.Encode(f, img)
 			_ = f.Close()
 		}
+	}
+}
+
+// The host's copy of the blocks isn't always the body's (a plugin's
+// msg.blocks): a plan whose block_id the host doesn't hold is the
+// host's first plan, and one the host doesn't hold at all draws its
+// text fallback, never a blank body.
+func TestAgentHostMisses(t *testing.T) {
+	h := &agentHost{th: theme.New(false)}
+	other := agentMsg(t, "plan-complete")
+	if !strings.Contains(string(other.Blocks), `"block_id":"p1"`) {
+		t.Fatalf("fixture blocks: %s", other.Blocks)
+	}
+	other.Blocks = json.RawMessage(strings.Replace(string(other.Blocks), `"block_id":"p1"`, `"block_id":"p9"`, 1))
+	gone := agentMsg(t, "plan-complete")
+	gone.Blocks = json.RawMessage(`[{"type":"context_actions","block_id":"x","elements":[]}]`)
+	s := newAgentShot(h, other, gone)
+	s.frame(600, 400, time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC))
+	if sl := s.rows[0].v.ElementSlots(); len(sl) != 1 || sl[0].Dy() < 19 {
+		t.Errorf("another block_id: slots %v, want the plan's", sl)
+	}
+	v := s.rows[1].v
+	if sl := v.ElementSlots(); len(sl) != 0 {
+		t.Errorf("no plan in the host's blocks: slots %v", sl)
+	}
+	if got := v.TextRange(0, v.PlainLen()); !strings.Contains(got, "Thinking completed") {
+		t.Errorf("no plan in the host's blocks: text %q, want the plan's title", got)
 	}
 }

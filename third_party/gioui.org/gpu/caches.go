@@ -4,6 +4,7 @@ package gpu
 
 import (
 	"fmt"
+	"image"
 
 	"gioui.org/internal/f32"
 )
@@ -15,6 +16,8 @@ type textureCacheKey struct {
 
 type textureCache struct {
 	res map[textureCacheKey]resourceCacheValue
+	// nextID is the last texture id handed out (Clack patch 46)
+	nextID uint64
 }
 
 type resourceCacheValue struct {
@@ -37,6 +40,11 @@ type opCacheValue struct {
 	data pathData
 
 	bounds f32.Rectangle
+	// quads are the stencil quads' bounds (Clack patch 36, with
+	// ClackStatsDetail only)
+	quads []image.Rectangle
+	// hash is the path's pathHash (Clack patch 46)
+	hash [2]uint64
 	// the fields below are handled by opCache
 	key  opKey
 	keep bool
@@ -137,7 +145,16 @@ func (r *opCache) frame() {
 			v.data.release()
 			r.cache[i].data.data = nil
 		}
-		delete(r.index, v.key)
+		// Clack: drop the index entry only while it still names this
+		// slot, and clear the slot. A freed slot used to keep its key,
+		// and put hands freed slots out again, so a key that came back
+		// into another slot had its live entry deleted by its old slot at
+		// every frame's end: a path that left the screen and returned was
+		// built and uploaded again every frame it stayed.
+		if r.index[v.key] == i+1 {
+			delete(r.index, v.key)
+		}
+		r.cache[i] = opCacheValue{}
 		r.freelist = append(r.freelist, i)
 	}
 }

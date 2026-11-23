@@ -12,11 +12,16 @@ import (
 func (l *lay) agent(b *richtext.Block, x, y, w int) int {
 	if el := l.opts.Elements; el != nil && len(b.Buttons) > 0 {
 		sz, _ := el.ElementsSize(b.Buttons[:1], w, false, l.metric())
-		if sz.Y <= 0 {
-			return 0
+		if sz.Y > 0 {
+			l.addSlot(b.Buttons[:1], image.Rect(x, y, x+max(sz.X, 1), y+sz.Y), false)
+			return sz.Y
 		}
-		l.addSlot(b.Buttons[:1], image.Rect(x, y, x+max(sz.X, 1), y+sz.Y), false)
-		return sz.Y
+		// the host can't draw it: the text fallback, never a blank body
+	}
+	if len(b.Buttons) > 0 && b.Buttons[0].Kind == richtext.AgentChannelUnfurlKind {
+		// MessageKitAttachments draws an agent_channel_unfurl as its
+		// code channel's card or not at all, never its fallback text
+		return 0
 	}
 	if len(b.Spans) == 0 {
 		return 0

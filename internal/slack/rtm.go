@@ -1,9 +1,11 @@
 package slack
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
@@ -29,17 +31,26 @@ type RTM struct {
 	Events  chan Event
 	OnState func(connected bool)
 
-	mu           sync.Mutex
-	conn         *websocket.Conn
-	next         atomic.Int64
+	mu   sync.Mutex
+	conn *websocket.Conn
+	next atomic.Int64
+	// reconnectURL is the gateway's last reconnect_url and reconnectAt
+	// when it arrived (Slack's _fastReconnectUrl and
+	// _fastReconnectUrlReceivedAtTime)
 	reconnectURL string
+	reconnectAt  ClockReading
 	fails        int
+	// kick cuts a backoff wait short (Reconnect)
+	kick chan struct{}
 	// fast: the current connection came from the gateway's reconnect_url
 	// (Slack's FAST_RECONNECTING; any other connect is a slow one)
 	fast atomic.Bool
 
 	// OnHello runs after every (re)connect, e.g. to resend subscriptions.
 	OnHello func()
+	// OnDrop sees an event Events had no room for, on the reader
+	// goroutine, before it's gone (core notes a dropped message's ts).
+	OnDrop func(Event)
 }
 
 // LastConnectFast reports whether the current (or last) connection was a
@@ -49,20 +60,93 @@ type RTM struct {
 func (r *RTM) LastConnectFast() bool { return r.fast.Load() }
 
 func (c *Client) NewRTM() *RTM {
-	return &RTM{c: c, Events: make(chan Event, 1024)}
+	return &RTM{c: c, Events: make(chan Event, 1024), kick: make(chan struct{}, 1)}
 }
 
-// MaxRTMFails is how many short-lived connects in a row Run tries before it
-// gives up (a connection that lasted over a minute resets the count).
+// MaxRTMFails is how many failed connects in a row (none reached hello)
+// Run takes at the normal backoff cap; after that it waits
+// RTMBackoffLong between tries. It never gives up: like Slack's socket
+// manager it keeps trying for as long as live updates are on, and core
+// polls in the meantime.
 const MaxRTMFails = 8
 
-// Run blocks until ctx is done, reconnecting with exponential backoff, or
-// until MaxRTMFails connects in a row failed or the session ended.
+// Run's backoff: rtmBackoffBase doubling up to rtmBackoffCap, then
+// rtmBackoffLong once MaxRTMFails connects in a row failed (Slack's
+// WAIT_FOR_RATE_LIMIT backs off from 1 s to a 60 s cap). Vars for tests.
+var (
+	rtmBackoffBase = time.Second
+	rtmBackoffCap  = 30 * time.Second
+	rtmBackoffLong = 60 * time.Second
+)
+
+// ReconnectURLMaxAge is how long a reconnect_url stays usable. Slack's
+// socket manager (getFastReconnectUrl) drops it once Date.now() is more
+// than 285 s past its arrival, and connects with a fresh
+// client.getWebSocketURL instead. The age is wall-clock, so time asleep
+// counts.
+const ReconnectURLMaxAge = 285 * time.Second
+
+// errStaleURL: the gateway refused the reconnect_url (Slack's
+// clearFastReconnectUrl cases). Run connects again at once with a fresh
+// URL and doesn't count a failure.
+var errStaleURL = errors.New("rtm: reconnect_url refused")
+
+// The socket's liveness check, Slack's SlackSocket (client-boot Kot3
+// _onSocketOpen): a ping every rtmPingEvery, and once rtmPongTimeout has
+// passed since the socket opened or a pong last answered one, the socket
+// closes with 4998 "Too long since we received a pong" and Run connects
+// again. Slack's clock there is Date.now(), so a sleep counts. A socket
+// that goes quiet without a close frame (a sleep, a NAT mapping or a
+// Wi-Fi network that went away, a half-open TCP connection) otherwise
+// blocks Read for as long as the kernel keeps the connection, and every
+// event the gateway sends meanwhile is lost with nobody noticing: Karim's
+// #clack drew nothing from 00:54Z to 03:53Z on 2026-11-20. Vars for
+// tests.
+var rtmPingEvery, rtmPongTimeout atomic.Int64 // nanoseconds
+
+func init() {
+	rtmPingEvery.Store(int64(10 * time.Second))
+	rtmPongTimeout.Store(int64(90 * time.Second))
+}
+
+// SetPingTimers sets the liveness check's ping interval and pong timeout
+// (Slack's 10 s and 90 s) and returns the undo: for tests, which can't
+// wait 90 s for a socket that went quiet.
+func SetPingTimers(every, timeout time.Duration) (restore func()) {
+	e, t := rtmPingEvery.Swap(int64(every)), rtmPongTimeout.Swap(int64(timeout))
+	return func() { rtmPingEvery.Store(e); rtmPongTimeout.Store(t) }
+}
+
+// pongTimeout is the close reason Slack's socket gives (status 4998).
+const pongTimeout = "Too long since we received a pong"
+
+// errPongTimeout: the socket was closed by the liveness check.
+var errPongTimeout = errors.New("rtm: " + pongTimeout)
+
+// session is how one connect went.
+type session struct {
+	hello bool          // the gateway said hello: the connect worked
+	up    time.Duration // wall-clock time from the dial to the drop (0 if the dial failed)
+	err   error
+}
+
+// Run blocks until ctx is done or the session ended, reconnecting with
+// exponential backoff.
+//
+// A connect counts as failed only if it never got hello. Slack's socket
+// manager does the same: CONNECTED clears its error count and its backoff.
+// Run used to judge a connection by how long it lasted on Go's monotonic
+// clock, which stops while a Mac sleeps, so an hour-long connection that
+// slept through most of it counted as a failed connect, and after eight of
+// those Run gave up on live updates for good.
 func (r *RTM) Run(ctx context.Context) {
-	backoff := time.Second
+	select { // a Reconnect from before this Run isn't for it
+	case <-r.kick:
+	default:
+	}
+	backoff := rtmBackoffBase
 	for ctx.Err() == nil && !r.c.SignedOut() {
-		start := time.Now()
-		err := r.once(ctx)
+		s := r.connect(ctx)
 		if ctx.Err() != nil {
 			return
 		}
@@ -73,45 +157,121 @@ func (r *RTM) Run(ctx context.Context) {
 			log.Printf("rtm: session ended, not reconnecting")
 			return
 		}
-		if time.Since(start) > time.Minute {
-			backoff = time.Second
+		stale := errors.Is(s.err, errStaleURL)
+		wait := backoff
+		switch {
+		case stale:
+			wait = 0 // not the network's fault: straight back with a fresh URL
+		case s.hello:
 			r.fails = 0
-		} else {
+			backoff = rtmBackoffBase
+			wait = backoff
+		default:
 			r.fails++
 		}
-		if r.fails >= MaxRTMFails {
-			// Don't keep hammering the gateway: core falls back to polling.
-			log.Printf("rtm: disconnected (%v); %d failed connects in a row, giving up until live updates are turned on again", err, r.fails)
-			r.fails = 0
-			return
+		if rl, ok := s.err.(rateLimitedErr); ok {
+			wait = rl.wait
 		}
-		log.Printf("rtm: disconnected (%v), retrying in %s", err, backoff)
+		switch {
+		case stale:
+			log.Printf("rtm: gateway refused the reconnect_url, connecting with a fresh URL")
+		case s.hello:
+			log.Printf("rtm: disconnected (%v) after %s (fast=%v), retrying in %s", s.err, s.up.Round(time.Second), r.fast.Load(), wait)
+			if connReset(s.err) || errors.Is(s.err, errPongTimeout) {
+				// the path that reset the socket, or went quiet under it,
+				// took the pooled API connections with it too
+				r.c.ResetConns()
+			}
+		case r.fails == MaxRTMFails:
+			log.Printf("rtm: connect failed (%v); %d failed connects in a row, retrying every %s until one works", s.err, r.fails, rtmBackoffLong)
+		default:
+			log.Printf("rtm: connect failed (%v), retrying in %s", s.err, wait)
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(backoff):
+		case <-r.kick:
+		case <-time.After(wait):
+		}
+		if stale {
+			continue
 		}
 		backoff *= 2
-		if backoff > 30*time.Second {
-			backoff = 30 * time.Second
+		limit := rtmBackoffCap
+		if r.fails >= MaxRTMFails {
+			limit = rtmBackoffLong
+		}
+		if backoff > limit {
+			backoff = limit
 		}
 	}
 }
 
-func (r *RTM) once(ctx context.Context) error {
-	u := r.reconnectURL
+// Reconnect drops the socket and connects again at once with a fresh
+// client.getWebSocketURL (not the reconnect_url, which belongs to the
+// path that just went away). Core calls it when the machine wakes or its
+// network addresses change, as Chromium's network change notifier makes
+// Slack's client do. A no-op apart from forgetting the reconnect_url while
+// Run isn't running.
+func (r *RTM) Reconnect(why string) {
+	r.mu.Lock()
+	conn := r.conn
 	r.reconnectURL = ""
-	r.fast.Store(u != "")
+	r.mu.Unlock()
+	if conn != nil {
+		log.Printf("rtm: %s, reconnecting", why)
+		conn.CloseNow()
+	}
+	select {
+	case r.kick <- struct{}{}:
+	default:
+	}
+}
+
+// takeReconnectURL returns the reconnect_url to dial, if it is fresh
+// enough, and forgets it either way: each one is tried once.
+func (r *RTM) takeReconnectURL() string {
+	r.mu.Lock()
+	u, at := r.reconnectURL, r.reconnectAt
+	r.reconnectURL = ""
+	r.mu.Unlock()
+	if u == "" {
+		return ""
+	}
+	if age := ReadClock().WallSince(at); age > ReconnectURLMaxAge || age < 0 {
+		log.Printf("rtm: reconnect_url is %s old, connecting with a fresh URL", age.Round(time.Second))
+		return ""
+	}
+	return u
+}
+
+// rateLimitedErr: an error frame said to back off for wait.
+type rateLimitedErr struct {
+	msg  string
+	wait time.Duration
+}
+
+func (e rateLimitedErr) Error() string { return "rtm: " + e.msg }
+
+// once connects and reads until the socket drops.
+func (r *RTM) once(ctx context.Context) error { return r.connect(ctx).err }
+
+func (r *RTM) connect(ctx context.Context) (s session) {
+	u := r.takeReconnectURL()
+	fast := u != ""
+	r.fast.Store(fast)
 	if u == "" {
 		u = r.c.WebSocketURL(ctx, r.fails%3 == 2) // every third failure, try the backup gateway
 	}
 	// The URL carries the token and the dial sends the cookie: it must be
 	// on slack.com, whatever client.getWebSocketURL or a reconnect_url said.
 	if pu, err := url.Parse(u); err != nil || !r.c.credsOK(pu) {
-		return ErrUntrustedHost
+		s.err = ErrUntrustedHost
+		return s
 	}
 	if r.c.SignedOut() {
-		return ErrSignedOut
+		s.err = ErrSignedOut
+		return s
 	}
 	t0 := time.Now()
 	h := http.Header{}
@@ -127,8 +287,10 @@ func (r *RTM) once(ctx context.Context) error {
 	conn, _, err := websocket.Dial(dctx, u, &websocket.DialOptions{HTTPHeader: h, HTTPClient: r.c.HTTP, CompressionMode: websocket.CompressionContextTakeover})
 	cancel()
 	if err != nil {
-		return scrubErr(err) // the dial error quotes the URL, token included
+		s.err = scrubErr(err) // the dial error quotes the URL, token included
+		return s
 	}
+	upAt := ReadClock()
 	conn.SetReadLimit(64 << 20)
 	r.mu.Lock()
 	r.conn = conn
@@ -138,19 +300,70 @@ func (r *RTM) once(ctx context.Context) error {
 		r.conn = nil
 		r.mu.Unlock()
 		conn.CloseNow()
+		s.up = ReadClock().WallSince(upAt)
 	}()
 
 	cctx, stop := context.WithCancel(ctx)
 	defer stop()
+	// the liveness check (rtmPongTimeout): the last pong, on the wall
+	// clock, from the socket's open on as Slack's timer is; pings holds
+	// the ids of the pings out
+	var pongMu sync.Mutex
+	lastPong := upAt
+	pings := map[int64]bool{}
+	var noPong atomic.Bool
+	// Slack's timer starts over when a ping's promise resolves: any reply
+	// whose reply_to is the ping's id and whose ok isn't false, whatever
+	// its type (SlackSocket _onSocketMessage → handleReply)
+	pingAnswered := func(data []byte) {
+		if !bytes.Contains(data, []byte(`"reply_to"`)) {
+			return
+		}
+		var rep struct {
+			OK      *bool `json:"ok"`
+			ReplyTo int64 `json:"reply_to"`
+		}
+		if json.Unmarshal(data, &rep) != nil || rep.OK != nil && !*rep.OK {
+			return
+		}
+		at := ReadClock()
+		pongMu.Lock()
+		if pings[rep.ReplyTo] {
+			delete(pings, rep.ReplyTo)
+			lastPong = at
+		}
+		pongMu.Unlock()
+	}
 	go func() {
-		t := time.NewTicker(10 * time.Second)
+		t := time.NewTicker(time.Duration(rtmPingEvery.Load()))
 		defer t.Stop()
 		for {
 			select {
 			case <-cctx.Done():
 				return
 			case <-t.C:
-				_ = r.Send(map[string]any{"type": "ping"})
+			}
+			pongMu.Lock()
+			quiet := ReadClock().WallSince(lastPong)
+			pongMu.Unlock()
+			if quiet > time.Duration(rtmPongTimeout.Load()) {
+				log.Printf("rtm: no pong for %s, closing the socket (4998 %s)", quiet.Round(time.Second), pongTimeout)
+				noPong.Store(true)
+				// the close handshake waits for a peer that may be gone (5 s
+				// at most), then drops the connection, which ends Read
+				_ = conn.Close(websocket.StatusCode(4998), pongTimeout)
+				return
+			}
+			ping := map[string]any{"type": "ping"}
+			if r.Send(ping) == nil {
+				if id, ok := ping["id"].(int64); ok {
+					pongMu.Lock()
+					if len(pings) >= 64 { // pings never answered
+						clear(pings)
+					}
+					pings[id] = true
+					pongMu.Unlock()
+				}
 			}
 		}
 	}()
@@ -158,8 +371,13 @@ func (r *RTM) once(ctx context.Context) error {
 	for {
 		_, data, err := conn.Read(cctx)
 		if err != nil {
-			return err
+			s.err = err
+			if noPong.Load() {
+				s.err = fmt.Errorf("%w (%w)", errPongTimeout, err)
+			}
+			return s
 		}
+		pingAnswered(data)
 		var ev Event
 		if json.Unmarshal(data, &ev) != nil {
 			continue
@@ -167,6 +385,7 @@ func (r *RTM) once(ctx context.Context) error {
 		ev.Raw = data
 		switch ev.Type {
 		case "hello":
+			s.hello = true
 			log.Printf("rtm: connected in %s", time.Since(t0).Round(time.Millisecond))
 			if r.OnState != nil {
 				r.OnState(true)
@@ -175,30 +394,27 @@ func (r *RTM) once(ctx context.Context) error {
 				go r.OnHello()
 			}
 		case "error":
-			var fe struct {
-				Error struct {
-					Code any    `json:"code"`
-					Msg  string `json:"msg"`
-				} `json:"error"`
-			}
-			_ = json.Unmarshal(data, &fe)
-			log.Printf("rtm: gateway error frame: %s", fe.Error.Msg)
-			for code := range authCodes {
-				if strings.Contains(fe.Error.Msg, code) {
-					r.c.markAuth(code)
-					return errors.New("rtm: " + code)
-				}
-			}
+			s.err = r.errorFrame(data, fast)
+			return s
 		case "reconnect_url":
 			var x struct {
 				URL string `json:"url"`
 			}
 			_ = json.Unmarshal(data, &x)
-			if slackURL(x.URL, "wss") { // it carries the token: Slack hosts only
-				r.reconnectURL = x.URL
+			if r.c.gatewayURLOK(x.URL) { // it carries the token: Slack hosts only
+				at := ReadClock()
+				r.mu.Lock()
+				r.reconnectURL, r.reconnectAt = x.URL, at
+				r.mu.Unlock()
 			}
 			continue
 		case "pong":
+			// a ping's answer: the socket is alive (Slack's send() resolves
+			// the ping on its reply, and the timer starts over)
+			at := ReadClock()
+			pongMu.Lock()
+			lastPong = at
+			pongMu.Unlock()
 			continue
 		case "":
 			// reply to one of our frames; surface failures only
@@ -214,14 +430,65 @@ func (r *RTM) once(ctx context.Context) error {
 			}
 			continue
 		case "goodbye":
-			return nil
+			return s
 		}
 		select {
 		case r.Events <- ev:
 		default:
 			log.Printf("rtm: event buffer full, dropping %s", ev.Type)
+			if r.OnDrop != nil {
+				r.OnDrop(ev)
+			}
 		}
 	}
+}
+
+// errorFrame handles the gateway's "error" frame the way Slack's socket
+// manager (_handleSocketErrorMessage) does: every one closes the socket.
+// "Socket URL has expired" and invalid_auth on a fast reconnect only
+// mean the reconnect_url is no good, so the next connect is a slow one at
+// once (errStaleURL); on a slow connect they are ordinary failures. A rate limit waits its retry_after (30 s without
+// one). Any other auth code ends the session.
+func (r *RTM) errorFrame(data []byte, fast bool) error {
+	var fe struct {
+		Error struct {
+			Code       any    `json:"code"`
+			Msg        string `json:"msg"`
+			RetryAfter int    `json:"retry_after"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(data, &fe)
+	msg := fe.Error.Msg
+	log.Printf("rtm: gateway error frame: %s", msg)
+	switch msg {
+	case "Socket URL has expired", "Subscription failure from the CS":
+		r.mu.Lock()
+		r.reconnectURL = ""
+		r.mu.Unlock()
+		if msg == "Socket URL has expired" && fast {
+			return errStaleURL // a fresh URL can't loop here: the next one is fresh
+		}
+		return errors.New("rtm: " + msg)
+	case "rate_limited", "ratelimited", "Ratelimited", "backend_overloaded", "unknown":
+		wait := 30 * time.Second
+		if fe.Error.RetryAfter > 0 {
+			wait = time.Duration(fe.Error.RetryAfter) * time.Second
+		}
+		return rateLimitedErr{msg: msg, wait: wait}
+	}
+	if fast && strings.Contains(msg, "invalid_auth") {
+		// Slack: "Got invalid_auth when trying to fast reconnect; clearing
+		// fast reconnect URL and trying slow reconnection instead". A
+		// session that really ended fails client.getWebSocketURL next.
+		return errStaleURL
+	}
+	for code := range authCodes {
+		if strings.Contains(msg, code) {
+			r.c.markAuth(code)
+			return errors.New("rtm: " + code)
+		}
+	}
+	return errors.New("rtm: " + msg)
 }
 
 // Send writes a JSON frame (assigning an id if absent).

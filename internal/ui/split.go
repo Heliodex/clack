@@ -50,6 +50,7 @@ import (
 	"github.com/some-du6e/clack/internal/ui/shortcut"
 	"github.com/some-du6e/clack/internal/ui/slackc"
 	"github.com/some-du6e/clack/internal/ui/theme"
+	"github.com/some-du6e/clack/internal/ui/views"
 )
 
 // paneSplit names the split view's view container (App.pane).
@@ -205,6 +206,32 @@ func (a *App) OpenSplit(route string) {
 		a.Navigate(route)
 		return
 	}
+	a.canvasNavigated() // a navigation still waiting for its file or message is dropped (canvas_open.go)
+	// a file channel's Channel view (toChannel, toMessage): Slack's
+	// RedirectFileChannel runs in the split view too (canvas_open.go). A
+	// canvas's message is its thread view there, the message its
+	// highlighted root; the canvas itself (toCanvas) and a list's list
+	// (toList, toListRecordByThreadTs) go in the side panel, as Clack's
+	// split view holds conversations only. A thread (toThread) stays a
+	// thread in the split view, as the middleware leaves Thread views be.
+	if ts := r.Message(); r.Thread() == "" && a.redirectInstead(ch, ts, fileTo{
+		canvas: func(fid string) {
+			if ts != "" {
+				a.openSplitFileThread(ch, ts)
+				return
+			}
+			a.OpenCanvasAt(fid, "", false)
+		},
+		list: func(fid string) {
+			if ts != "" {
+				a.listJump(fid, ch, "", ts, views.FileSide, nil)
+				return
+			}
+			a.OpenList(fid)
+		},
+	}, func() { a.OpenSplit(route) }, nil) {
+		return
+	}
 	s := &a.split
 	if a.pane == paneSplit && len(s.stack) > 0 {
 		// navigating inside the split view: the old view is its back stack
@@ -230,6 +257,7 @@ func (a *App) OpenSplit(route string) {
 // the primary view. Its conversations save their drafts and go, as
 // Slack's view unmounts.
 func (a *App) CloseSplit() {
+	a.canvasNavigated() // a navigation still waiting for its file is dropped (canvas_open.go)
 	s := &a.split
 	if len(s.stack) == 0 {
 		return
@@ -276,6 +304,7 @@ func (a *App) PaneBack() bool {
 // GoPaneBack goes back in the split view or the secondary pane
 // (FlexpaneBackButton).
 func (a *App) GoPaneBack() {
+	a.canvasNavigated() // a navigation still waiting for its file is dropped (canvas_open.go)
 	if a.pane != paneSplit {
 		if a.secondary.kind == secThread && a.secondary.prev != nil {
 			a.leaveThreadRoute(a.secondary.channel, a.secondary.ts)
@@ -302,6 +331,19 @@ func (a *App) splitClick() bool {
 // rows open their item in the split view on that click).
 func (a *App) SplitClick() bool { return a.splitClick() }
 
+// ClickMods are this frame's click's modifiers (popups: a menu row a
+// plugin's onSelectAction passed on runs a frame later, with the click it
+// was picked with).
+func (a *App) ClickMods() key.Modifiers { return a.clickMods }
+
+// WithClickMods runs f as if this frame's click had modifiers m.
+func (a *App) WithClickMods(m key.Modifiers, f func()) {
+	prev := a.clickMods
+	a.clickMods = m
+	defer func() { a.clickMods = prev }()
+	f()
+}
+
 // splitPointer sees the root pointer events (readRootPointer): the
 // modifiers of a click's release, and which container a press lands in
 // (the split view's focus; menus over the workspace don't count).
@@ -310,7 +352,7 @@ func (a *App) splitPointer(pe pointer.Event) {
 	case pointer.Release:
 		a.clickMods = pe.Modifiers
 	case pointer.Press:
-		if !a.splitOpen() || len(a.overlays) > 0 {
+		if !a.splitOpen() || a.visibleOverlays() {
 			return
 		}
 		p := a.ptrWin
@@ -576,7 +618,7 @@ func (a *App) layoutSplitResize(gtx layout.Context, col, card image.Rectangle) {
 		theme.Fill(gtx, image.Rect(lx-gtx.Dp(1), card.Min.Y, lx+gtx.Dp(3), card.Max.Y), a.th.C.Link)
 	}
 	s.rz.area(gtx, r, col.Min.X)
-	s.hover = a.ptrOK && a.ptrWin.In(r) && len(a.overlays) == 0
+	s.hover = a.ptrOK && a.ptrWin.In(r) && !a.visibleOverlays()
 }
 
 // ---- the split view's channel header ----

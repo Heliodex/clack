@@ -1,7 +1,8 @@
 // Package idleprobe counts the frames a Gio window draws while nobody
-// touches it, and names the code that asked for each one. Tests only
-// (internal/ui TestIdleFrames, internal/ui/huddleui
-// TestHuddleWindowIdleFrames); nothing in the app imports it.
+// touches it, and names the code that asked for each one. Tests and the
+// perf driver only (internal/ui TestIdleFrames and TestMacIdleCPU,
+// internal/ui/huddleui TestHuddleWindowIdleFrames, the perfharness
+// build's idle stage); the app itself never imports it.
 //
 // A Gio window draws a frame when
 //
@@ -125,8 +126,10 @@ func skipFrame(fn string) bool {
 		}
 	}
 	// the tests' per-window filters (TestIdleFrames.func1,
-	// TestHuddleWindowIdleFrames.func1)
-	return strings.Contains(fn, "IdleFrames.func1")
+	// TestHuddleWindowIdleFrames.func1, TestMacIdleCPU's) and the perf
+	// driver's (perfInvalidateHook)
+	return strings.Contains(fn, "IdleFrames.func1") || strings.Contains(fn, "IdleCPU.func") ||
+		strings.HasSuffix(fn, ".perfInvalidateHook")
 }
 
 // Caller names the code that asked for a frame: the first two frames
@@ -198,6 +201,12 @@ func (r Result) CountMatching(subs ...string) int {
 // frames' timeline.
 func (r Result) Log(t testing.TB) {
 	t.Helper()
+	var sb strings.Builder
+	r.write(&sb)
+	t.Log(sb.String())
+}
+
+func (r Result) write(sb *strings.Builder) {
 	by := map[string]int{}
 	for _, f := range r.Frames {
 		for _, c := range f.Causes {
@@ -211,19 +220,17 @@ func (r Result) Log(t testing.TB) {
 	sort.Slice(keys, func(i, j int) bool {
 		return by[keys[i]] > by[keys[j]] || by[keys[i]] == by[keys[j]] && keys[i] < keys[j]
 	})
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "idle-frames %s: %d frames in %v idle\n", r.Name, len(r.Frames), r.Dur)
+	fmt.Fprintf(sb, "idle-frames %s: %d frames in %v idle\n", r.Name, len(r.Frames), r.Dur)
 	for _, k := range keys {
-		fmt.Fprintf(&sb, "  %5d  %s\n", by[k], k)
+		fmt.Fprintf(sb, "  %5d  %s\n", by[k], k)
 	}
 	for i, f := range r.Frames {
 		if i == 40 {
-			fmt.Fprintf(&sb, "  … %d more frames\n", len(r.Frames)-i)
+			fmt.Fprintf(sb, "  … %d more frames\n", len(r.Frames)-i)
 			break
 		}
-		fmt.Fprintf(&sb, "  @%7.1fms  %s\n", float64(f.At)/float64(time.Millisecond), strings.Join(f.Causes, " | "))
+		fmt.Fprintf(sb, "  @%7.1fms  %s\n", float64(f.At)/float64(time.Millisecond), strings.Join(f.Causes, " | "))
 	}
-	t.Log(sb.String())
 }
 
 // Run lets the window sit for d with no input and records every frame it

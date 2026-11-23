@@ -49,6 +49,18 @@ type PopoverOpts struct {
 	// cubic-bezier(.33,1,.68,1)). NoMotion is prefers-reduced-motion
 	// (animation: none).
 	AnimateIn, NoMotion bool
+	// Bare draws the content as it is, without the card's background,
+	// border and shadow: Slack's .c-popover__content has none, the
+	// content brings its own (AudioPopover's strip).
+	Bare bool
+	// OnOverlayClick, when set, runs on a click outside the content
+	// instead of closing the popover (Slack's shouldCloseOnOverlayClick:
+	// false; AudioPopover flashes its speedbump).
+	OnOverlayClick func()
+	// OnEnter runs on Return or Space while the popover has the keyboard
+	// focus: the content's autoFocus button (AudioPopover's Stop
+	// recording).
+	OnEnter func()
 }
 
 // Popover is a card with arbitrary content anchored to a rectangle; it
@@ -75,6 +87,11 @@ func NewPopover(h Host, content layout.Widget, o PopoverOpts) *Popover {
 // Rect is the card's last laid-out rectangle (window coords).
 func (p *Popover) Rect() image.Rectangle { return p.rect }
 
+// Peeking reports a hover peek (PopoverOpts.Peek): it never takes the
+// focus, so it has none to give back, and isn't one of the window's
+// overlay layers (the shell's dismissTop closes it on Escape).
+func (p *Popover) Peeking() bool { return p.o.Peek }
+
 // Layout draws the popover.
 func (p *Popover) Layout(gtx layout.Context) layout.Dimensions {
 	drain()
@@ -94,12 +111,27 @@ func (p *Popover) Layout(gtx layout.Context) layout.Dimensions {
 		p.Dismiss()
 		return layout.Dimensions{}
 	}
+	if p.o.OnEnter != nil && isTop(p) {
+		for {
+			e, ok := gtx.Event(key.Filter{Focus: p, Name: key.NameReturn}, key.Filter{Focus: p, Name: key.NameEnter},
+				key.Filter{Focus: p, Name: key.NameSpace})
+			if !ok {
+				break
+			}
+			if ke, ok := e.(key.Event); ok && ke.State == key.Press {
+				p.o.OnEnter()
+			}
+		}
+	}
 	if p.o.Modal {
 		fill(gtx, image.Rectangle{Max: win}, cl.Backdrop)
 	}
 	if !p.o.Peek && p.scrim.Layout(gtx) {
-		p.Dismiss()
-		return layout.Dimensions{}
+		if p.o.OnOverlayClick == nil {
+			p.Dismiss()
+			return layout.Dimensions{}
+		}
+		p.o.OnOverlayClick()
 	}
 	m := dp(gtx, 8)
 	maxW := win.X - 2*m
@@ -111,6 +143,9 @@ func (p *Popover) Layout(gtx layout.Context) layout.Dimensions {
 		}
 		cg.Constraints = layout.Constraints{Min: image.Pt(w, 0), Max: image.Pt(w, win.Y-2*m)}
 	}
+	// the inspect tool: the card's element recorded before the content is
+	// laid out, so the content is inside it (slackc EndCardAt)
+	cm := popoverClass.Inspect(0)
 	call, d := record(cg, p.content)
 	gap := p.o.Gap
 	if gap == 0 {
@@ -159,8 +194,14 @@ func (p *Popover) Layout(gtx layout.Context) layout.Dimensions {
 	}
 	keyTarget(gtx, p, p.rect)
 	st := popoverClass.Enter(gtx, 0, 0)
-	defer st.Leave()
-	if !st.Hidden() {
+	var box image.Rectangle
+	if !st.Hidden() && p.o.Bare {
+		t := op.Offset(pos).Push(gtx.Ops)
+		p.block.Layout(gtx, image.Rectangle{Max: d.Size})
+		call.Add(gtx.Ops)
+		t.Pop()
+		box = image.Rectangle{Min: pos, Max: pos.Add(d.Size)}
+	} else if !st.Hidden() {
 		styledCard(gtx, st, cl, pos, d.Size, dp(gtx, rad), false, func(gtx layout.Context) {
 			local := image.Rectangle{Max: d.Size}
 			p.block.Layout(gtx, local)
@@ -168,7 +209,10 @@ func (p *Popover) Layout(gtx layout.Context) layout.Dimensions {
 			call.Add(gtx.Ops)
 			cs.Pop()
 		})
+		box = image.Rectangle{Min: pos, Max: pos.Add(d.Size)}
 	}
+	st.Leave()
+	cm.EndCardAt(gtx, box) // the inspect tool: the card is the popover's box
 	return layout.Dimensions{Size: win}
 }
 
@@ -226,6 +270,11 @@ type TipState struct {
 	// Texty is a TextyTooltip Popover (Texty's mouseover opens it): no
 	// delay, allowance 0 and no tryOppositePosition (theme.TextyTip).
 	Texty bool
+	// Wake, when set, asks the owner for the frame at the end of the hover
+	// delay (now is the frame's clock) instead of executing an
+	// op.InvalidateCmd mid-layout, which replays later handlers' unread
+	// input in Gio's router.
+	Wake func(now, at time.Time)
 	// org is the target's window origin, so the tooltip keeps inside the
 	// window (theme.PlaceTooltip); last is where it was drawn (tests).
 	org  theme.TipOrigin
@@ -242,6 +291,10 @@ func (st *TipState) Placed() theme.TipPlace { return st.last }
 func (st *TipState) Showing(now time.Time) bool {
 	return st.hovered && !now.Before(st.since.Add(st.delay()))
 }
+
+// Reset ends the hover: the next one waits the delay again (a target
+// that wasn't drawn this frame).
+func (st *TipState) Reset() { st.hovered = false }
 
 // delay is the tooltip's hover delay.
 func (st *TipState) delay() time.Duration {
@@ -308,7 +361,11 @@ func tooltipWith(gtx layout.Context, th *theme.Theme, st *TipState, hovered bool
 		st.since = gtx.Now
 	}
 	if wait := st.since.Add(st.delay()); gtx.Now.Before(wait) {
-		gtx.Execute(op.InvalidateCmd{At: wait})
+		if st.Wake != nil {
+			st.Wake(gtx.Now, wait)
+		} else {
+			gtx.Execute(op.InvalidateCmd{At: wait})
+		}
 		return
 	}
 	call, d := record(gtx, box)
@@ -458,76 +515,4 @@ func tipBox(gtx layout.Context, th *theme.Theme, label, shortcut string, maxWidt
 		macroAt(gtx, kc, image.Pt((sz.X-kw)/2, y+dp(gtx, 4)))
 	}
 	return layout.Dimensions{Size: sz}
-}
-
-// ---- Toast ----
-
-// Toast is a transient message at the bottom center of the window
-// (Slack's dark toast: #1d1c1d, radius 8, 15/700 white). Pill toasts use
-// Slack's keyboard-hint pill instead (rgba(0,0,0,.7), fully rounded).
-type Toast struct {
-	base
-	h     Host
-	text  string
-	pill  bool
-	until time.Time
-	dur   time.Duration
-}
-
-// NewToast returns a toast overlay that disappears after 3.5 s.
-func NewToast(h Host, text string) *Toast {
-	return &Toast{h: h, text: text, dur: 3500 * time.Millisecond}
-}
-
-// NewHintPill returns the translucent keyboard-hint pill ("Tip: …").
-func NewHintPill(h Host, text string) *Toast {
-	return &Toast{h: h, text: text, pill: true, dur: 4 * time.Second}
-}
-
-// Layout draws the toast.
-func (t *Toast) Layout(gtx layout.Context) layout.Dimensions {
-	drain()
-	if t.done {
-		return layout.Dimensions{}
-	}
-	if t.until.IsZero() {
-		t.until = gtx.Now.Add(t.dur)
-	}
-	if !gtx.Now.Before(t.until) {
-		t.Dismiss()
-		return layout.Dimensions{}
-	}
-	gtx.Execute(op.InvalidateCmd{At: t.until})
-	th := t.h.Theme()
-	cl := colorsOf(th)
-	win := gtx.Constraints.Max
-	fs := float32(15)
-	tw := textW(gtx, th, fs, theme.Bold, t.text)
-	if mx := win.X - dp(gtx, 80); tw > mx {
-		tw = mx
-	}
-	padX, h := dp(gtx, 16), dp(gtx, 44)
-	bg, rad := cl.Tooltip, dp(gtx, 8)
-	if t.pill {
-		h = dp(gtx, 34)
-		bg = rgba(0x000000, .7)
-		rad = h / 2
-	}
-	w := tw + 2*padX
-	r := image.Rect((win.X-w)/2, win.Y-h-dp(gtx, 28), (win.X+w)/2, win.Y-dp(gtx, 28))
-	if !t.pill {
-		softShadow(gtx, r, rad, dp(gtx, 4), dp(gtx, 12), cl.Shadow)
-	}
-	rrect(gtx, r, rad, bg)
-	fg := cl.TooltipText // .c-toast: content-inv-pry on base-inv-pry
-	if t.pill {
-		fg = rgb(0xffffff)
-	}
-	at(gtx, image.Pt(r.Min.X+padX, r.Min.Y), func(gtx layout.Context) layout.Dimensions {
-		gtx.Constraints = layout.Constraints{Max: image.Pt(tw, h)}
-		return vcenter(gtx, h, func(gtx layout.Context) layout.Dimensions {
-			return text(gtx, th, fs, theme.Bold, fg, t.text)
-		})
-	})
-	return layout.Dimensions{}
 }

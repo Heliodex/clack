@@ -42,6 +42,7 @@ func (a *App) hoverBegin(gtx layout.Context) {
 	h := &a.hover
 	if h.ctl.Pointer == nil {
 		h.ctl.Pointer = a.PointerPos
+		h.ctl.Origin = a.FrameOrigin
 		a.installAppCardHooks()
 	}
 	hovercard.SetDefault(&h.ctl)
@@ -153,6 +154,7 @@ func (a *App) hoverCardFrame(gtx layout.Context) {
 		h.setPeek(nil)
 		if h.urc == nil || h.gen != gen {
 			h.urc = popups.NewURLHoverCard(a, req.Anchor, req.URL)
+			h.urc.Placement().Start(req.Opposite)
 			h.gen = gen
 		}
 		g := gtx
@@ -163,6 +165,7 @@ func (a *App) hoverCardFrame(gtx layout.Context) {
 			}
 			h.urc.Layout(g)
 		}()
+		h.ctl.SetPlaced(h.urc.Placement().Opp())
 		h.ctl.CardArea(g, h.urc.Rect())
 		if !next.IsZero() && !next.After(gtx.Now.Add(time.Minute)) {
 			hovercard.Invalidate(gtx, next)
@@ -175,6 +178,9 @@ func (a *App) hoverCardFrame(gtx layout.Context) {
 		h.card, h.prev, h.chc, h.cvc = nil, nil, nil, nil
 		if h.tpk == nil || h.gen != gen {
 			h.setPeek(a.newSlugPeek(req.Anchor, req.ChannelID, req.Tab))
+			if h.tpk != nil {
+				h.tpk.Placement().Start(req.Opposite)
+			}
 			h.gen = gen
 		}
 		if h.tpk == nil {
@@ -194,6 +200,7 @@ func (a *App) hoverCardFrame(gtx layout.Context) {
 			h.setPeek(nil)
 			return
 		}
+		h.ctl.SetPlaced(h.tpk.Placement().Opp())
 		h.ctl.CardArea(g, h.tpk.Rect())
 		if !next.IsZero() && !next.After(gtx.Now.Add(time.Minute)) {
 			hovercard.Invalidate(gtx, next)
@@ -208,6 +215,7 @@ func (a *App) hoverCardFrame(gtx layout.Context) {
 			h.cvc = popups.NewCanvasMentionCard(a, req.Anchor, req.ChannelID, req.CanvasFile, req.CanvasSection)
 			h.gen = gen
 		}
+		h.cvc.SetAnchor(req.Anchor) // the bubble follows its mention (hovercard's package comment)
 		g := gtx
 		g.Constraints = layout.Constraints{Max: gtx.Constraints.Max}
 		h.cvc.Layout(g)
@@ -229,6 +237,7 @@ func (a *App) hoverCardFrame(gtx layout.Context) {
 		h.card, h.prev = nil, nil
 		if h.chc == nil || h.gen != gen {
 			h.chc = popups.NewChannelHoverCard(a, req.Anchor, req.ChannelID, req.Buttons, req.Texty)
+			h.chc.Placement().Start(req.Opposite)
 			h.gen = gen
 		}
 		g := gtx
@@ -244,6 +253,7 @@ func (a *App) hoverCardFrame(gtx layout.Context) {
 			h.chc = nil
 			return
 		}
+		h.ctl.SetPlaced(h.chc.Placement().Opp())
 		h.ctl.CardArea(g, h.chc.Rect())
 		if !next.IsZero() && !next.After(gtx.Now.Add(time.Minute)) {
 			hovercard.Invalidate(gtx, next)
@@ -257,6 +267,7 @@ func (a *App) hoverCardFrame(gtx layout.Context) {
 		h.card = nil
 		if h.prev == nil || h.gen != gen {
 			h.prev = popups.NewPreviewCard(a, req.Anchor, pc)
+			h.prev.Placement().Start(req.Opposite)
 			h.gen = gen
 		}
 		g := gtx
@@ -267,6 +278,7 @@ func (a *App) hoverCardFrame(gtx layout.Context) {
 			}
 			h.prev.Layout(g)
 		}()
+		h.ctl.SetPlaced(h.prev.Placement().Opp())
 		h.ctl.CardArea(g, h.prev.Rect())
 		if !next.IsZero() && !next.After(gtx.Now.Add(time.Minute)) {
 			hovercard.Invalidate(gtx, next)
@@ -280,6 +292,7 @@ func (a *App) hoverCardFrame(gtx layout.Context) {
 		} else {
 			h.card = popups.NewHoverCard(a, req.Anchor, req.UserID, req.BotID)
 		}
+		h.card.Placement().Start(req.Opposite)
 		h.gen = gen
 	}
 	g := gtx
@@ -295,6 +308,7 @@ func (a *App) hoverCardFrame(gtx layout.Context) {
 		h.card = nil
 		return
 	}
+	h.ctl.SetPlaced(h.card.Placement().Opp())
 	h.ctl.CardArea(g, h.card.Rect())
 	if next.IsZero() || next.After(gtx.Now.Add(time.Minute)) {
 		return
@@ -317,6 +331,18 @@ func (h *profileHover) setPeek(p *slugPeek) {
 func (a *App) installAppCardHooks() {
 	popups.OpenAppAbout = func(uid string) { a.openAppTab(uid, "about") }
 	popups.OpenAppTab = a.openAppTab
+	// App details' primary action facts read the primary view (3QxE
+	// getPrimaryView): its conversation and an app DM's open tab
+	popups.CurrentView = func() (string, string) {
+		ch := a.router.Current().Channel()
+		if ch == "" {
+			return "", ""
+		}
+		if dm := blockkit.AppDMFor(a, ch); dm != nil {
+			return ch, dm.Tab()
+		}
+		return ch, ""
+	}
 	// ChannelHoverCardHuddleBadge is the sidebar suffix's badge (huddleui
 	// Badge), and a channel-tab slug opens the channel card where Slack's
 	// does (core.ChannelTabSlugCard)

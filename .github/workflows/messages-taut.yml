@@ -2,7 +2,7 @@ name: messages-taut
 # The message list under Taut: builds Taut's published plugins with Taut's
 # own build:user-plugin (never committed: GPLv3) and runs internal/ui/messages'
 # plugin acceptance tests (ShutUpSlackbot, Censorship, BringBackSlackbot,
-# UserPronouns, WhoReacted, ShowSendingBot, IdvStatus) plus the zero-cost benchmark, on synthetic state.
+# UserPronouns, WhoReacted, ShowSendingBot, IdvStatus, ShowRealUser) plus the zero-cost benchmark, on synthetic state.
 on:
   push:
     branches: [ui, main] # agent branches run only ci + supply-chain on push; dispatch this one by hand (gh workflow run messages-taut.yml --ref <branch>)
@@ -24,9 +24,17 @@ env:
 permissions:
   contents: read
 
+# A newer run for the same branch, tag or PR cancels this one while it is
+# queued or running, so stale pushes don't pile up in the shared queue.
+# A dispatch with other inputs gets its own group.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.ref }}
+  cancel-in-progress: true
+
 jobs:
   plugins:
     runs-on: ubuntu-latest
+    timeout-minutes: 15 # budget: 1.5 x p95 (3.6 min) + 3, docs/CI-SPEED.md
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -43,7 +51,7 @@ jobs:
           git -C /tmp/taut checkout -q "$TAUT_REF"
           cd /tmp/taut && npm ci --ignore-scripts --no-audit --no-fund
           mkdir -p "$GITHUB_WORKSPACE/dist/taut-plugins"
-          for n in ShutUpSlackbot Censorship BringBackSlackbot UserPronouns WhoReacted ShowSendingBot IdvStatus; do
+          for n in ShutUpSlackbot Censorship BringBackSlackbot UserPronouns WhoReacted ShowSendingBot IdvStatus ShowRealUser; do
             f=$(ls plugins/$n.ts plugins/$n.tsx 2>/dev/null | head -1)
             npm run -s build:user-plugin -- "$f" "$GITHUB_WORKSPACE/dist/taut-plugins/$n.js"
           done

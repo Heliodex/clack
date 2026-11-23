@@ -22,8 +22,10 @@ import (
 	"gioui.org/unit"
 	"gioui.org/widget"
 
+	"github.com/some-du6e/clack/internal/i18n"
 	"github.com/some-du6e/clack/internal/ui/icons"
 	"github.com/some-du6e/clack/internal/ui/theme"
+	"github.com/some-du6e/clack/internal/ui/views"
 )
 
 // bbmCont is the view container the panel shows: Slack's
@@ -504,12 +506,9 @@ func (a *App) layoutSearchPill(gtx layout.Context, sorg image.Point, sw, sh int)
 	a.searchPill = image.Rectangle{Min: sorg, Max: sorg.Add(image.Pt(sw, sh))}
 	at(gtx, sorg, image.Pt(sw, sh), func(gtx layout.Context) layout.Dimensions {
 		d := clickArea(gtx, a.clicks.get("nav.search"), func(gtx layout.Context, sz image.Point, hovered bool) {
-			bg := c.SearchBg
-			if hovered {
-				bg = c.SearchHover
-			}
-			// Slack: rgba(249,237,255,.25) plus a rgba(131,56,138,.08) tint.
-			a.chrome(gtx, sorg, image.Rectangle{Max: sz}, gtx.Dp(4), bg, theme.SearchTint)
+			// theme-surf-inv-pry under the blended surf-inv-pry-hover layer,
+			// hovered or not (layoutTopNav's pill)
+			a.chrome(gtx, sorg, image.Rectangle{Max: sz}, gtx.Dp(4), c.SearchBg, c.ChromeHoverTint)
 		}, func(gtx layout.Context) layout.Dimensions {
 			sz := image.Pt(sw, sh)
 			if a.searchBoxIcon() {
@@ -612,6 +611,9 @@ func (a *App) bbmCrumbs() []bbmCrumb {
 			label = "Profile"
 		case secDetails:
 			label = "Details"
+			if _, ok := a.secondary.view.(*views.ExternalOrg); ok { // ia4's view names (eU)
+				label = i18n.T("ia4", "External organization")
+			}
 		case secCode: // no breadcrumb label: getAriaLabelForViewContent (session_channel_views)
 			label = a.codeDetailsLabel()
 		case secSearch:
@@ -624,6 +626,8 @@ func (a *App) bbmCrumbs() []bbmCrumb {
 			if p, ok := a.secondary.view.(*woPane); ok {
 				label = p.title(p.entity())
 			}
+		case secEmail: // FileDetails' titleContent
+			label = emailPaneTitle()
 		}
 		cs = append(cs, bbmCrumb{key: "secondary", label: label, last: true})
 	}

@@ -57,6 +57,16 @@ type desktopNote struct {
 	// Activated runs when the toast or one of its buttons is clicked (any
 	// goroutine; nil: nothing happens).
 	Activated func(toastActivation)
+	// pushChecked: the message path applied the conversation's
+	// desktop_push_enabled (notePushOn), which may turn its notifications
+	// on with the global switch off; textChecked: it wrote the body with
+	// no_text_in_notifications applied (notifyBody). notifyShow applies
+	// the global ones only to the rest.
+	pushChecked, textChecked bool
+	// soundThroughDND: a VIP sent the message and it came through Do Not
+	// Disturb (shouldOverrideDndForMessage), its sound too (canPlaySound);
+	// prioritySound: it plays priority_desktop_sound (Mvkl Tk).
+	soundThroughDND, prioritySound bool
 }
 
 // noteButton is one of actionButtons: buildNotificationActionButtons'
@@ -175,8 +185,17 @@ func splitJSSpace(s string) []string {
 // them (Chrome passes them whole, but Windows draws 2 lines of the title
 // and 4 of the body, far short of the cap), and the body's HTML entities decoded
 // (notifyBrowser's decodeHtmlEntities, for content the server sent).
-func (n *desktopNote) toastTitle() string { return shellTruncate(n.Title, 1500, 1700) }
-func (n *desktopNote) toastBody() string  { return toastUnescape(shellTruncate(n.Body, 1500, 2000)) }
+func (n *desktopNote) toastTitle() string { return shellTitle(n.Title) }
+func (n *desktopNote) toastBody() string  { return shellBody(n.Body) }
+
+// shellTitle and shellBody are what the shell makes of a notification's
+// title and body on every OS before it shows them (win32 gX; the Linux
+// build's E5 @1149611 of 4.53.276's main.bundle.cjs, whose result goes to
+// the Electron notification E3): the title capped (dP(title, 1500,
+// 1700)), the body capped (dP(body, 1500, 2000)) and then lodash
+// unescaped when it holds an entity (E8.test, E9 → E6).
+func shellTitle(s string) string { return shellTruncate(s, 1500, 1700) }
+func shellBody(s string) string  { return toastUnescape(shellTruncate(s, 1500, 2000)) }
 
 // isSlackURI is the shell's aw: a slack: link.
 func isSlackURI(s string) bool { return len(s) >= 6 && strings.EqualFold(s[:6], "slack:") }

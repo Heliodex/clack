@@ -7,6 +7,7 @@ import (
 
 	"github.com/some-du6e/clack/internal/desktop"
 	"github.com/some-du6e/clack/internal/i18n"
+	"github.com/some-du6e/clack/internal/logtag"
 )
 
 // The macOS notification, as Slack desktop's mac shell shows the webapp's
@@ -168,10 +169,10 @@ func (m *macNotifier) start() {
 		m.sys.SetHandler(m.respond)
 		m.sys.Request(func(granted bool, err error) {
 			if err != nil {
-				log.Printf("notify: macOS notification authorization: %v", err)
+				log.Printf("notify: macOS notification permission error: %v", err)
 				return
 			}
-			log.Printf("notify: macOS notification authorization: granted %t", granted)
+			log.Printf("notify: macOS notification permission: granted=%t", granted)
 		})
 	})
 }
@@ -210,14 +211,17 @@ func (m *macNotifier) NotifyNote(n *desktopNote) error {
 	}
 	opts := macOptions(n)
 	m.keep(n)
+	// the decision log's "notify: show" is the rules' (notify_decisions.go);
+	// whether the center shows it is logged here, with its tags
+	at := logtag.ID(n.Channel) + "/" + logtag.ID(n.Msg)
 	var once sync.Once
 	end := func(err error, timedOut bool) {
 		once.Do(func() {
 			switch {
 			case timedOut:
-				log.Printf("notify: macOS never reported showing a notification or failing to")
+				log.Printf("notify: macOS never reported showing the notification for %s or failing to", at)
 			case err != nil:
-				log.Printf("notify: macOS didn't show a notification: %v", err)
+				log.Printf("notify: macOS didn't show the notification for %s: %v", at, err)
 			}
 			m.deliveryCheck()
 		})

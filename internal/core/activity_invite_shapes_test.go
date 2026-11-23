@@ -57,7 +57,7 @@ func TestActivityStringInviteAllAndUnreads(t *testing.T) {
 					}
 				}
 			}
-			// the joiner (team_joiner_invite is behind an experiment in All)
+			// the joiner (the All feed never asks for team_joiner_invite)
 			j, err := a.Activity(ctx, ActivityOpts{Types: "team_joiner_invite", Unread: unread})
 			if err != nil || len(j.Items) != 1 || j.Items[0].Actor != "U0FAKE00002" {
 				t.Errorf("team_joiner_invite: %+v %v, want the joiner U0FAKE00002 from item.invite", j.Items, err)
@@ -129,16 +129,23 @@ func TestActivityRealtimeOddShapeArrives(t *testing.T) {
 	}
 	push("ping-1", "1762709000.000100", map[string]any{"type": "at_user", "invite": "I0ODD",
 		"message": map[string]any{"ts": "1762709000.000100", "channel": ch, "author_user_id": "U0FAKE00003"}})
-	push("ping-2", "1762709001.000100", map[string]any{"type": "team_joiner_invite", "invite": "U0FAKE00003",
+	push("ping-2", "1762709001.000100", map[string]any{"type": "prejoin_dm_welcome_party_alert",
+		"prejoin_dm_welcome_party_payload": map[string]any{"channel_id": ch, "is_reminder": "sometimes"}})
+	// activityUpdatedV2 (c07ab895506f) drops team_joiner_invite: not in its
+	// allow-list. Events apply in order, so once ping-3 is in, ping-joiner
+	// was handled.
+	push("ping-joiner", "1762709002.000100", map[string]any{"type": "team_joiner_invite", "invite": "U0FAKE00003",
 		"team_joiner_invite_payload": map[string]any{"channel_id": ch, "is_reminder": "sometimes"}})
-	log.wait(t, "both realtime entries", func(evs []Event) bool {
+	push("ping-3", "1762709003.000100", map[string]any{"type": "at_user",
+		"message": map[string]any{"ts": "1762709003.000100", "channel": ch, "author_user_id": "U0FAKE00003"}})
+	log.wait(t, "the realtime entries", func(evs []Event) bool {
 		n := 0
 		for _, ev := range evs {
-			if ev.Type == "activity" && ev.Activity != nil && (ev.Activity.Key == "ping-1" || ev.Activity.Key == "ping-2") {
+			if ev.Type == "activity" && ev.Activity != nil && (ev.Activity.Key == "ping-1" || ev.Activity.Key == "ping-2" || ev.Activity.Key == "ping-3") {
 				n++
 			}
 		}
-		return n == 2
+		return n == 3
 	})
 	for _, ev := range log.all() {
 		if ev.Type != "activity" || ev.Activity == nil {
@@ -150,9 +157,11 @@ func TestActivityRealtimeOddShapeArrives(t *testing.T) {
 				t.Errorf("ping-1: %+v", it)
 			}
 		case "ping-2":
-			if it.Actor != "U0FAKE00003" {
-				t.Errorf("ping-2: joiner %q", it.Actor)
+			if it.Type != "prejoin_dm_welcome_party_alert" || it.Channel != ch {
+				t.Errorf("ping-2: %+v", it)
 			}
+		case "ping-joiner":
+			t.Errorf("a realtime team_joiner_invite reached the views: %+v", it)
 		}
 	}
 }

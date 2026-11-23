@@ -7,22 +7,33 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"unicode"
 )
 
 // Session secrets must never reach logs, error strings or crash output:
 // xoxc/xoxd/xoxe/xoxp/xoxb tokens, the d, d-s and lc cookies, magic-login
-// link tokens (magic-login/<tok>, magic_tokens=, <i>.tokens=), and token=
-// query or form values (the realtime gateway URL carries the token).
+// link tokens (magic-login/<tok>, magic_tokens=, <i>.tokens=), token=
+// query or form values (the realtime gateway URL carries the token), and
+// the Slack CLI's sign-in ticket: the "/slackauthticket <ticket>" command
+// `slack login` prints for the composer (／ is the full-width slash Slack's
+// composer also takes), and the ticket= and challenge= values the CLI
+// redeems it with (apps.hosted.exchangeAuthTicket, docs/SLACKAUTHTICKET.md).
 
-var secretRE = regexp.MustCompile(`xox[a-z]-[^\s"'&;,)<>\]]+|\b(?i:token|enterprise_token|d|d-s|lc|magic_tokens|tokens)=[^\s"'&;,)<>\]]+|(?i:magic-login/)[A-Za-z0-9_-]+`)
+var secretRE = regexp.MustCompile(`xox[a-z]-[^\s"'&;,)<>\]]+|\b(?i:token|enterprise_token|d|d-s|lc|magic_tokens|tokens|ticket|challenge)=[^\s"'&;,)<>\]]+|(?i:magic-login/)[A-Za-z0-9_-]+|(?i:[/／]slackauthticket)\s+[^\s"'&;,)<>\]]+`)
 
 // Redact replaces anything that looks like a Slack token or session cookie
 // in s with a placeholder.
 func Redact(s string) string {
-	if !strings.Contains(s, "xox") && !strings.Contains(s, "=") && !strings.Contains(s, "agic-login/") {
+	if !strings.Contains(s, "xox") && !strings.Contains(s, "=") && !strings.Contains(s, "agic-login/") &&
+		!strings.Contains(strings.ToLower(s), "slackauthticket") {
 		return s
 	}
 	return secretRE.ReplaceAllStringFunc(s, func(m string) string {
+		if m[0] == '/' || strings.HasPrefix(m, "／") {
+			// "/slackauthticket <ticket>": the command stays, the ticket goes
+			// (the pattern puts whitespace between them)
+			return m[:strings.IndexFunc(m, unicode.IsSpace)] + " REDACTED"
+		}
 		if i := strings.IndexByte(m, '/'); i >= 0 && strings.HasPrefix(strings.ToLower(m), "magic-login/") {
 			return m[:i+1] + "REDACTED"
 		}

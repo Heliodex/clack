@@ -51,7 +51,47 @@ func (f JSFunc) CallResult(done func(result any, err error), args ...any) {
 	})
 }
 
+// CallEvent calls the JS function (an onKeyDown prop) with a DOM event
+// it gets as React's synthetic one, whose stopPropagation and
+// preventDefault it can call, and tells done (any goroutine) whether it
+// stopped it. A bridge that can't tell (EventBridge) gets the bare event,
+// and done hears false.
+func (f JSFunc) CallEvent(ev Props, done func(stopped bool)) {
+	b := bridge()
+	eb, ok := b.(EventBridge)
+	switch {
+	case f.ID == 0 || b == nil:
+		done(false)
+	case ok:
+		eb.CallEvent(f.ID, encodeArgs([]any{Props{"$event": ev}}), done)
+	default:
+		b.Call(f.ID, encodeArgs([]any{ev}), nil)
+		done(false)
+	}
+}
+
+// CallTruthy calls the JS function with args as Slack calls a handler
+// whose return value decides what runs next (TruthyBridge): done hears, on
+// any goroutine, whether it returned something truthy or threw, and err
+// when no runtime answered (ErrNoRuntime without a TruthyBridge). The
+// window is invalidated after.
+func (f JSFunc) CallTruthy(done func(truthy, threw bool, err error), args ...any) {
+	b := bridge()
+	tb, ok := b.(TruthyBridge)
+	if f.ID == 0 || b == nil || !ok {
+		done(false, false, errNoBridge)
+		return
+	}
+	tb.CallTruthy(f.ID, encodeArgs(args), func(truthy, threw bool, err error) {
+		done(truthy, threw, err)
+		invalidate()
+	})
+}
+
 var errNoBridge = errors.New("slackc: no plugin runtime")
+
+// ErrNoRuntime is what a call hears when no plugin runtime can answer.
+var ErrNoRuntime = errNoBridge
 
 // Element is a React element passed as a prop ({"$el":[…]}), e.g. a
 // Tooltip's tip; lay it out with Host.Element.
@@ -70,11 +110,24 @@ type Slot struct {
 	Name   string
 	Props  Props
 	Native Native
+	// OwnBox: Native draws the element's box itself, its background,
+	// borders and shadows (Styled.Wrap), so the layout engine leaves the
+	// "@" box's to it, as it does a host component's (HostElement.OwnBox).
+	// The className a plugin passes on reaches both the "@" box and the
+	// element the native enters: painted by both, a rule's translucent
+	// fill showed twice as strong, and its ring square round a round pill.
+	OwnBox bool
 }
 
 // Child makes a Slot.
 func Child(name string, p Props, native Native) Slot {
 	return Slot{Name: name, Props: p, Native: native}
+}
+
+// ChildBox is Child for a native that draws its element's box (OwnBox):
+// the reaction pill's UnstyledButton.
+func ChildBox(name string, p Props, native Native) Slot {
+	return Slot{Name: name, Props: p, Native: native, OwnBox: true}
 }
 
 // SlotOf returns the native slot an "@" node renders (its "$slot" prop).

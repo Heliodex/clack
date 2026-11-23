@@ -1,12 +1,12 @@
 package richview
 
 import (
+	"bytes"
 	"fmt"
 	"image"
 	"image/color"
 	"strings"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"gioui.org/f32"
@@ -30,8 +30,16 @@ import (
 // across frames; the layout is cached until the doc, the width, the scale
 // or the Style generation changes.
 type View struct {
-	doc  richtext.Doc
-	opts Options
+	// hitImgs is the last Layout's image cache, for HitAt (an
+	// AttachmentImage's PlayPauseAnimations turns on once its image
+	// decodes as an animation)
+	hitImgs Images
+	doc     richtext.Doc
+	opts    Options
+	// under is the opaque fill the View sits on when it isn't its
+	// palette's panel (SetUnder): the boxes' see-through fills (box.see)
+	// composite over it
+	under color.NRGBA
 
 	d       display
 	laidW   int
@@ -45,7 +53,11 @@ type View struct {
 	ops      op.Ops
 	call     op.CallOp // the recording under the images it doesn't hold (liveImgs)
 	callTop  op.CallOp // … and over them
+	callEll  op.CallOp // a clamp's "…", over the components too
 	recorded bool
+	// recHover is the hovered target whose text the recording drew in
+	// Slack's hover color (a pill's: hoverText), -1 none
+	recHover int16
 	pending  []int32 // imgs (>=0) or ^frag index of images not yet decoded
 	live     []int32 // frags of animated emoji: drawn every frame, not recorded
 	liveImgs []int32 // imgs of animated GIFs (animated.go): drawn every frame, not recorded
@@ -76,9 +88,16 @@ type View struct {
 	selA     int32
 	selB     int32
 	focused  bool
-	lastTap  time.Duration
-	tapCount int
+	// clicks counts the view's presses (the window's count, Gio patch 48;
+	// gio_patch48.go), tapCount the last press's, and gran the granule it
+	// selected by (a double click's word, a triple's paragraph), granA and
+	// granB that first granule, which a drag extends by gran
+	clicks       clickCounter
+	tapCount     int
+	gran         uint8
+	granA, granB int32
 	// clicks on a link target sent to the DOM (clickLink): its click count
+	// on stock Gio, which has no window count
 	clickT   int16
 	clickAt  time.Duration
 	clickN   int
@@ -90,6 +109,9 @@ type View struct {
 	dark     bool            // the last layout's Palette.Dark (MemberSlug's c-member_slug--dark)
 	hovMen   mentionKey      // the @mention last reported to the hover card
 	hovOn    bool
+	probe    hovercard.Probe // keeps ptr and hover honest when the layout moves (hovercard/anchor.go)
+	side     map[any]bool    // each trigger's Popover side (hovercard Request.Opposite), while drawn
+	origin   int             // a tag: the view's area, for its window origin as the layout put it (follow)
 	// the link preview whose hover trigger was last reported, and each
 	// preview's hover card content (unfurl_hover.go)
 	prevKey  previewKey
@@ -117,9 +139,17 @@ type View struct {
 
 	// expanded: attachments whose collapsed text was expanded (truncate.go)
 	expanded map[*richtext.Attachment]bool
-	// collapsed: image blocks hidden with their title-row toggle
-	collapsed map[*richtext.Image]bool
-	redraw    bool // ask for a frame after this frame's events
+	// collapsed: image blocks hidden with their title-row toggle (keys
+	// *richtext.Image), and call cards and containers toggled by the
+	// viewer, by keys that outlive a rebuilt Doc ("call:" + the call id,
+	// "container:" + Container.Key): the row's View keeps them through
+	// reactions, replies and chat.update, as Slack's component state and
+	// its redux expandables do. collapseDefs is the is_collapsible and
+	// default_collapsed each container key was last laid out with: a
+	// change resets its toggle (ContainerBlock's useEffect).
+	collapsed    map[any]bool
+	collapseDefs map[string]uint8
+	redraw       bool // ask for a frame after this frame's events
 
 	// lead: the first line's start (SetLead)
 	lead int
@@ -162,6 +192,12 @@ func (v *View) WordAt(off int32) (int32, int32) {
 	return a, b
 }
 
+// WordAtPoint returns what a double click at p selects (the message
+// list's): the image or emoji under p whole, else the word around p's
+// offset, the last word of a line that wraps when p is at or past its end
+// (wordAtPoint).
+func (v *View) WordAtPoint(p f32.Point) (int32, int32) { return v.wordAtPoint(p) }
+
 // LineAt returns the line (paragraph) range around off (triple-click).
 func (v *View) LineAt(off int32) (int32, int32) {
 	sa, sb := v.selA, v.selB
@@ -173,7 +209,7 @@ func (v *View) LineAt(off int32) (int32, int32) {
 
 // New returns a View for doc.
 func New(doc richtext.Doc, o Options) *View {
-	v := &View{hover: -1, press: -1, tipFrag: -1}
+	v := &View{hover: -1, press: -1, tipFrag: -1, recHover: -1}
 	v.Set(doc, o)
 	return v
 }
@@ -229,7 +265,7 @@ func (v *View) Release() {
 	}
 	v.d = display{}
 	v.ops = op.Ops{}
-	v.call, v.callTop = op.CallOp{}, op.CallOp{}
+	v.call, v.callTop, v.callEll = op.CallOp{}, op.CallOp{}, op.CallOp{}
 	v.recorded = false
 	v.pending, v.liveImgs = nil, nil
 	v.dirty = true
@@ -266,6 +302,9 @@ func (v *View) selRange() (int32, int32) {
 // Layout draws the doc at the constraints' max width and returns its size.
 func (v *View) Layout(gtx layout.Context, st *Style, h Handler) layout.Dimensions {
 	v.dark = st != nil && st.Palette.Dark
+	if st != nil {
+		v.hitImgs = st.Images
+	}
 	w := gtx.Constraints.Max.X
 	if v.opts.MaxWidth > 0 {
 		if mw := gtx.Dp(dpUnit(v.opts.MaxWidth)); mw < w {
@@ -287,6 +326,9 @@ func (v *View) Layout(gtx layout.Context, st *Style, h Handler) layout.Dimension
 	if v.namesChanged() {
 		v.dirty = true // a mention's plugin label changed (members.go)
 	}
+	if v.slugsChanged() {
+		v.dirty = true // a message slug's label reads otherwise now (slugs.go)
+	}
 	if v.dirty || w != v.laidW || gtx.Metric.PxPerDp != v.laidPx || gtx.Metric.PxPerSp != v.laidSp || st.gen != v.laidGen || mode != v.laidMode || uipref.Gen() != v.laidPf {
 		v.relayout(st, w, gtx.Metric.PxPerDp, gtx.Metric.PxPerSp)
 	} else if len(v.pending) > 0 && v.anyReady(st) {
@@ -294,6 +336,15 @@ func (v *View) Layout(gtx layout.Context, st *Style, h Handler) layout.Dimension
 	}
 	if !v.recorded {
 		v.record(st)
+	}
+	if v.probe.Missed() {
+		// not laid out for a frame: Gio forgot the handler and the Leave
+		// it was owed (Slack's spans unmounted, and mount unhovered, with
+		// new Popovers)
+		clear(v.side)
+		if v.hovering {
+			v.left()
+		}
 	}
 	v.events(gtx, st, h)
 	v.hoverCard(st, h)
@@ -314,8 +365,23 @@ func (v *View) Layout(gtx layout.Context, st *Style, h Handler) layout.Dimension
 	return v.draw(gtx, st)
 }
 
+// DrawnHook, when set (tests: a message body's frame, edit_latency_test.go),
+// sees the doc of every View as it paints it. UI goroutine.
+var DrawnHook func(doc richtext.Doc)
+
+// PaintedHook, when set (tests: which surface painted a body,
+// thread_reply_latency_test.go), sees every View as it paints. UI
+// goroutine.
+var PaintedHook func(v *View)
+
 // draw paints the laid-out doc and registers its input areas.
 func (v *View) draw(gtx layout.Context, st *Style) layout.Dimensions {
+	if h := DrawnHook; h != nil {
+		h(v.doc)
+	}
+	if h := PaintedHook; h != nil {
+		h(v)
+	}
 	size := v.d.size
 	if gtx.Constraints.Min.X > size.X {
 		size.X = gtx.Constraints.Min.X
@@ -328,15 +394,21 @@ func (v *View) draw(gtx layout.Context, st *Style) layout.Dimensions {
 	if v.opts.Dim {
 		opac = paint.PushOpacity(gtx.Ops, 0.5)
 	}
-	if v.selA != v.selB {
-		v.paintSelection(gtx, st)
+	if h := v.hoverText(st); h != v.recHover {
+		// a pill's text takes the hover color in the recording, not
+		// painted again over it
+		if v.staticText(h) || v.staticText(v.recHover) {
+			v.record(st)
+		} else {
+			v.recHover = h
+		}
 	}
-	// Hover backgrounds for pills, buttons and cards draw under the content.
+	// Hover backgrounds for buttons and cards draw under the content.
 	if v.hover >= 0 {
 		for i := range v.d.boxes {
 			b := &v.d.boxes[i]
-			if b.hov != 0 {
-				continue // a hover layer's: drawn with its layer (drawHoverLayers)
+			if b.hov != 0 || b.hoverOver {
+				continue // a hover layer's: drawn with its layer (drawHoverLayers); a pill's: over its fill
 			}
 			if (b.target == v.hover || b.tgTo > b.target && v.hover > b.target && v.hover <= b.tgTo) && b.hover.A > 0 {
 				switch b.kind {
@@ -344,7 +416,7 @@ func (v *View) draw(gtx layout.Context, st *Style) layout.Dimensions {
 					// Card hover: stronger border on top.
 					strokeRRect(gtx.Ops, b.r, b.radius, b.bw, b.hover)
 				default:
-					paint.FillShape(gtx.Ops, b.hover, clip.UniformRRect(b.r, b.radius).Op(gtx.Ops))
+					fillRadii(gtx.Ops, b.r, b.radii(), v.overUnder(b.hover, b.seeHover)) // a wrapped pill's lines: square where it broke
 				}
 			}
 		}
@@ -352,6 +424,24 @@ func (v *View) draw(gtx layout.Context, st *Style) layout.Dimensions {
 	v.call.Add(gtx.Ops)
 	for _, i := range v.liveImgs { // animated GIFs: their frame now, over what's under them
 		v.drawImg(gtx.Ops, st, int(i), false)
+	}
+	// A hovered pill's background takes its fill's place, on each line
+	// it runs on (.c-member_slug--link:hover, .p-rich_text_slug:hover):
+	// over the recorded fill, under its text. Components draw their own.
+	if v.hover >= 0 {
+		for i := range v.d.boxes {
+			if b := &v.d.boxes[i]; b.hoverOver && b.hov == 0 && b.comp == 0 && b.target == v.hover && b.hover.A > 0 && v.pillHoverFill(b) {
+				fillRadii(gtx.Ops, b.r, b.radii(), v.overUnder(b.hover, b.seeHover))
+			}
+		}
+	}
+	// The selection over the backgrounds, under the text: Chromium paints
+	// ::selection with the text (the text fragment's selection rect, then
+	// its glyphs), after every background below it, so it shows over a
+	// code block, a code chip and a mention pill (their fills are opaque
+	// here: Palette.flat). Drawn under v.call, those boxes hid it.
+	if v.selA != v.selB {
+		v.paintSelection(gtx, st)
 	}
 	v.callTop.Add(gtx.Ops)
 	v.drawPlays(gtx, st)
@@ -375,28 +465,8 @@ func (v *View) draw(gtx layout.Context, st *Style) layout.Dimensions {
 	if len(v.d.comps) > 0 {
 		v.layoutComps(gtx, st)
 	}
-	// a hovered message_mention pill's text and icon take Slack's hover
-	// color (.p-rich_text_slug:hover), over the recorded ones
-	if v.hover >= 0 && int(v.hover) < len(v.d.targets) && v.d.targets[v.hover].slug && st.Palette.SlugHoverText.A > 0 {
-		col := st.Palette.SlugHoverText
-		for i := range v.d.frags {
-			f := &v.d.frags[i]
-			if f.target != v.hover {
-				continue
-			}
-			switch f.kind {
-			case fText:
-				if f.sh != nil && len(f.sh.glyphs) > 0 {
-					v.paintGlyphs(gtx.Ops, st, f, col)
-				}
-			case fImage:
-				if name, ok := strings.CutPrefix(f.url, iconURL); ok {
-					g := *f
-					g.col = col
-					paintIcon(gtx.Ops, name, &g)
-				}
-			}
-		}
+	if v.d.ells > 0 {
+		v.callEll.Add(gtx.Ops)
 	}
 	if v.hover >= 0 && int(v.hover) < len(v.d.targets) {
 		switch tg := &v.d.targets[v.hover]; {
@@ -414,8 +484,8 @@ func (v *View) draw(gtx layout.Context, st *Style) layout.Dimensions {
 	v.drawCopyButtons(gtx, st)
 	v.drawFileSecs(gtx, st)
 	v.drawExpands(gtx, st)
-	v.drawPills(gtx, st)    // snippet.go
-	v.drawFileBars(gtx, st) // file_actions.go
+	v.drawPills(gtx, st)           // snippet.go
+	v.drawFileBars(gtx, st, false) // file_actions.go
 	v.drawHoverLayers(gtx, st)
 	v.drawRemoves(gtx, st)
 	if v.opts.Dim {
@@ -426,6 +496,10 @@ func (v *View) draw(gtx layout.Context, st *Style) layout.Dimensions {
 	// Input areas: the whole view takes text-selection input; clickable
 	// things show the hand cursor.
 	event.Op(gtx.Ops, v)
+	if v.hovering {
+		v.probe.Layout(gtx, v.ptr)
+	}
+	v.mounted(gtx, size)
 	pointer.CursorText.Add(gtx.Ops)
 	for i := range v.d.hits {
 		hr := &v.d.hits[i]
@@ -439,17 +513,7 @@ func (v *View) draw(gtx layout.Context, st *Style) layout.Dimensions {
 		pointer.CursorPointer.Add(gtx.Ops)
 		s.Pop()
 	}
-	for i := range v.d.bars { // the shown FileActions' buttons
-		if !v.barShown(i) {
-			continue
-		}
-		_, rs := v.barRects(i)
-		for _, r := range rs {
-			s := clip.Rect(r).Push(gtx.Ops)
-			pointer.CursorPointer.Add(gtx.Ops)
-			s.Pop()
-		}
-	}
+	v.barCursors(gtx, false) // the shown FileActions' buttons
 	for i := range v.d.codes {
 		if c := &v.d.codes[i]; c.block {
 			s := clip.Rect(v.copyButton(c)).Push(gtx.Ops)
@@ -484,6 +548,17 @@ func (v *View) draw(gtx layout.Context, st *Style) layout.Dimensions {
 			opac.Pop()
 		}
 	}
+	v.layoutMedia(gtx) // video tiles (Options.Media), likewise over the rest
+	// an audio card's FileActions, over its player (Slack's absolutely
+	// placed hover actions)
+	if v.opts.Dim {
+		opac = paint.PushOpacity(gtx.Ops, 0.5)
+	}
+	v.drawFileBars(gtx, st, true)
+	if v.opts.Dim {
+		opac.Pop()
+	}
+	v.barCursors(gtx, true)
 	d := layout.Dimensions{Size: size}
 	if b := v.d.firstBaseline(); b >= 0 && b <= size.Y {
 		d.Baseline = size.Y - b
@@ -533,7 +608,8 @@ func (v *View) relayout(st *Style, w int, pxdp, pxsp float32) {
 		v.expanded = map[*richtext.Attachment]bool{}
 	}
 	if v.collapsed == nil {
-		v.collapsed = map[*richtext.Image]bool{}
+		v.collapsed = map[any]bool{}
+		v.collapseDefs = map[string]uint8{}
 	}
 	if v.playing == nil {
 		v.playing = map[string]bool{}
@@ -542,7 +618,10 @@ func (v *View) relayout(st *Style, w int, pxdp, pxsp float32) {
 	// messages_theme != "dense")
 	pf := uipref.Get()
 	l := lay{st: st, d: &v.d, scale: pxdp, spx: pxsp, jumbo: v.doc.Jumbo && pf.Jumbomoji && !pf.Dense, lead: float32(v.lead), opts: v.opts, mode: mode, cs: &v.cs,
-		expanded: v.expanded, collapsed: v.collapsed, playing: v.playing, noAnim: uipref.Get().NoAnimations}
+		expanded: v.expanded, collapsed: v.collapsed, collapseDefs: v.collapseDefs, playing: v.playing, noAnim: uipref.Get().NoAnimations}
+	if v.opts.FillBlocks {
+		l.filled = 1 // a view's blocks (FillBlocks)
+	}
 	v.css.parts = v.css.parts[:0]
 	if v.css.scope.Active() {
 		l.css = &v.css
@@ -610,7 +689,8 @@ func (v *View) anyReady(st *Style) bool {
 	for _, p := range v.pending {
 		if p >= 0 {
 			im := &v.d.imgs[p]
-			if _, ok := st.Images.Get(im.url, im.px); ok {
+			// one whose own image failed is ready once its fallback is
+			if _, ok := st.Images.Get(imgSource(st.Images, im), im.px); ok {
 				return true
 			}
 		} else {
@@ -637,9 +717,15 @@ func (v *View) record(st *Style) {
 	m := op.Record(ops)
 	v.paintBelow(ops, st, 0)
 	v.call = m.Stop()
+	v.recHover = v.hoverText(st)
 	m = op.Record(ops)
 	v.paintAbove(ops, st, 0, nil)
 	v.callTop = m.Stop()
+	m = op.Record(ops)
+	if v.d.ells > 0 {
+		v.paintEllipses(ops, st)
+	}
+	v.callEll = m.Stop()
 	v.recorded = true
 }
 
@@ -661,7 +747,7 @@ func (v *View) paintBelow(ops *op.Ops, st *Style, comp int16) {
 		if b := &v.d.boxes[i]; b.layer == 0 && b.comp == comp && b.hov == hp {
 			v.drawBox(ops, b, css)
 			if hp != 0 && b.target >= 0 && b.target == v.hover && b.hover.A > 0 { // a hover layer's hovered button
-				fillRadii(ops, b.r, [4]int{b.radius, b.radius, b.radius, b.radius}, b.hover)
+				fillRadii(ops, b.r, b.radii(), v.overUnder(b.hover, b.seeHover))
 			}
 		}
 	}
@@ -700,12 +786,18 @@ func (v *View) paintAbove(ops *op.Ops, st *Style, comp int16, fg *color.NRGBA) {
 	ul := uipref.Get().UnderlineLinks
 	for i := range v.d.frags {
 		f := &v.d.frags[i]
-		if f.comp != comp || f.hov != hp {
-			continue
+		if f.comp != comp || f.hov != hp || f.ell && static {
+			continue // a clamp's "…" is recorded on its own (paintEllipses)
 		}
 		switch f.kind {
 		case fImage:
 			if name, ok := strings.CutPrefix(f.url, iconURL); ok { // a vector icon (pills)
+				if f.target >= 0 && f.target == v.recHover {
+					g := *f
+					g.col = st.Palette.SlugHoverText
+					paintIcon(ops, name, &g)
+					continue
+				}
 				paintIcon(ops, name, f)
 				continue
 			}
@@ -733,32 +825,19 @@ func (v *View) paintAbove(ops *op.Ops, st *Style, comp int16, fg *color.NRGBA) {
 			}
 			drawImage(ops, img, r, [4]int{}, false)
 		case fText:
-			if f.sh == nil || len(f.sh.glyphs) == 0 {
-				continue
-			}
 			col := f.col
-			if fg != nil {
+			if f.target >= 0 && f.target == v.recHover {
+				// a hovered pill's text in Slack's hover color
+				// (.p-rich_text_slug:hover, .c-member_slug--link:hover and
+				// the channel and group links': --sk_highlight_hover),
+				// painted once
+				col = st.Palette.SlugHoverText
+			} else if fg != nil {
 				col = *fg
 			} else if css && f.part != 0 {
 				col = v.textCol(f)
 			}
-			v.paintGlyphs(ops, st, f, col)
-			if f.style&(richtext.Strike|richtext.Underline) != 0 {
-				thick := max(1, f.size/14)
-				w := f.w + f.ulU // over the spaces of the same style
-				if f.style&richtext.Strike != 0 {
-					y := f.y - int(float32(f.size)*0.3+0.5)
-					paint.FillShape(ops, col, clip.Rect(image.Rect(int(f.x), y, int(f.x+w+0.5), y+thick)).Op())
-				}
-				if f.style&richtext.Underline != 0 {
-					underline(ops, f, w, col)
-				}
-			} else if ul && f.target >= 0 && int(f.target) < len(v.d.targets) && v.d.targets[f.target].website {
-				underline(ops, f, f.w+f.ulT, col) // Accessibility > "Underline links to websites"
-			}
-			if css && f.part != 0 {
-				v.partDeco(ops, i, col)
-			}
+			v.paintText(ops, st, i, col, css, ul)
 		}
 	}
 	for i := range v.d.boxes {
@@ -768,14 +847,185 @@ func (v *View) paintAbove(ops *op.Ops, st *Style, comp int16, fg *color.NRGBA) {
 	}
 }
 
+// paintText paints text frag i in col with its decorations.
+func (v *View) paintText(ops *op.Ops, st *Style, i int, col color.NRGBA, css, ul bool) {
+	f := &v.d.frags[i]
+	if f.sh == nil || len(f.sh.glyphs) == 0 {
+		return
+	}
+	v.paintGlyphs(ops, st, f, col)
+	if f.style&(richtext.Strike|richtext.Underline) != 0 {
+		thick := max(1, f.size/14)
+		w := f.w + f.ulU // over the spaces of the same style
+		if f.style&richtext.Strike != 0 {
+			y := f.y - int(float32(f.size)*0.3+0.5)
+			paint.FillShape(ops, col, clip.Rect(image.Rect(int(f.x), y, int(f.x+w+0.5), y+thick)).Op())
+		}
+		if f.style&richtext.Underline != 0 {
+			underline(ops, f, w, col)
+		}
+	} else if ul && f.target >= 0 && int(f.target) < len(v.d.targets) && v.d.targets[f.target].website {
+		underline(ops, f, f.w+f.ulT, col) // Accessibility > "Underline links to websites"
+	}
+	if css && f.part != 0 {
+		v.partDeco(ops, i, col)
+	}
+}
+
+// paintEllipses paints the clamps' "…", which go over everything on
+// their line (a component pill's box under them too): Chromium appends
+// the ellipsis to the line box after every child (PlaceEllipsisNextTo).
+// Only the static ones: a component card's or a hover layer's "…" is its
+// owner's (paintAbove draws it with the owner), so it goes when the owner
+// is hidden and isn't painted twice.
+func (v *View) paintEllipses(ops *op.Ops, st *Style) {
+	css := len(v.css.parts) > 0
+	for i := range v.d.frags {
+		if f := &v.d.frags[i]; staticEllipsis(f) {
+			col := f.col
+			if css && f.part != 0 {
+				col = v.textCol(f)
+			}
+			v.paintText(ops, st, i, col, css, false)
+		}
+	}
+}
+
+// staticEllipsis reports a clamp's "…" no component or hover layer owns.
+func staticEllipsis(f *frag) bool { return f.ell && f.comp == 0 && f.hov == 0 }
+
+// hoverText is the hovered target whose text takes Slack's hover color
+// (hoverRecolors), -1 none.
+func (v *View) hoverText(st *Style) int16 {
+	if v.hover >= 0 && int(v.hover) < len(v.d.targets) && st.Palette.SlugHoverText.A > 0 && v.hoverRecolors(v.hover) {
+		return v.hover
+	}
+	return -1
+}
+
+// staticText reports that target t has text or an icon in the recording.
+func (v *View) staticText(t int16) bool {
+	if t < 0 {
+		return false
+	}
+	for i := range v.d.frags {
+		if f := &v.d.frags[i]; f.target == t && f.comp == 0 && f.hov == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// pillHoverFill reports that b's own hover fill shows: no rule gives the
+// pill a background of its own (its component's WrapInline paints that).
+func (v *View) pillHoverFill(b *box) bool {
+	if b.part == 0 || len(v.css.parts) == 0 {
+		return true
+	}
+	ps := v.css.get(b.part)
+	return ps == nil || !ps.hasBg
+}
+
+// hoverRecolors reports that target t's text takes the hover color: a
+// message or link slug, or a member, channel or group pill (a system
+// message's names underline instead; a chip that only opens a card
+// doesn't change).
+func (v *View) hoverRecolors(t int16) bool {
+	tg := &v.d.targets[t]
+	if tg.slug {
+		return true
+	}
+	if tg.underline || tg.cardOnly || tg.kind != tUser && tg.kind != tChannel && tg.kind != tUsergroup {
+		return false
+	}
+	for i := range v.d.boxes {
+		if b := &v.d.boxes[i]; b.target == t && b.inline {
+			return true // it's a pill
+		}
+	}
+	return false
+}
+
+// targetBounds is target t's box: its words and images and its line
+// boxes (a pill's, also one holding only its picture where it wrapped
+// after it), the element's bounding rect an anchored card or a plugin's
+// click sees.
+func (v *View) targetBounds(t int16) image.Rectangle {
+	var r image.Rectangle
+	for i := range v.d.frags {
+		if f := &v.d.frags[i]; f.target == t {
+			r = r.Union(fragRect(f))
+		}
+	}
+	for i := range v.d.boxes {
+		if b := &v.d.boxes[i]; b.target == t && b.inline {
+			r = r.Union(b.r)
+		}
+	}
+	return r
+}
+
 // drawBox draws b, with its CSS part's fill when it has one.
-func (v *View) drawBox(ops *op.Ops, b *box, css bool) {
+// SetUnder is the opaque fill the View is drawn over this frame, when it
+// isn't its palette's panel (a hovered or flashing message row; the zero
+// color: the panel). The palette's see-through fills (a mention's, code's,
+// a pre block's) composite over it, as Slack's rgba fills blend over the
+// row's own background: the jump highlight's yellow shows through them.
+func (v *View) SetUnder(c color.NRGBA) {
+	if c.A != 255 {
+		c = color.NRGBA{}
+	}
+	if c != v.under {
+		v.under = c
+		v.recorded = false // the fills are in the recording
+	}
+}
+
+// overUnder is fill over the View's under: see, the rgba a see-through
+// fill of the palette is flattened from (box.see), composited over it
+// (sRGB) instead of over the panel. An opaque fill (see zero) stays,
+// whatever its color.
+func (v *View) overUnder(fill, see color.NRGBA) color.NRGBA {
+	if v.under.A != 255 || see.A == 0 {
+		return fill
+	}
+	return Over(see, v.under)
+}
+
+// drawnFill is box b's fill as drawBox paints it (outside a hovered
+// component pill): its CSS part's background in its place (css), else its
+// own, composited over the View's under when it's see-through.
+func (v *View) drawnFill(b *box, css bool) color.NRGBA {
 	if !css || b.part == 0 {
+		return v.overUnder(b.fill, b.see)
+	}
+	if f := v.boxFill(b); f != b.fill {
+		return f // the part's own background, color or opacity, not the palette's fill
+	}
+	return v.overUnder(b.fill, b.see)
+}
+
+func (v *View) drawBox(ops *op.Ops, b *box, css bool) {
+	if b.hoverOver && b.comp != 0 && b.target >= 0 && b.target == v.hover && b.hover.A > 0 && v.pillHoverFill(b) {
+		// a component pill, drawn each frame: hovered, its hover fill in
+		// place of its fill
+		bb := *b
+		bb.fill = v.overUnder(b.hover, b.seeHover)
+		drawBox(ops, &bb)
+		return
+	}
+	if !css || b.part == 0 {
+		if f := v.drawnFill(b, false); f != b.fill {
+			bb := *b
+			bb.fill = f
+			drawBox(ops, &bb)
+			return
+		}
 		drawBox(ops, b)
 		return
 	}
 	bb := *b
-	bb.fill = v.boxFill(b)
+	bb.fill = v.drawnFill(b, true)
 	if ps := v.css.get(b.part); ps != nil {
 		bb.stroke = mulAlpha(bb.stroke, ps.alpha)
 	}
@@ -893,35 +1143,7 @@ func (v *View) offsetAt(p f32.Point) int32 {
 		return 0
 	}
 	x, y := p.X, int(p.Y)
-	best := -1
-	bestD := 1 << 30
-	for i, ln := range lines {
-		if ln.f1 <= ln.f0 {
-			continue
-		}
-		var dy int
-		switch {
-		case y < ln.top:
-			dy = ln.top - y
-		case y >= ln.bot:
-			dy = y - ln.bot + 1
-		}
-		// Prefer lines whose horizontal span contains x (side-by-side fields).
-		f0, f1 := &v.d.frags[ln.f0], &v.d.frags[ln.f1-1]
-		dx := 0
-		if x < f0.x {
-			dx = int(f0.x - x)
-		} else if x > f1.x+f1.w {
-			dx = int(x - f1.x - f1.w)
-		}
-		d := dy*4 + dx/8
-		if dy == 0 {
-			d = dx / 8
-		}
-		if d < bestD {
-			bestD, best = d, i
-		}
-	}
+	best := v.lineAt(p)
 	if best < 0 {
 		return 0
 	}
@@ -951,6 +1173,42 @@ func (v *View) offsetAt(p f32.Point) int32 {
 	return v.d.frags[ln.f1-1].p1
 }
 
+// lineAt is the line a point is on, or nearest to (-1 without lines).
+func (v *View) lineAt(p f32.Point) int {
+	lines := v.d.lines
+	x, y := p.X, int(p.Y)
+	best := -1
+	bestD := 1 << 30
+	for i, ln := range lines {
+		if ln.f1 <= ln.f0 {
+			continue
+		}
+		var dy int
+		switch {
+		case y < ln.top:
+			dy = ln.top - y
+		case y >= ln.bot:
+			dy = y - ln.bot + 1
+		}
+		// Prefer lines whose horizontal span contains x (side-by-side fields).
+		f0, f1 := &v.d.frags[ln.f0], &v.d.frags[ln.f1-1]
+		dx := 0
+		if x < f0.x {
+			dx = int(f0.x - x)
+		} else if x > f1.x+f1.w {
+			dx = int(x - f1.x - f1.w)
+		}
+		d := dy*4 + dx/8
+		if dy == 0 {
+			d = dx / 8
+		}
+		if d < bestD {
+			bestD, best = d, i
+		}
+	}
+	return best
+}
+
 func bytesForRunes(s string, r int) int {
 	b := 0
 	for i := 0; i < r && b < len(s); i++ {
@@ -978,26 +1236,86 @@ func (v *View) targetAt(p f32.Point) int16 {
 	return -1
 }
 
+// selectWord selects what a double click at off does (HandleDoubleClick):
+// an image's or emoji's frag whole, else the word, whitespace or
+// character there (wordRange, words.go).
 func (v *View) selectWord(off int32) {
-	pl := v.d.plain
-	off = min(max(off, 0), int32(len(pl)))
-	a, b := int(off), int(off)
-	isW := func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '\'' }
-	for a > 0 {
-		r, sz := utf8.DecodeLastRune(pl[:a])
-		if !isW(r) {
-			break
+	off = min(max(off, 0), int32(len(v.d.plain)))
+	for i := range v.d.frags {
+		if f := &v.d.frags[i]; f.kind != fText && f.p0 >= 0 && f.p0 <= off && off < f.p1 {
+			v.selA, v.selB = f.p0, f.p1
+			return
 		}
-		a -= sz
 	}
-	for b < len(pl) {
-		r, sz := utf8.DecodeRune(pl[b:])
-		if !isW(r) {
-			break
-		}
-		b += sz
-	}
+	a, b := wordRange(v.d.plain, int(off))
 	v.selA, v.selB = int32(a), int32(b)
+}
+
+// wordAtPoint is what a double click at p selects: the image or emoji
+// under p whole, whichever half the press lands on (Blink's word around
+// an image takes the image; the right half's caret offset is after it),
+// else the word around p's offset (selectWord), the line's last word when
+// p is after the last word of a line that wraps (lineEndWord).
+func (v *View) wordAtPoint(p f32.Point) (int32, int32) {
+	pt := image.Pt(int(p.X), int(p.Y))
+	for i := range v.d.frags {
+		if f := &v.d.frags[i]; f.kind != fText && f.p0 >= 0 && f.p1 > f.p0 && pt.In(fragRect(f)) {
+			return f.p0, f.p1
+		}
+	}
+	off := v.offsetAt(p)
+	if w, ok := v.lineEndWord(p, off); ok {
+		off = w
+	}
+	sa, sb := v.selA, v.selB
+	v.selectWord(off)
+	a, b := v.selA, v.selB
+	v.selA, v.selB = sa, sb
+	return a, b
+}
+
+// lineEndWord is the offset whose word a double click at p takes when p's
+// offset off is after the last word of a line that wraps (its paragraph
+// goes on on the next line): that word's last byte, as Blink's
+// ChooseWordSide picks kPreviousWordIfOnBoundary at the end of a line
+// that isn't its paragraph's ("If the caret is after the last word in a
+// soft-wrapped line ... select that last word", selection_adjuster.cc),
+// not the space the line wraps at nor the next line's first word.
+func (v *View) lineEndWord(p f32.Point, off int32) (int32, bool) {
+	li := v.lineAt(p)
+	if li < 0 || li+1 >= len(v.d.lines) {
+		return 0, false
+	}
+	textEnd := func(ln lineInfo) int32 {
+		for fi := ln.f1 - 1; fi >= ln.f0; fi-- {
+			if f := &v.d.frags[fi]; f.p0 >= 0 {
+				return f.p1
+			}
+		}
+		return -1
+	}
+	textStart := func(ln lineInfo) int32 {
+		for fi := ln.f0; fi < ln.f1; fi++ {
+			if f := &v.d.frags[fi]; f.p0 >= 0 {
+				return f.p0
+			}
+		}
+		return -1
+	}
+	ln, next := v.d.lines[li], v.d.lines[li+1]
+	start, end, nextStart := textStart(ln), textEnd(ln), textStart(next)
+	pl := v.d.plain
+	if start < 0 || end <= start || nextStart < end || int(nextStart) > len(pl) || bytes.IndexByte(pl[end:nextStart], '\n') >= 0 {
+		return 0, false // not a soft wrap: the line ends its paragraph
+	}
+	wordEnd := end
+	for wordEnd > start && (pl[wordEnd-1] == ' ' || pl[wordEnd-1] == '\t') {
+		wordEnd--
+	}
+	if wordEnd == start || off < wordEnd {
+		return 0, false
+	}
+	return wordEnd - 1, true
 }
 
 func (v *View) selectLine(off int32) {
@@ -1007,13 +1325,7 @@ func (v *View) selectLine(off int32) {
 		v.selA, v.selB = a, b
 		return
 	}
-	a, b := int(off), int(off)
-	for a > 0 && pl[a-1] != '\n' {
-		a--
-	}
-	for b < len(pl) && pl[b] != '\n' {
-		b++
-	}
+	a, b := paragraphRange(pl, int(off)) // with its break (words.go)
 	v.selA, v.selB = int32(a), int32(b)
 }
 
@@ -1024,6 +1336,16 @@ func (v *View) events(gtx layout.Context, st *Style, h Handler) {
 			gtx.Execute(op.InvalidateCmd{})
 		}
 	}()
+	// the layout moved the view under a resting pointer (the probe's
+	// Leave, at the pointer's position then): Chromium's hover update
+	// after a layout, as a Move there would. First, before the view's own
+	// events: those are newer (a Move after the layout moved it, or the
+	// later Moves of several between frames, the probe hearing only the
+	// first), so they win. Not during a drag, whose Drag events carry the
+	// pointer.
+	if pos, ok := v.probe.Moved(gtx); ok && v.hovering && !v.dragging {
+		v.pointerAt(gtx, st, pos)
+	}
 	for {
 		ev, ok := gtx.Event(
 			pointer.Filter{Target: v, Kinds: pointer.Press | pointer.Release | pointer.Drag | pointer.Move | pointer.Enter | pointer.Leave | pointer.Cancel},
@@ -1057,31 +1379,9 @@ func (v *View) events(gtx layout.Context, st *Style, h Handler) {
 		case pointer.Event:
 			switch e.Kind {
 			case pointer.Enter, pointer.Move:
-				v.hovering = true
-				v.hover = v.targetAt(e.Position)
-				v.ptr = e.Position
-				v.tipOrg.Learn(e.Position)
-				if b := v.copyButtonAt(e.Position) + 1; b != v.copyHot {
-					v.copyHot, v.copyTipAt = b, gtx.Now
-				}
-				if b := v.fileSecAt(e.Position) + 1; b != v.secHot {
-					v.secHot, v.copyTipAt = b, gtx.Now
-				}
-				if b := v.expandAt(st, e.Position) + 1; b != v.expHot {
-					v.expHot, v.copyTipAt = b, gtx.Now
-				}
-				if bar, btn, _ := v.barAt(e.Position); barKey(bar, btn) != v.barHot {
-					v.barHot, v.copyTipAt = barKey(bar, btn), gtx.Now
-				}
-				if f := v.emojiAt(e.Position); f != v.tipFrag {
-					v.tipFrag, v.tipAt = f, gtx.Now
-				}
+				v.pointerAt(gtx, st, e.Position)
 			case pointer.Leave:
-				v.hovering = false
-				v.tipFrag = -1
-				if !v.dragging {
-					v.hover = -1
-				}
+				v.left()
 			case pointer.Cancel:
 				v.dragging = false
 				v.press = -1
@@ -1096,9 +1396,10 @@ func (v *View) events(gtx layout.Context, st *Style, h Handler) {
 						autoscrollVeto(gtx.Source, e)
 					}
 				}
-				if !ctxclick.Primary(e) || v.inSlot(e.Position) {
-					// element widgets take their own presses; a macOS
-					// Ctrl+click opens the owner's context menu instead
+				if !ctxclick.Primary(e) || v.inSlot(e.Position) && !v.onMediaBar(e.Position) {
+					// element widgets take their own presses (but an audio
+					// card's FileActions, over its player, are the doc's); a
+					// macOS Ctrl+click opens the owner's context menu instead
 					continue
 				}
 				if b := v.copyButtonAt(e.Position); b >= 0 { // a code block's copy button
@@ -1137,22 +1438,27 @@ func (v *View) events(gtx layout.Context, st *Style, h Handler) {
 					continue
 				}
 				off := v.offsetAt(e.Position)
-				if e.Time-v.lastTap < 400*time.Millisecond {
-					v.tapCount++
-				} else {
+				// the press's count (the window's, Gio patch 48); taps take
+				// no multi-click selection in text that isn't editable
+				// (Blink's mouse_down_allows_multi_click_)
+				v.tapCount = v.clicks.press(gtx.Source, e)
+				if e.Source != pointer.Mouse {
 					v.tapCount = 1
 				}
-				v.lastTap = e.Time
+				v.gran = granChar
 				switch {
 				case v.tapCount == 2:
-					v.selectWord(off)
+					v.selA, v.selB = v.wordAtPoint(e.Position)
+					v.gran = granWord
 				case v.tapCount >= 3:
 					v.selectLine(off)
+					v.gran = granParagraph
 				case e.Modifiers.Contain(key.ModShift) && v.HasSelection():
 					v.selB = off
 				default:
 					v.selA, v.selB = off, off
 				}
+				v.granA, v.granB = v.selA, v.selB
 				v.dragging = true
 				gtx.Execute(key.FocusCmd{Tag: v})
 			case pointer.Drag:
@@ -1162,7 +1468,11 @@ func (v *View) events(gtx layout.Context, st *Style, h Handler) {
 				if d := e.Position.Sub(v.pressPos); d.X*d.X+d.Y*d.Y > 9 {
 					v.moved = true
 				}
-				if v.moved && v.tapCount == 1 && !v.External {
+				switch {
+				case !v.moved || v.External:
+				case v.gran != granChar:
+					v.extendBy(v.offsetAt(e.Position))
+				case v.tapCount == 1:
 					v.selB = v.offsetAt(e.Position)
 				}
 			case pointer.Release:
@@ -1203,10 +1513,13 @@ func (v *View) events(gtx layout.Context, st *Style, h Handler) {
 				if !wasDrag {
 					continue
 				}
-				if !v.moved && v.tapCount == 1 {
-					if !v.External {
+				if !v.moved {
+					if v.tapCount == 1 && !v.External {
 						v.selA, v.selB = 0, 0
 					}
+					// every click acts, the second of a double click too
+					// (Blink's click: a link's default handler doesn't look
+					// at the detail)
 					if t := v.targetAt(e.Position); t >= 0 && t == v.press && h != nil {
 						anchor := image.Pt(int(e.Position.X), int(e.Position.Y)).Add(v.Origin)
 						if !v.clickLink(gtx, t, anchor, e, h) {
@@ -1214,10 +1527,121 @@ func (v *View) events(gtx layout.Context, st *Style, h Handler) {
 						}
 					}
 				}
+				if pc, ok := h.(PlainClicker); ok && v.press < 0 && v.tapCount == 1 && !e.Modifiers.Contain(key.ModShift) {
+					if d := e.Position.Sub(v.pressPos); d.X*d.X+d.Y*d.Y <= 16 {
+						pc.PlainClick()
+					}
+				}
 				v.press = -1
 			}
 		}
 	}
+}
+
+// pointerAt is the pointer over the view at p (an Enter or a Move, or
+// the layout moving the view under it): what it is on, and where.
+func (v *View) pointerAt(gtx layout.Context, st *Style, p f32.Point) {
+	v.hovering = true
+	v.hover = v.targetAt(p)
+	v.ptr = p
+	v.tipOrg.Learn(p)
+	if b := v.copyButtonAt(p) + 1; b != v.copyHot {
+		v.copyHot, v.copyTipAt = b, gtx.Now
+	}
+	if b := v.fileSecAt(p) + 1; b != v.secHot {
+		v.secHot, v.copyTipAt = b, gtx.Now
+	}
+	if b := v.expandAt(st, p) + 1; b != v.expHot {
+		v.expHot, v.copyTipAt = b, gtx.Now
+	}
+	if bar, btn, _ := v.barAt(p); barKey(bar, btn) != v.barHot {
+		v.barHot, v.copyTipAt = barKey(bar, btn), gtx.Now
+	}
+	if f := v.emojiAt(p); f != v.tipFrag {
+		v.tipFrag, v.tipAt = f, gtx.Now
+	}
+}
+
+// left is the pointer leaving the view (a Leave, or the view missing a
+// frame: Probe.Missed).
+func (v *View) left() {
+	v.hovering = false
+	v.tipFrag = -1
+	if !v.dragging {
+		v.hover = -1
+	}
+}
+
+// mounted tells the hover card controller this view is drawn, when the
+// open or pending card is one of its triggers' (Controller.Mounted). size
+// is the view's laid-out size.
+func (v *View) mounted(gtx layout.Context, size image.Point) {
+	c := hovercard.Default()
+	if c == nil {
+		return
+	}
+	for _, k := range [2]any{c.OpenKey(), c.PendingKey()} {
+		switch k := k.(type) {
+		case mentionKey:
+			if k.v == v {
+				c.Mounted(k)
+				v.keepSide(c, k)
+				v.follow(gtx, c, k, size)
+			}
+		case previewKey:
+			if k.v == v {
+				c.Mounted(k)
+				v.keepSide(c, k)
+			}
+		}
+	}
+}
+
+// follow tells an open canvas card where its mention is this frame
+// (Controller.Follow): Quip's positioners place the bubble again after
+// any change to the document, so it goes with its mention while the
+// pointer rests on it. The mention's window bounds come from the layout,
+// not the pointer: the view's area as the last frame put it (Gio patch
+// 53), whose frame asks for the next one when it moved the view (patch
+// 57: a block inserted above it, the canvas scrolling, the pane
+// resizing). The origin learned from pointer events is stale exactly
+// then: a collaborator's edit moves the mention under a pointer resting
+// on the card, and no pointer event reaches the view.
+func (v *View) follow(gtx layout.Context, c *hovercard.Controller, k mentionKey, size image.Point) {
+	if !c.Follows(k) || k.t < 0 || int(k.t) >= len(v.d.targets) {
+		return
+	}
+	func() {
+		defer pointer.PassOp{}.Push(gtx.Ops).Pop()
+		defer clip.Rect{Max: size}.Push(gtx.Ops).Pop()
+		event.Op(gtx.Ops, &v.origin)
+	}()
+	if org, ok := areaOrigin(gtx, &v.origin); ok {
+		// the router's coordinates include Gio's own title bar; the
+		// card's are the frame's
+		c.Follow(k, v.targetBounds(k.t).Add(org.Sub(c.FrameOrigin())))
+	}
+}
+
+// keepSide keeps the side k's open card was placed on (its Popover's
+// state, which lasts while the trigger is mounted).
+func (v *View) keepSide(c *hovercard.Controller, k any) {
+	if o, ok := c.Placed(k); ok {
+		if v.side == nil {
+			v.side = map[any]bool{}
+		}
+		v.side[k] = o
+	}
+}
+
+// WindowOrigin is the view's window origin as the pointer last showed it
+// (its tooltips' TipOrigin; tests).
+func (v *View) WindowOrigin() (image.Point, bool) {
+	b := v.tipOrg.Bounds()
+	if b.Empty() {
+		return image.Point{}, false
+	}
+	return b.Min.Mul(-1), true
 }
 
 // mentionKey identifies one @mention of a View to the hover card.
@@ -1249,13 +1673,14 @@ func (v *View) isChannelCard(t int16) bool {
 // shows a tooltip (rich text's Link passes showTooltip for every valid
 // URL; mrkdwn's renderLink its showTooltips) in UrlHoverCardTrigger with
 // truncated_url_hover_card on (URLHoverCard). A canvas's links are
-// Quip's, not BaseMrkdwnLink.
+// Quip's, not BaseMrkdwnLink, and an email body's are the email's
+// (EmailIframe: no hover card, and an http(s) one asks first).
 func (v *View) isURLCard(t int16) bool {
 	if t < 0 || int(t) >= len(v.d.targets) || URLHoverCard == nil || v.opts.Canvas {
 		return false
 	}
 	tg := &v.d.targets[t]
-	return tg.kind == tLink && tg.urlCard && tg.url != "" && URLHoverCard(tg.url)
+	return tg.kind == tLink && tg.urlCard && !tg.emailLink && tg.url != "" && URLHoverCard(tg.url)
 }
 
 // URLHoverCard, set by the ui root, reports whether a message link to
@@ -1338,12 +1763,8 @@ func (v *View) hoverCard(st *Style, h Handler) {
 	if !on {
 		return
 	}
-	var r image.Rectangle
-	for i := range v.d.frags {
-		if f := &v.d.frags[i]; f.target == t {
-			r = r.Union(fragRect(f))
-		}
-	}
+	r := v.targetBounds(t)
+	defer func() { c.ReportSide(k, v.side[k]) }() // its Popover's side
 	if urlCard {
 		c.ReportURL(k, v.d.targets[t].url, r, v.ptr) // UrlHoverCardTrigger: UrlHoverCard, position "top"
 		return
@@ -1363,7 +1784,9 @@ func (v *View) hoverCard(st *Style, h Handler) {
 	c.Report(k, v.d.targets[t].id, r, v.ptr)
 }
 
-// inSlot reports whether p is on an element run drawn by Options.Elements.
+// inSlot reports whether p is on an element run drawn by Options.Elements
+// or a video tile Options.Media draws: their widgets take their own
+// presses.
 func (v *View) inSlot(p f32.Point) bool {
 	pt := image.Pt(int(p.X), int(p.Y))
 	for i := range v.d.slots {
@@ -1371,7 +1794,7 @@ func (v *View) inSlot(p f32.Point) bool {
 			return true
 		}
 	}
-	return false
+	return v.inMedia(pt)
 }
 
 // targetText is the text a link target draws (its frags' plain text).
@@ -1420,27 +1843,37 @@ func (v *View) clickLink(gtx layout.Context, t int16, anchor image.Point, e poin
 	default:
 		return false
 	}
-	var r image.Rectangle
-	for i := range v.d.frags {
-		if f := &v.d.frags[i]; f.target == t {
-			r = r.Union(fragRect(f))
-		}
-	}
-	l.Rect = r.Add(v.Origin)
+	l.Rect = v.targetBounds(t).Add(v.Origin)
 	l.Text = text
 	l.Key = fmt.Sprintf("%p/%d/%s%s", v, t, tg.id, tg.url)
-	// the click count Slack's event carries (detail)
-	if t == v.clickT && e.Time-v.clickAt < 500*time.Millisecond {
+	// the click count Slack's event carries (detail): the window's (Gio
+	// patch 48, gio_patch48.go), on stock Gio this target's within the
+	// double-click time
+	if t == v.clickT && e.Time-v.clickAt <= doubleClickTime() {
 		v.clickN++
 	} else {
 		v.clickN = 1
 	}
 	v.clickT, v.clickAt = t, e.Time
-	return slackc.ClickLink(l, v.clickN, e.Modifiers, gtx.Metric.PxPerDp, func() { v.activateTarget(&tg, text, anchor, h) })
+	n := clicksOf(e)
+	if n <= 0 {
+		n = v.clickN
+	}
+	return slackc.ClickLink(l, n, e.Modifiers, gtx.Metric.PxPerDp, func() { v.activateTarget(&tg, text, anchor, h) })
 }
 
 func (v *View) activate(t int16, anchor image.Point, h Handler) {
 	v.activateTarget(&v.d.targets[t], v.targetText(t), anchor, h)
+}
+
+// targetRect is tg's (first) hit box, in the View's coordinates.
+func (v *View) targetRect(tg *target) (image.Rectangle, bool) {
+	for _, h := range v.d.hits {
+		if h.t >= 0 && int(h.t) < len(v.d.targets) && &v.d.targets[h.t] == tg {
+			return h.r, true
+		}
+	}
+	return image.Rectangle{}, false
 }
 
 // activateTarget is a click on tg (text: what it draws).
@@ -1450,7 +1883,23 @@ func (v *View) activateTarget(tg *target, text string, anchor image.Point, h Han
 	}
 	switch tg.kind {
 	case tLink, tCard:
+		if tg.kind == tLink && tg.slug && tg.msgCh != "" && tg.id != "" {
+			if mh, ok := h.(MessageMentionHandler); ok {
+				mh.OpenMessageMention(tg.msgCh, tg.id, tg.msgThread, tg.url)
+				break
+			}
+		}
 		if tg.url == "" {
+			break
+		}
+		// an email body's links (laid out as mrkdwn links, then marked)
+		// go through EmailIframe's onMessage, not BaseMrkdwnLink
+		if eh, ok := h.(EmailLinkHandler); ok && tg.emailLink {
+			eh.OpenEmailLink(tg.url)
+			break
+		}
+		if mh, ok := h.(MrkdwnLinkHandler); ok && tg.kind == tLink && tg.mrkdwn {
+			mh.OpenMrkdwnLink(tg.url, text)
 			break
 		}
 		if lh, ok := h.(LinkTextHandler); ok && tg.kind == tLink {
@@ -1492,13 +1941,29 @@ func (v *View) activateTarget(tg *target, text string, anchor image.Point, h Han
 		if wh, ok := h.(WorkObjectHandler); ok && tg.att != nil {
 			wh.WorkObject(v.woEvent(tg, anchor))
 		}
+	case tWorkflowCard: // a share_shortcut card (shortcut.go)
+		if wh, ok := h.(WorkflowCardHandler); ok {
+			if c, ok := tg.key.(*richtext.ShortcutCard); ok {
+				r := image.Rectangle{Min: anchor, Max: anchor}
+				if tg.id == "more" { // the menu opens from the ⋮ button itself (uJed: LeftBottom)
+					if hr, ok := v.targetRect(tg); ok {
+						r = hr
+					}
+				}
+				wh.WorkflowCard(tg.id, c, r)
+			}
+		}
 	case tSnippet: // a snippet's Show more / Show less (snippet.go)
 		if fh, ok := h.(FileActionHandler); ok && tg.file != nil {
 			fh.FileAction(tg.act, tg.file, image.Rectangle{Min: anchor, Max: anchor})
 		}
 	case tCollapse:
-		if tg.img != nil && v.collapsed != nil {
-			v.collapsed[tg.img] = !v.collapsed[tg.img]
+		var k any = tg.img
+		if tg.key != nil {
+			k = tg.key
+		}
+		if (tg.img != nil || tg.key != nil) && v.collapsed != nil {
+			v.collapsed[k] = !v.collapsed[k]
 			v.dirty = true
 			v.redraw = true
 		}

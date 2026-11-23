@@ -5,6 +5,7 @@ import (
 	"image"
 	"strings"
 
+	"github.com/some-du6e/clack/internal/ui/composer"
 	"github.com/some-du6e/clack/internal/ui/popups"
 	"github.com/some-du6e/clack/internal/ui/shortcut"
 	"github.com/some-du6e/clack/internal/ui/theme"
@@ -196,9 +197,12 @@ func (a *App) openStatusFromShortcut() {
 }
 
 func (a *App) signOut() {
+	a.closeInspectSession() // inspect_wire.go
 	if a.opts.SignOut != nil && a.data == nil {
 		a.opts.SignOut() // deletes the stored credentials
 	}
+	a.closeVideos()       // the players go with the session (video.go)
+	composer.CloseClips() // and a clip recording, never into the next session
 	if a.data != nil {
 		a.data.signOut()
 		a.data = nil

@@ -3,6 +3,8 @@ package richview
 import (
 	"strings"
 	"sync/atomic"
+
+	"github.com/some-du6e/clack/internal/richtext"
 )
 
 // User mentions name the member as plugins present it. Slack's mention
@@ -77,6 +79,48 @@ func memberReadFn() MemberRead {
 	return nil
 }
 
+var memberPeek atomic.Pointer[MemberRead]
+
+// SetMemberPeek installs (or with nil removes) MemberRead's peek: the same
+// answer, but no access recorded and nothing asked for (Slack's
+// getRawMemberById), for a check that reads the same members every frame
+// for what may have changed (MentionTextPeek).
+func SetMemberPeek(f MemberRead) {
+	if f == nil {
+		memberPeek.Store(nil)
+		return
+	}
+	memberPeek.Store(&f)
+}
+
+// MentionTextPeek is MentionText reading the member through the peek
+// when one is installed: a preview checking every frame whether a name
+// it drew reads otherwise now (a rename, a plugin's nickname) counted as
+// drawing the member each frame, and every status or huddle change of
+// theirs redrew every list (the hub's drawsMember).
+func MentionTextPeek(sp richtext.Span) (string, bool) {
+	p := memberPeek.Load()
+	if p == nil {
+		return MentionText(sp)
+	}
+	if sp.Kind != richtext.User || sp.ID == "" {
+		return "", false
+	}
+	if f := memberLabelFn(); f != nil {
+		if n, ok := f(sp.ID); ok {
+			return "@" + n, true
+		}
+	}
+	n, miss := (*p)(sp.ID)
+	if miss != MemberLoaded {
+		return "", true
+	}
+	if n = strings.TrimPrefix(n, "@"); n == "" {
+		return "", false
+	}
+	return "@" + n, true
+}
+
 // nameUse is a user mention a layout drew and the name it used ("" for
 // the parsed text), or what the store had instead (miss) and whether the
 // mention drew BaseMissingMember's bar for it (bar).
@@ -111,18 +155,48 @@ func mentionName(id string) (string, MemberMiss) {
 // exist. Each use is recorded so namesChanged can tell when to lay out
 // again.
 func (l *lay) mentionText(id, parsed string) (string, MemberMiss) {
+	txt, miss, n, read := mentionShown(id, parsed)
+	if read {
+		l.d.names = append(l.d.names, nameUse{id: id, name: n, miss: miss})
+	}
+	return txt, miss
+}
+
+// mentionShown is mentionText without noting the use (a table's column
+// measure): the text, the miss, the name read and whether one was.
+func mentionShown(id, parsed string) (txt string, miss MemberMiss, name string, read bool) {
 	if id == "" || memberLabelFn() == nil && memberReadFn() == nil {
-		return parsed, MemberLoaded
+		return parsed, MemberLoaded, "", false
 	}
 	n, miss := mentionName(id)
-	l.d.names = append(l.d.names, nameUse{id: id, name: n, miss: miss})
 	if miss != MemberLoaded {
-		return "", miss
+		return "", miss, n, true
 	}
 	if n == "" {
-		return parsed, MemberLoaded
+		return parsed, MemberLoaded, n, true
 	}
-	return "@" + n, MemberLoaded
+	return "@" + n, MemberLoaded, n, true
+}
+
+// MentionText is a user mention span's text as a message draws it now
+// (mentionText): "@" and the member's name as the store (or a plugin)
+// has it, "" while the store can't name them (the bar adds no text); ok
+// false for any other span, whose own text stays. For previews built
+// from a stored Doc (richtext.PlainTextWith), whose mentions keep the
+// name they were converted with: mentions aren't conversion refs, a
+// rename converts no message again.
+func MentionText(sp richtext.Span) (string, bool) {
+	if sp.Kind != richtext.User || sp.ID == "" || memberLabelFn() == nil && memberReadFn() == nil {
+		return "", false
+	}
+	n, miss := mentionName(sp.ID)
+	if miss != MemberLoaded {
+		return "", true
+	}
+	if n == "" {
+		return "", false
+	}
+	return "@" + n, true
 }
 
 // namesChanged reports a mention the last layout drew that reads
@@ -137,6 +211,12 @@ func (v *View) namesChanged() bool {
 		}
 	}
 	return changed
+}
+
+// PendingMentions lists the ids of the canvas mentions the last layout
+// drew as Quip's loading skeleton (canvasMissing), in order (tests).
+func (v *View) PendingMentions() []string {
+	return append([]string(nil), v.d.pending...)
 }
 
 // MissingMembers lists the user mentions the last layout drew as

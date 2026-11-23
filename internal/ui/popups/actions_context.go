@@ -1,7 +1,6 @@
 package popups
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"image"
@@ -13,7 +12,10 @@ import (
 	"gioui.org/op"
 
 	"github.com/some-du6e/clack/internal/core"
+	"github.com/some-du6e/clack/internal/imgcache"
+	"github.com/some-du6e/clack/internal/localimg"
 	"github.com/some-du6e/clack/internal/richtext"
+	"github.com/some-du6e/clack/internal/slack"
 	"github.com/some-du6e/clack/internal/ui/clipimg"
 	"github.com/some-du6e/clack/internal/ui/shortcut"
 	"github.com/some-du6e/clack/internal/ui/slackc"
@@ -64,17 +66,23 @@ func NewMessageContextMenu(h Host, at image.Point, m core.Message, where Message
 		wrap["threadTs"] = m.ThreadTS
 	}
 	return NewMenuOpts(h, items, MenuOpts{Anchor: a, Within: "MessageActionsMenu", WithinProps: p,
-		Wraps: []MenuWrap{{Name: "MessageActionsContextMenu", Props: wrap}}})
+		Wraps:  []MenuWrap{{Name: "MessageActionsContextMenu", Props: wrap}},
+		MAMenu: MessageActionsProps(p, "context")})
 }
 
+// ctxContainer is Slack's messageContainerType for a message menu's
+// container (client-boot ipGw: MESSAGE_PANE "Channel", THREAD "Thread",
+// THREADS_VIEW "Threads"; SEARCH "search" is newSearchResultMenu's), what
+// a message action provider sees in MAMenu's props and onSelectAction's
+// context.
 func ctxContainer(where MessageContext) string {
 	switch where {
 	case InThread:
-		return "thread"
+		return "Thread"
 	case InThreadsView:
-		return "threads_view"
+		return "Threads"
 	}
-	return "message_pane"
+	return "Channel"
 }
 
 // ctxHoverItems is the context menu's first group (kctM for "context"):
@@ -87,7 +95,7 @@ func ctxHoverItems(h Host, at image.Point, m core.Message, where MessageContext,
 	// a comment thread's root takes none in its thread (ThreadRootCanvas)
 	react := !m.System && (h.Core() == nil || h.Core().CanAddReaction(&m)) && !(where == InThread && m.IsCommentRoot())
 	if react {
-		items = append(items, MenuItem{Label: "Add reaction…", Icon: "add-reaction", Hint: nsMessage.T("R"), Keys: KeyReact, Do: func() {
+		items = append(items, MenuItem{Action: "add_reaction", Label: "Add reaction…", Icon: "add-reaction", Hint: nsMessage.T("R"), Keys: KeyReact, Do: func() {
 			h.ShowOverlay(NewReactionPicker(h, at, ch, ts, m.ThreadTS, nil))
 		}}.In(nsMessage))
 	}
@@ -100,7 +108,19 @@ func ctxHoverItems(h Host, at image.Point, m core.Message, where MessageContext,
 		case m.ReplyCount > 0 || isReply:
 			label = "Reply to thread"
 		}
-		items = append(items, MenuItem{Label: label, Icon: "threads", Hint: nsMessage.T("T"), Keys: KeyComment, Do: func() {
+		items = append(items, MenuItem{Action: "comment", Label: label, Icon: "threads", Hint: nsMessage.T("T"), Keys: KeyComment, Do: func() {
+			// the comment thunk (0yz+, default branch): setFocusInput for
+			// channel-(threadTs || ts), then the thread opens. The
+			// threadTs is the one the menu's container passes: none from a
+			// channel's list (AEjl), so a broadcast reply's key is its own
+			// ts and its parent's box stays unfocused, as in Slack; the
+			// Threads view passes the row's thread (aQNV). Not the wrap
+			// props' threadTs, which Clack sets for any reply.
+			key := ts
+			if where == InThreadsView && m.ThreadTS != "" {
+				key = m.ThreadTS
+			}
+			SetThreadFocusInput(h, ch, key)
 			if o.OnReply != nil {
 				o.OnReply()
 				return
@@ -116,14 +136,16 @@ func ctxHoverItems(h Host, at image.Point, m core.Message, where MessageContext,
 	// toolbar's label, its F or S hint, and no row when Slack has none;
 	// its id is share_message whatever the label (lq1n)
 	if sa, ok := ShareAction(h.Core(), &m, where == InThread); ok {
-		items = append(items, MenuItem{Key: "share_message", Label: sa.Label, Icon: "forward-msg", Hint: nsMessage.T(sa.Hint), Keys: KeyShare, Do: func() {
+		items = append(items, MenuItem{Key: "share_message", Action: "share_message", Label: sa.Label, Icon: "forward-msg", Hint: nsMessage.T(sa.Hint), Keys: KeyShare, Do: func() {
 			h.ShowOverlay(NewForwardModal(h, m))
 		}}.In(nsMessage))
 	}
 	// the to-do action (Yoyn, actions_todo.go): "Complete to-do" on a
-	// to-do, else "Add to-do"
+	// to-do, else "Add to-do", one action id for both (boot-shared:
+	// `{id: addToLaterTodos, name: S ? "Complete to-do" : "Add to-do"}`;
+	// clear_later_todo is Slack's separate, danger "Clear to-do")
 	ta := TodoActionFor(h.Core(), &m)
-	todo := MenuItem{Label: ta.Label, Icon: ta.MenuIcon, Hint: nsSaved.T("A"), Keys: KeyLaterTodos}.In(nsSaved)
+	todo := MenuItem{Action: "add_to_later_todos", Label: ta.Label, Icon: ta.MenuIcon, Hint: nsSaved.T("A"), Keys: KeyLaterTodos}.In(nsSaved)
 	todo.Do = func() {
 		if o.OnTodo != nil {
 			o.OnTodo()
@@ -176,51 +198,172 @@ func NewLinkMenu(h Host, at image.Point, l LinkMenu) *Menu {
 	}
 	if l.Image != "" {
 		items = append(items, Sep())
-		items = append(items, ctxImageItems(h, l.Image, l.Proxy)...)
+		items = append(items, ctxImageItems(h, l.Image, l.Image, "", l.Proxy)...)
 	}
-	return NewMenuOpts(h, items, MenuOpts{Anchor: pointRect(at), Width: 220})
+	return NewMenuOpts(h, shellTail(h, items), MenuOpts{Anchor: pointRect(at), Width: 220})
 }
 
 // NewImageMenu is the desktop shell's image menu (buildMenuForImage):
 // Copy Image and Copy Image URL. Emoji get it too.
 func NewImageMenu(h Host, at image.Point, src string, proxy bool) *Menu {
-	return NewMenuOpts(h, ctxImageItems(h, src, proxy), MenuOpts{Anchor: pointRect(at), Width: 220})
+	return NewImageMenuFrom(h, at, src, src, "", proxy)
 }
 
-func ctxImageItems(h Host, src string, proxy bool) []MenuItem {
+// NewImageMenuFrom is NewImageMenu for an image whose <img src> (what
+// Copy Image URL copies) isn't the URL Clack draws it from (shown, what
+// Copy Image copies): the image viewer's proxied media items. alt ("" for
+// none) is what Copy Image copies when shown can't be (the thumbnail the
+// viewer shows in an original's place: copyImage's stand-in).
+func NewImageMenuFrom(h Host, at image.Point, shown, src, alt string, proxy bool) *Menu {
+	return NewMenuOpts(h, shellTail(h, ctxImageItems(h, shown, src, alt, proxy)), MenuOpts{Anchor: pointRect(at), Width: 220})
+}
+
+// ctxImageItems are addImageItems: Copy Image (webContents.copyImageAt:
+// the image's pixels on the clipboard) and Copy Image URL (its srcURL).
+func ctxImageItems(h Host, shown, src, alt string, proxy bool) []MenuItem {
 	return []MenuItem{
-		{Label: "Copy Image", Do: func() { CopyImage(h, src, proxy, "") }},
+		{Label: "Copy Image", Do: func() { copyImage(h, shown, alt, proxy, "") }},
 		{Label: "Copy Image URL", DoCtx: func(gtx layout.Context) { copyText(gtx, src) }},
 	}
+}
+
+// ShellWindow is the window a desktop shell menu opens in, as the ui
+// root (the Host popups gets) answers for its own window: whether it is
+// full screen, and leaving full screen. A Host without it is never full
+// screen.
+type ShellWindow interface {
+	ShellFullScreen() bool
+	ExitShellFullScreen()
+}
+
+// shellTail is what the desktop shell's menus end with after their own
+// items: addInspectElement only in its developer mode, and
+// addToggleFullScreen, a separator and "Exit Full Screen" while the
+// window is full screen (the same on macOS, Windows and Linux, Slack
+// 4.53.276).
+func shellTail(h Host, items []MenuItem) []MenuItem {
+	w, ok := h.(ShellWindow)
+	if !ok || !w.ShellFullScreen() {
+		return items
+	}
+	return append(items, Sep(), MenuItem{Label: "Exit Full Screen", Do: w.ExitShellFullScreen})
 }
 
 // CopyImage puts the image at src on the clipboard (Slack-hosted images
 // come through core.Fetch; proxy forces that). It toasts ok ("" for none)
 // or the failure.
-func CopyImage(h Host, src string, proxy bool, ok string) {
-	run(h, func(ctx context.Context) (struct{}, error) {
-		data, err := fetchBytes(ctx, h, src, proxy)
-		if err != nil {
-			return struct{}{}, err
-		}
-		img, _, err := image.Decode(bytes.NewReader(data))
-		if err != nil {
-			return struct{}{}, err
-		}
-		return struct{}{}, clipimg.Write(ctx, img)
-	}, func(_ struct{}, err error) {
+func CopyImage(h Host, src string, proxy bool, ok string) { copyImage(h, src, "", proxy, ok) }
+
+// copyFileImage is a file menu's Copy image: the original (Slack's
+// getSrcForFullSizeImage: url_private), or, when Clack can't copy the
+// original at all (standIn: it needs more decode memory than an image may
+// have, its format isn't one Clack decodes, it's past the download limit),
+// the file's largest Slack thumbnail in its place, toasted as such
+// (copiedSmaller). A slow download, decode, encode or clipboard helper is
+// the original's own failure, never a reason for the thumbnail.
+func copyFileImage(h Host, f *richtext.File, ok string) {
+	src, alt := f.URL, ""
+	if f.Thumb != nil {
+		alt = f.Thumb.URL
+	}
+	if src == "" {
+		src, alt = alt, ""
+	}
+	copyImage(h, src, alt, true, ok)
+}
+
+// copiedSmaller is the toast for a copy of the file's thumbnail in its
+// original's place. Clack's: Slack copies only the original
+// (getSrcForFullSizeImage) and toasts "Image copied to clipboard" or
+// "Failed to copy image", nothing in between.
+const copiedSmaller = "Copied a smaller version of the image"
+
+// copyImage is CopyImage with a stand-in: alt ("" for none) is copied in
+// src's place when src can't be copied for a reason a smaller copy gets
+// around (standIn), and toasted as copiedSmaller.
+func copyImage(h Host, src, alt string, proxy bool, ok string) {
+	run(h, func(ctx context.Context) (bool, error) {
+		return copyImageWork(ctx, h, src, alt, proxy)
+	}, func(smaller bool, err error) {
 		switch {
 		case err != nil:
 			h.Toast("Failed to copy image: " + errText(err))
+		case smaller:
+			h.Toast(copiedSmaller)
 		case ok != "":
 			h.Toast(ok)
 		}
 	})
 }
 
+// copyImageWork copies src with the whole of ctx, or alt ("" for none) in
+// its place when src's failure is one a smaller copy gets around
+// (standIn); smaller says alt was copied. Any other failure of src (a
+// timeout, a cancelled copy, a failed download, the clipboard helper) is
+// returned as it is.
+func copyImageWork(ctx context.Context, h Host, src, alt string, proxy bool) (smaller bool, err error) {
+	err = copyFrom(ctx, h, src, proxy)
+	if err == nil || alt == "" || alt == src || !standIn(err) || ctx.Err() != nil {
+		return false, err
+	}
+	if aerr := copyFrom(ctx, h, alt, proxy); aerr != nil {
+		return false, err // the original's reason is the one to report
+	}
+	return true, nil
+}
+
+// standIn reports whether a file's thumbnail may stand in for an original
+// that failed with err: the original needs more decode memory than an
+// image may have, or is past MaxPixels or MaxSide (imgcache.ErrTooBig), or
+// is in a format Clack doesn't decode (image.ErrFormat), or is past the
+// download limit (slack.ErrTooLarge). Those are the original itself; a
+// timeout, a busy decode memory or a failed download are not, and copy
+// nothing in its place.
+func standIn(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	return errors.Is(err, imgcache.ErrTooBig) || errors.Is(err, image.ErrFormat) || errors.Is(err, slack.ErrTooLarge)
+}
+
+// copyFetch and copyWrite are copyFrom's download and clipboard write
+// (tests swap them: no network, no clipboard).
+var (
+	copyFetch = fetchBytes
+	copyWrite = clipimg.WriteCharged
+)
+
+// copyFrom puts the image at src on the clipboard. The decode charges
+// everything it allocates to a budget from imgcache's process-wide decode
+// memory (its dead buffers given back as it goes), and the clipboard
+// conversion charges its copies (the PNG) to the same budget, held until
+// the image is on the clipboard: an untrusted emoji or image too big for it
+// returns an error here (run's callback toasts it) instead of OOM-crashing
+// (this overlay has no recover). One the decode memory is too busy for
+// right now is tried again until ctx runs out (WithBudget).
+func copyFrom(ctx context.Context, h Host, src string, proxy bool) error {
+	data, err := copyFetch(ctx, h, src, proxy)
+	if err != nil {
+		return err
+	}
+	return imgcache.WithBudget(ctx, func(b *imgcache.Budget) error {
+		img, err := imgcache.DecodeBudget(data, imgcache.MaxPixels, imgcache.MaxSide, b)
+		if err != nil {
+			return err
+		}
+		return copyWrite(ctx, img, imgcache.ChargeFunc(b))
+	})
+}
+
 // fetchBytes downloads src: through core for Slack's hosts (or when
 // viaCore), else publicly without credentials (lbGet).
 func fetchBytes(ctx context.Context, h Host, src string, viaCore bool) ([]byte, error) {
+	if localimg.Is(src) { // a file being uploaded (the pending viewer): its own bytes, as Slack's blob: URL
+		if b, ok := localimg.Get(src); ok {
+			return b, nil
+		}
+		return nil, errors.New("the image is gone")
+	}
 	if c := h.Core(); c != nil && (viaCore || lbSlackHost(src)) {
 		data, _, err := c.Fetch(ctx, src)
 		return data, err
@@ -298,7 +441,7 @@ func NewFileMenu(h Host, at image.Point, m core.Message, f *richtext.File) *Menu
 		if src == "" && f.Thumb != nil {
 			src = f.Thumb.URL
 		}
-		cp := MenuItem{Label: "Copy image", Do: func() { CopyImage(h, src, true, nsFile.T("Image copied to clipboard")) }}.In(nsFile)
+		cp := MenuItem{Label: "Copy image", Do: func() { copyFileImage(h, f, nsFile.T("Image copied to clipboard")) }}.In(nsFile)
 		group(download)
 		if src != "" {
 			group(share, copyLink, cp, later)
@@ -397,7 +540,7 @@ func NewFileActionsMenu(h Host, btn image.Rectangle, m core.Message, f *richtext
 			src = f.Thumb.URL
 		}
 		if src != "" {
-			copyImg = MenuItem{Label: "Copy image", Do: func() { CopyImage(h, src, true, nsFile.T("Image copied to clipboard")) }}.In(nsFile)
+			copyImg = MenuItem{Label: "Copy image", Do: func() { copyFileImage(h, f, nsFile.T("Image copied to clipboard")) }}.In(nsFile)
 		}
 	}
 	group(later, open, copyLink, copyImg)
@@ -465,10 +608,7 @@ func ConfirmDeleteFile(h Host, f *richtext.File) {
 // DownloadFile saves f to the Downloads folder, like the lightbox's
 // Download button.
 func DownloadFile(h Host, f *richtext.File) {
-	src := f.URL
-	if src == "" {
-		src = f.Download
-	}
+	src := downloadSource(f)
 	if src == "" {
 		h.Toast("This file can't be downloaded")
 		return
@@ -478,6 +618,20 @@ func DownloadFile(h Host, f *richtext.File) {
 		name = f.Title
 	}
 	saveDownload(h, src, name, true, nil)
+}
+
+// downloadSource is what a file's Download fetches: its url_private (or
+// url_private_download); an audio file's url_private_download first, as
+// Slack's download does, never the aac rendition its player plays
+// (richtext.File.MediaURL).
+func downloadSource(f *richtext.File) string {
+	if f.IsAudio && f.Download != "" {
+		return f.Download
+	}
+	if f.URL != "" {
+		return f.URL
+	}
+	return f.Download
 }
 
 // saveDownload fetches src (through core when viaCore or on Slack's
@@ -516,7 +670,8 @@ func NewCodeMenu(h Host, at image.Point, code string, block bool) *Menu {
 		label = "Copy this code block"
 	}
 	items := []MenuItem{MenuItem{Label: label, DoCtx: func(gtx layout.Context) { copyText(gtx, code) }}.In(nsMessage)}
-	return NewMenuOpts(h, items, MenuOpts{Anchor: pointRect(at), Width: 220})
+	// the shell's own menu under the trigger's item: its tail too
+	return NewMenuOpts(h, shellTail(h, items), MenuOpts{Anchor: pointRect(at), Width: 220})
 }
 
 // NewTextSelectionMenu is Slack's TextSelectionContextMenu: Copy text

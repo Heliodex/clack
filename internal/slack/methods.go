@@ -152,10 +152,17 @@ type PostOpts struct {
 	Blocks                  json.RawMessage
 	Attachments             json.RawMessage // e.g. a shared section's [{blocks: [channel_section]}]
 	ClientMsgID             string
+	// BlocksOnly posts the blocks as Slack's sendMessage does for a
+	// message it built from a Delta (Run task now): no text, link_names
+	// or unfurl_links; the server makes the text from the blocks
+	BlocksOnly bool
 }
 
 func (c *Client) Post(ctx context.Context, o PostOpts) (*Message, error) {
 	p := url.Values{"channel": {o.Channel}, "text": {o.Text}, "link_names": {"true"}, "unfurl_links": {"true"}}
+	if o.BlocksOnly && len(o.Blocks) > 0 {
+		p = url.Values{"channel": {o.Channel}}
+	}
 	if o.ThreadTS != "" {
 		p.Set("thread_ts", o.ThreadTS)
 		if o.Broadcast {
@@ -182,8 +189,11 @@ func (c *Client) Post(ctx context.Context, o PostOpts) (*Message, error) {
 	return &r.Message, err
 }
 
+// Update is chat.update for an edit. Slack's commitMessageEdit (boot-shared
+// 4Tc8) sends {channel, ts, skip_dlp_user_warning: false, blocks}; Clack
+// also sends the text and link_names.
 func (c *Client) Update(ctx context.Context, ch, ts, text string, blocks json.RawMessage) error {
-	p := url.Values{"channel": {ch}, "ts": {ts}, "text": {text}, "link_names": {"true"}}
+	p := url.Values{"channel": {ch}, "ts": {ts}, "text": {text}, "link_names": {"true"}, "skip_dlp_user_warning": {"false"}}
 	if len(blocks) > 0 {
 		p.Set("blocks", string(blocks))
 	}
@@ -267,6 +277,18 @@ func (c *Client) agentVersion() string {
 	return c.agentVer
 }
 
+// gatewayURLOK reports whether raw may be dialled as the realtime gateway.
+// The URL carries the token, so only wss:// Slack hosts pass (or, for
+// tests against internal/fakeslack, this client's own loopback API
+// origin).
+func (c *Client) gatewayURLOK(raw string) bool {
+	if slackURL(raw, "wss") {
+		return true
+	}
+	pu, perr := url.Parse(raw)
+	return perr == nil && isLoopback(c.base) && (pu.Scheme == "ws" || pu.Scheme == "wss") && c.credsOK(pu)
+}
+
 // WebSocketURL builds the realtime gateway URL the web client uses
 // (verified against app.slack.com: org token, gateway_server from
 // client.getWebSocketURL's routing_context, and a real agent_version; the
@@ -282,19 +304,9 @@ func (c *Client) WebSocketURL(ctx context.Context, fallback bool) string {
 		Routing  string `json:"routing_context"`
 	}
 	err := c.Call(ctx, "client.getWebSocketURL", nil, &r)
-	// The URL gets the token appended, so only wss:// Slack hosts are used
-	// (or, for tests against internal/fakeslack, this client's own loopback
-	// API origin).
-	okURL := func(raw string) bool {
-		if slackURL(raw, "wss") {
-			return true
-		}
-		pu, perr := url.Parse(raw)
-		return perr == nil && isLoopback(c.base) && (pu.Scheme == "ws" || pu.Scheme == "wss") && c.credsOK(pu)
-	}
-	if err == nil && okURL(r.Primary) && !fallback {
+	if err == nil && c.gatewayURLOK(r.Primary) && !fallback {
 		base = r.Primary
-	} else if err == nil && okURL(r.Fallback) && fallback {
+	} else if err == nil && c.gatewayURLOK(r.Fallback) && fallback {
 		base = r.Fallback
 	}
 	tok := c.Creds.Token

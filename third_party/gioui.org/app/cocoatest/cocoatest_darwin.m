@@ -6,6 +6,9 @@
 // tests (cocoatest_darwin.go). ARC.
 
 #import <AppKit/AppKit.h>
+#import <Carbon/Carbon.h>
+#import <QuartzCore/CAMetalLayer.h>
+#import <objc/runtime.h>
 
 #include "_cgo_export.h"
 
@@ -87,6 +90,7 @@ void cocoatest_state(uintptr_t viewRef, cocoatest_window *s) {
 			strlcpy(s->title, t, sizeof(s->title));
 		}
 		s->screenFrame = flipped(w.frame);
+		s->occlusionVisible = (w.occlusionState & NSWindowOcclusionStateVisible) != 0;
 	}
 }
 
@@ -179,6 +183,16 @@ int cocoatest_reopen(int visible, int *handled) {
 	}
 }
 
+void cocoatest_terminate(void) {
+	dispatch_async(dispatch_get_main_queue(), ^{
+		// terminate: from the run loop, as AppKit sends it for the Dock's
+		// Quit or a quit Apple Event: not inside this main-queue block,
+		// which would hold the serial main queue for as long as terminate:
+		// waits (NSTerminateLater), so no dispatched work could run
+		[NSApp performSelector:@selector(terminate:) withObject:nil afterDelay:0];
+	});
+}
+
 void cocoatest_post_did_become_active(void) {
 	@autoreleasepool {
 		[[NSNotificationCenter defaultCenter] postNotificationName:NSApplicationDidBecomeActiveNotification object:NSApp];
@@ -241,6 +255,261 @@ void cocoatest_toggle_full_screen(uintptr_t view) {
 	}
 }
 
+// layoutChars is what the current keyboard layout types for the key at
+// code with m held (UCKeyTranslate, as the window server fills a key
+// event's characters in), AppKit's function-key characters for the
+// arrows; nil when the layout can't say.
+static NSString *layoutChars(unsigned short code, NSEventModifierFlags m) {
+	unichar fk = 0;
+	switch (code) {
+	case kVK_UpArrow:
+		fk = NSUpArrowFunctionKey;
+		break;
+	case kVK_DownArrow:
+		fk = NSDownArrowFunctionKey;
+		break;
+	case kVK_LeftArrow:
+		fk = NSLeftArrowFunctionKey;
+		break;
+	case kVK_RightArrow:
+		fk = NSRightArrowFunctionKey;
+		break;
+	}
+	if (fk != 0) {
+		return [NSString stringWithCharacters:&fk length:1];
+	}
+	TISInputSourceRef src = TISCopyCurrentKeyboardLayoutInputSource();
+	if (src == NULL) {
+		return nil;
+	}
+	NSString *s = nil;
+	CFDataRef data = (CFDataRef)TISGetInputSourceProperty(src, kTISPropertyUnicodeKeyLayoutData);
+	if (data != NULL) {
+		UInt32 mods = 0;
+		if (m & NSEventModifierFlagShift) mods |= shiftKey;
+		if (m & NSEventModifierFlagOption) mods |= optionKey;
+		if (m & NSEventModifierFlagControl) mods |= controlKey;
+		if (m & NSEventModifierFlagCommand) mods |= cmdKey;
+		UInt32 dead = 0;
+		UniChar buf[8];
+		UniCharCount n = 0;
+		OSStatus st = UCKeyTranslate((const UCKeyboardLayout *)CFDataGetBytePtr(data), code, kUCKeyActionDown,
+									 (mods >> 8) & 0xff, LMGetKbdType(), kUCKeyTranslateNoDeadKeysMask, &dead, 8, &n, buf);
+		if (st == noErr) {
+			s = [NSString stringWithCharacters:buf length:n];
+		}
+	}
+	CFRelease(src);
+	return s;
+}
+
+static NSEvent *keyEvent(NSEventType type, NSWindow *w, NSEventModifierFlags m, unsigned short code, NSString *chars, NSString *ign) {
+	return [NSEvent keyEventWithType:type
+							location:NSZeroPoint
+					   modifierFlags:m
+						   timestamp:[[NSProcessInfo processInfo] systemUptime]
+						windowNumber:w.windowNumber
+							 context:nil
+						  characters:chars
+		 charactersIgnoringModifiers:ign
+						   isARepeat:NO
+							 keyCode:code];
+}
+
+// the modifier keys in the order a hand presses them
+static const struct {
+	int mod;
+	NSEventModifierFlags flag;
+	unsigned short code;
+} modKeys[4] = {
+	{8, NSEventModifierFlagControl, kVK_Control},
+	{4, NSEventModifierFlagOption, kVK_Option},
+	{2, NSEventModifierFlagShift, kVK_Shift},
+	{1, NSEventModifierFlagCommand, kVK_Command},
+};
+
+void cocoatest_post_key(uintptr_t viewRef, int code, int mods, int direct, char *charsOut, char *ignOut, int n) {
+	@autoreleasepool {
+		charsOut[0] = 0;
+		ignOut[0] = 0;
+		NSView *view = (__bridge NSView *)(void *)viewRef;
+		NSWindow *w = view.window;
+		if (w == nil) {
+			return;
+		}
+		unsigned short c = (unsigned short)code;
+		NSMutableArray<NSEvent *> *evs = [NSMutableArray array];
+		NSEventModifierFlags held = 0;
+		for (int i = 0; i < 4; i++) {
+			if (mods & modKeys[i].mod) {
+				held |= modKeys[i].flag;
+				NSEvent *e = keyEvent(NSEventTypeFlagsChanged, w, held, modKeys[i].code, @"", @"");
+				if (e != nil) {
+					[evs addObject:e];
+				}
+			}
+		}
+		NSEventModifierFlags km = held;
+		if (c == kVK_UpArrow || c == kVK_DownArrow || c == kVK_LeftArrow || c == kVK_RightArrow) {
+			km |= NSEventModifierFlagFunction | NSEventModifierFlagNumericPad;
+		}
+		NSString *chars = layoutChars(c, held) ?: @"";
+		NSString *ign = layoutChars(c, held & NSEventModifierFlagShift) ?: @"";
+		strlcpy(charsOut, chars.UTF8String ?: "", n);
+		strlcpy(ignOut, ign.UTF8String ?: "", n);
+		NSEvent *down = keyEvent(NSEventTypeKeyDown, w, km, c, chars, ign);
+		NSEvent *up = keyEvent(NSEventTypeKeyUp, w, km, c, chars, ign);
+		if (down != nil) {
+			[evs addObject:down];
+		}
+		if (up != nil) {
+			[evs addObject:up];
+		}
+		for (int i = 3; i >= 0; i--) {
+			if (mods & modKeys[i].mod) {
+				held &= ~modKeys[i].flag;
+				NSEvent *e = keyEvent(NSEventTypeFlagsChanged, w, held, modKeys[i].code, @"", @"");
+				if (e != nil) {
+					[evs addObject:e];
+				}
+			}
+		}
+		for (NSEvent *e in evs) {
+			if (!direct) {
+				[NSApp postEvent:e atStart:NO];
+				continue;
+			}
+			switch (e.type) {
+			case NSEventTypeFlagsChanged:
+				[view flagsChanged:e];
+				break;
+			case NSEventTypeKeyDown:
+				[view keyDown:e];
+				break;
+			default:
+				[view keyUp:e];
+				break;
+			}
+		}
+	}
+}
+
+void cocoatest_keyboard_layout(char *out, int n) {
+	@autoreleasepool {
+		out[0] = 0;
+		TISInputSourceRef src = TISCopyCurrentKeyboardLayoutInputSource();
+		if (src == NULL) {
+			return;
+		}
+		CFStringRef sid = (CFStringRef)TISGetInputSourceProperty(src, kTISPropertyInputSourceID);
+		if (sid != NULL) {
+			CFStringGetCString(sid, out, n, kCFStringEncodingUTF8);
+		}
+		CFRelease(src);
+	}
+}
+
+// ---- TraceKeys: what a view's class gets of the key events ----
+
+static NSMutableString *keyTrace;
+static NSMutableSet<NSString *> *tracedClasses;
+static IMP origKeyDown, origKeyUp, origFlags, origDoCommand, origInsert, origInsertRange;
+
+static NSString *codepoints(NSString *s) {
+	NSMutableString *o = [NSMutableString string];
+	for (NSUInteger i = 0; i < s.length; i++) {
+		[o appendFormat:@"%sU+%04X", i > 0 ? " " : "", (unsigned)[s characterAtIndex:i]];
+	}
+	return o.length > 0 ? o : @"none";
+}
+
+static NSString *flagNames(NSEventModifierFlags f) {
+	NSMutableString *o = [NSMutableString string];
+	if (f & NSEventModifierFlagControl) [o appendString:@"⌃"];
+	if (f & NSEventModifierFlagOption) [o appendString:@"⌥"];
+	if (f & NSEventModifierFlagShift) [o appendString:@"⇧"];
+	if (f & NSEventModifierFlagCommand) [o appendString:@"⌘"];
+	if (f & NSEventModifierFlagFunction) [o appendString:@"fn"];
+	return o.length > 0 ? o : @"-";
+}
+
+static void traceEvent(NSString *what, NSEvent *e) {
+	[keyTrace appendFormat:@"%@ code %d %@ chars %@ ignoring %@\n", what, (int)e.keyCode, flagNames(e.modifierFlags),
+						   e.type == NSEventTypeFlagsChanged ? @"-" : codepoints(e.characters),
+						   e.type == NSEventTypeFlagsChanged ? @"-" : codepoints(e.charactersIgnoringModifiers)];
+}
+
+static void tKeyDown(id self, SEL cmd, NSEvent *e) {
+	traceEvent(@"keyDown:", e);
+	((void (*)(id, SEL, NSEvent *))origKeyDown)(self, cmd, e);
+}
+
+static void tKeyUp(id self, SEL cmd, NSEvent *e) {
+	traceEvent(@"keyUp:", e);
+	((void (*)(id, SEL, NSEvent *))origKeyUp)(self, cmd, e);
+}
+
+static void tFlags(id self, SEL cmd, NSEvent *e) {
+	traceEvent(@"flagsChanged:", e);
+	((void (*)(id, SEL, NSEvent *))origFlags)(self, cmd, e);
+}
+
+static void tDoCommand(id self, SEL cmd, SEL action) {
+	[keyTrace appendFormat:@"  doCommandBySelector: %@\n", NSStringFromSelector(action)];
+	((void (*)(id, SEL, SEL))origDoCommand)(self, cmd, action);
+}
+
+static NSString *plain(id s) {
+	return [s isKindOfClass:[NSAttributedString class]] ? [(NSAttributedString *)s string] : (NSString *)s;
+}
+
+static void tInsert(id self, SEL cmd, id s) {
+	[keyTrace appendFormat:@"  insertText: %@\n", codepoints(plain(s))];
+	((void (*)(id, SEL, id))origInsert)(self, cmd, s);
+}
+
+static void tInsertRange(id self, SEL cmd, id s, NSRange r) {
+	[keyTrace appendFormat:@"  insertText:replacementRange: %@\n", codepoints(plain(s))];
+	((void (*)(id, SEL, id, NSRange))origInsertRange)(self, cmd, s, r);
+}
+
+static IMP swap(Class c, SEL sel, IMP imp) {
+	Method m = class_getInstanceMethod(c, sel);
+	return m != NULL ? method_setImplementation(m, imp) : NULL;
+}
+
+void cocoatest_trace_keys(uintptr_t viewRef) {
+	@autoreleasepool {
+		Class c = [(__bridge NSView *)(void *)viewRef class];
+		if (tracedClasses == nil) {
+			tracedClasses = [NSMutableSet set];
+			keyTrace = [NSMutableString string];
+		}
+		NSString *name = NSStringFromClass(c);
+		if ([tracedClasses containsObject:name] || tracedClasses.count > 0) {
+			return; // one class: the originals are kept in statics
+		}
+		[tracedClasses addObject:name];
+		origKeyDown = swap(c, @selector(keyDown:), (IMP)tKeyDown);
+		origKeyUp = swap(c, @selector(keyUp:), (IMP)tKeyUp);
+		origFlags = swap(c, @selector(flagsChanged:), (IMP)tFlags);
+		origDoCommand = swap(c, @selector(doCommandBySelector:), (IMP)tDoCommand);
+		origInsert = swap(c, @selector(insertText:), (IMP)tInsert);
+		origInsertRange = swap(c, @selector(insertText:replacementRange:), (IMP)tInsertRange);
+	}
+}
+
+char *cocoatest_key_trace(void) {
+	@autoreleasepool {
+		if (keyTrace == nil || keyTrace.length == 0) {
+			return NULL;
+		}
+		char *s = strdup(keyTrace.UTF8String);
+		[keyTrace setString:@""];
+		return s;
+	}
+}
+
 static __weak NSView *trackedView;
 static __weak NSWindow *trackedWindow;
 
@@ -257,6 +526,138 @@ void cocoatest_alive(int *view, int *window) {
 		*view = trackedView != nil;
 		*window = trackedWindow != nil;
 	}
+}
+
+// ---- Clack patch (CLACK_PATCHES.md §32): occlusion, sleep and drawables ----
+
+static NSWindow *coverWindow;
+
+void cocoatest_cover(void) {
+	@autoreleasepool {
+		NSRect all = NSZeroRect;
+		for (NSScreen *s in [NSScreen screens]) {
+			all = NSUnionRect(all, s.frame);
+		}
+		// larger than any window under it: macOS may not count a window of
+		// the same size as covering (Chromium's WindowOcclusionCheckerMac)
+		all = NSInsetRect(all, -40, -40);
+		if (coverWindow == nil) {
+			coverWindow = [[NSWindow alloc] initWithContentRect:all
+													  styleMask:NSWindowStyleMaskBorderless
+														backing:NSBackingStoreBuffered
+														  defer:NO];
+			coverWindow.releasedWhenClosed = NO;
+			coverWindow.opaque = YES;
+			coverWindow.backgroundColor = NSColor.blackColor;
+			coverWindow.hasShadow = NO;
+			coverWindow.level = NSFloatingWindowLevel;
+		}
+		[coverWindow setFrame:all display:YES];
+		[coverWindow orderFrontRegardless];
+	}
+}
+
+void cocoatest_uncover(void) {
+	@autoreleasepool {
+		[coverWindow orderOut:nil];
+	}
+}
+
+void cocoatest_post_workspace(int note) {
+	@autoreleasepool {
+		NSString *names[4] = {
+			NSWorkspaceWillSleepNotification,
+			NSWorkspaceDidWakeNotification,
+			NSWorkspaceScreensDidSleepNotification,
+			NSWorkspaceScreensDidWakeNotification,
+		};
+		if (note < 0 || note > 3) {
+			return;
+		}
+		NSWorkspace *ws = [NSWorkspace sharedWorkspace];
+		[ws.notificationCenter postNotificationName:names[note] object:ws];
+	}
+}
+
+int cocoatest_drawable_timeout(uintptr_t viewRef) {
+	@autoreleasepool {
+		NSView *view = (__bridge NSView *)(void *)viewRef;
+		if (![view.layer isKindOfClass:[CAMetalLayer class]]) {
+			return -1;
+		}
+		if (@available(macOS 10.13, *)) {
+			return ((CAMetalLayer *)view.layer).allowsNextDrawableTimeout ? 1 : 0;
+		}
+		return 0;
+	}
+}
+
+// A layer whose drawables the compositor keeps: while held, every
+// CAMetalLayer's nextDrawable answers as CAMetalLayer documents for a pool
+// with none free, waiting a second and giving nil with
+// allowsNextDrawableTimeout, waiting until the release without it.
+// (Holding drawables doesn't do it: on the macOS 26 runner a layer gave 8
+// unpresented ones, textures taken, without waiting.)
+static IMP origNextDrawable;
+static NSCondition *drawableCond;
+static BOOL drawablesHeld;
+static int heldCalls;
+
+static id heldNextDrawable(id self, SEL cmd) {
+	NSCondition *c = drawableCond;
+	[c lock];
+	if (drawablesHeld) {
+		heldCalls++;
+		BOOL timeout = YES;
+		if (@available(macOS 10.13, *)) {
+			timeout = ((CAMetalLayer *)self).allowsNextDrawableTimeout;
+		}
+		NSDate *limit = timeout ? [NSDate dateWithTimeIntervalSinceNow:1.0] : [NSDate distantFuture];
+		while (drawablesHeld && [c waitUntilDate:limit]) {
+		}
+		if (drawablesHeld) {
+			[c unlock];
+			return nil;
+		}
+	}
+	[c unlock];
+	return ((id (*)(id, SEL))origNextDrawable)(self, cmd);
+}
+
+void cocoatest_hold_drawables(void) {
+	@autoreleasepool {
+		if (drawableCond == nil) {
+			drawableCond = [[NSCondition alloc] init];
+			Method m = class_getInstanceMethod([CAMetalLayer class], @selector(nextDrawable));
+			origNextDrawable = method_setImplementation(m, (IMP)heldNextDrawable);
+		}
+		[drawableCond lock];
+		drawablesHeld = YES;
+		heldCalls = 0;
+		[drawableCond unlock];
+	}
+}
+
+void cocoatest_release_drawables(void) {
+	NSCondition *c = drawableCond;
+	if (c == nil) {
+		return;
+	}
+	[c lock];
+	drawablesHeld = NO;
+	[c broadcast];
+	[c unlock];
+}
+
+int cocoatest_held_calls(void) {
+	NSCondition *c = drawableCond;
+	if (c == nil) {
+		return 0;
+	}
+	[c lock];
+	int n = heldCalls;
+	[c unlock];
+	return n;
 }
 
 static void runMain(void *h) {

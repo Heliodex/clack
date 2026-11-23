@@ -37,11 +37,10 @@ import (
 	"gioui.org/widget"
 	"gioui.org/x/explorer"
 	_ "golang.org/x/image/bmp"
-	xdraw "golang.org/x/image/draw"
-	_ "golang.org/x/image/webp"
 
 	"github.com/some-du6e/clack/internal/core"
 	"github.com/some-du6e/clack/internal/i18n"
+	"github.com/some-du6e/clack/internal/imgcache" // registers WebP for image.DecodeConfig
 	"github.com/some-du6e/clack/internal/localimg"
 	"github.com/some-du6e/clack/internal/ui/icons"
 	"github.com/some-du6e/clack/internal/ui/popups"
@@ -49,6 +48,7 @@ import (
 	"github.com/some-du6e/clack/internal/ui/slackc"
 	"github.com/some-du6e/clack/internal/ui/theme"
 	"github.com/some-du6e/clack/internal/ui/uiguard"
+	"github.com/some-du6e/clack/internal/ui/videoplayer"
 )
 
 // Attachments: the + menu, file pickers, clipboard images and the chip row
@@ -62,13 +62,19 @@ import (
 // file from a file manager onto the window can't be supported yet.
 
 const (
-	attMaxFileSize  = 1 << 30  // Slack's per-file upload limit (1 GB)
-	attMaxTotalSize = 1 << 30  // what one message may hold in memory
-	attMaxFiles     = 10       // Slack attaches at most 10 files to a message
-	attMaxPixels    = 80 << 20 // don't decode thumbnails of images above 80 MP
-	attChipH        = 62       // dp, chip height (and image thumbnail side)
-	attCardW        = 240      // dp, file card width
-	attRadius       = 12       // dp, chip corner radius
+	attMaxFileSize  = 1 << 30 // Slack's per-file upload limit (1 GB)
+	attMaxTotalSize = 1 << 30 // what one message may hold in memory
+	attMaxFiles     = 10      // Slack attaches at most 10 files to a message
+	// attMaxPixels: a thumbnail isn't decoded for an image claiming more
+	// than 80 MP. Under it the decode is still bounded by imgcache's
+	// decode memory (MaxDecode): a thumbnail that doesn't fit (an RGBA PNG
+	// past ~58 MP, a big progressive JPEG) degrades to the file chip, as an
+	// undecodable one does (makeThumb); the upload itself is unchanged.
+	attMaxPixels = 80 << 20
+	attChipH     = 62  // dp, chip height (and image thumbnail side)
+	attCardW     = 240 // dp, file card width
+	attClipW     = 210 // dp, a pending clip's pillow: 184 + 2×12 + 2
+	attRadius    = 12  // dp, chip corner radius
 )
 
 var (
@@ -113,6 +119,14 @@ type attChip struct {
 	kind  attKind
 	// thumbURL is Slack's thumbnail of a restored file (draft_files.go).
 	thumbURL string
+	// clip is a recorded voice clip's File fields (clips.go); nil for any
+	// other file.
+	clip *clipMeta
+	// loading: a restored file the draft named by id alone, whose
+	// files.info is out (Slack's unknown file: MissingText bars over an
+	// exception tile); gone: it never came (a non-existent file: "This
+	// file was deleted."). Guarded by attachments.mu (draft_meta.go).
+	loading, gone bool
 
 	// pf is the eager upload as Slack's send sees it (its uploadPromise):
 	// the placeholder draws it and the share waits for it. nil for files
@@ -195,8 +209,12 @@ func (a *attachments) dropPreviews(chips ...*attChip) {
 // call from any goroutine except Layout, Menu and the picker modal, which
 // run on the UI goroutine.
 type attachments struct {
-	h    Host
-	core *core.App // the session the files were uploaded to
+	h Host
+	// the uploaded clips' player row (clips.go clipRow) and the window's
+	// players it's of; the UI goroutine's
+	clipPlayer *videoplayer.Row
+	clipCtl    *videoplayer.Controller
+	core       *core.App // the session the files were uploaded to
 
 	onChange func() // guarded by mu: the owning composer's attChanged (draft_files.go)
 
@@ -207,7 +225,14 @@ type attachments struct {
 
 	picking atomic.Bool
 	pasting atomic.Bool
-	browser *attBrowser // UI goroutine only
+	browser *attBrowser  // UI goroutine only
+	plus    *popups.Menu // the + menu last opened (UI goroutine only)
+	// plusOpen is ShortcutsMenuTriggerButton's S, the + drawn open: set
+	// when its menu opens (onPopoverOpen), cleared when it closes
+	// (onPopoverClose) or by a double click, but not when a click on the
+	// + toggles the menu shut, which never calls onPopoverClose (so the
+	// + stays turned then, as Slack's does). UI goroutine only.
+	plusOpen, plusToggling bool
 
 	// insertLink puts text linked to url at the owning composer's caret
 	// (the + menu's Workflow row, WorkflowItem)
@@ -234,9 +259,17 @@ func (a *attachments) Files() []core.UploadFile {
 	defer a.mu.Unlock()
 	var out []core.UploadFile
 	for _, c := range a.chips {
-		out = append(out, core.UploadFile{Name: c.name, Title: c.title, Data: c.data})
+		out = append(out, core.UploadFile{Name: c.name, Title: c.title, Data: c.data, Subtype: c.subtype()})
 	}
 	return out
+}
+
+// subtype is the File's subtype ("slack_audio" for a recorded clip).
+func (c *attChip) subtype() string {
+	if c.clip != nil {
+		return c.clip.subtype
+	}
+	return ""
 }
 
 // sendBatch is what one send takes from the composer.
@@ -268,7 +301,7 @@ func (a *attachments) takeForSend() (b sendBatch) {
 			c.pf.Title = c.title
 			b.pending = append(b.pending, c.pf)
 		default:
-			b.raw = append(b.raw, core.UploadFile{Name: c.name, Title: c.title, Data: c.data})
+			b.raw = append(b.raw, core.UploadFile{Name: c.name, Title: c.title, Data: c.data, Subtype: c.subtype()})
 		}
 	}
 	a.chips, a.total = nil, 0
@@ -363,7 +396,7 @@ func (a *attachments) prepare(c *attChip) {
 	}
 	a.mu.Lock()
 	c.preparing, c.ptotal = true, int64(len(c.data))
-	name, data := c.name, c.data
+	name, data, sub := c.name, c.data, c.subtype()
 	a.mu.Unlock()
 	a.h.Invalidate()
 
@@ -397,7 +430,7 @@ func (a *attachments) prepare(c *attChip) {
 		}
 	}
 	// addAndUploadPendingFile (AnonymizeFilenames renames the file here).
-	pu, err := prepareFile(context.Background(), coreAPI{a.h.Core()}, name, data, prog)
+	pu, err := prepareFile(context.Background(), coreAPI{a.h.Core()}, core.UploadFile{Name: name, Title: name, Data: data, Subtype: sub}, prog)
 	a.mu.Lock()
 	c.preparing = false
 	var p core.PreparedUpload
@@ -493,13 +526,9 @@ func attCleanName(name string) string {
 // toast shows s from any goroutine (via the composer's UI queue).
 func (a *attachments) toast(s string) { a.later(func() { a.h.Toast(s) }) }
 
-// later runs f on the UI goroutine at the next composer Layout.
-func (a *attachments) later(f func()) {
-	restoreQ.Lock()
-	restoreQ.fns = append(restoreQ.fns, f)
-	restoreQ.Unlock()
-	a.h.Invalidate()
-}
+// later runs f on the UI goroutine at the next composer Layout, while the
+// files' session lasts (laterFor).
+func (a *attachments) later(f func()) { laterFor(a.core, a.h, f) }
 
 // ---- file types ----
 
@@ -620,18 +649,40 @@ func attThumbnail(data []byte, px int) (*image.RGBA, error) {
 	if cfg.Width <= 0 || cfg.Height <= 0 || int64(cfg.Width)*int64(cfg.Height) > attMaxPixels {
 		return nil, fmt.Errorf("image is %dx%d", cfg.Width, cfg.Height)
 	}
-	img, _, err := image.Decode(bytes.NewReader(data))
+	// The decode and the crop's scale charge what they allocate to a
+	// budget from imgcache's process-wide decode memory (a 1×1 WebP meta
+	// bomb passes the pixel check above; a progressive JPEG's coefficients
+	// don't show in it), with attMaxPixels as this surface's own thumbnail
+	// ceiling; one the decode memory is too busy for now is tried again
+	// until ctx is done.
+	ctx, cancel := context.WithTimeout(context.Background(), attThumbWait)
+	defer cancel()
+	var dst *image.RGBA
+	err = imgcache.WithBudget(ctx, func(bg *imgcache.Budget) error {
+		img, err := imgcache.DecodeBudget(data, attMaxPixels, attMaxPixels, bg)
+		if err != nil {
+			return err
+		}
+		b := img.Bounds()
+		s := min(b.Dx(), b.Dy())
+		sr := image.Rect(b.Min.X+(b.Dx()-s)/2, b.Min.Y+(b.Dy()-s)/2, 0, 0)
+		sr.Max = sr.Min.Add(image.Pt(s, s))
+		if err := imgcache.ChargeFunc(bg)(4 * int64(px) * int64(px)); err != nil {
+			return err
+		}
+		dst = image.NewRGBA(image.Rect(0, 0, px, px))
+		// x/image/draw's CatmullRom.Scale's pixels, a band at a time
+		return imgcache.ScaleInto(dst, img, sr, bg)
+	})
 	if err != nil {
 		return nil, err
 	}
-	b := img.Bounds()
-	s := min(b.Dx(), b.Dy())
-	sr := image.Rect(b.Min.X+(b.Dx()-s)/2, b.Min.Y+(b.Dy()-s)/2, 0, 0)
-	sr.Max = sr.Min.Add(image.Pt(s, s))
-	dst := image.NewRGBA(image.Rect(0, 0, px, px))
-	xdraw.CatmullRom.Scale(dst, dst.Bounds(), img, sr, xdraw.Src, nil)
 	return dst, nil
 }
+
+// attThumbWait is how long a thumbnail tries again while the decode memory
+// is busy (imgcache.ErrBusy) before the chip shows as a file card.
+const attThumbWait = time.Minute
 
 func (a *attachments) makeThumb(c *attChip, px int) {
 	img, err := attThumbnail(a.thumbBytes(c), px)
@@ -712,7 +763,20 @@ type plusMenu struct {
 	snippet func()                // Text snippet: the snippet dialog
 	gif     func(image.Rectangle) // GIF: the GIF picker at the menu's target (nil: no GIF picker)
 	anchor  image.Rectangle       // the + button, window coordinates (Menu sets it)
+	// blocked is slackConnectFileSharingBlocked (rscm O, the + button's
+	// N): Upload from your computer is disabled, and the menu's scrim
+	// is up at once. restricted is isRestrictedExternalHuddle (uu7O f):
+	// no GIF and no Upload from your computer.
+	blocked, restricted bool
 }
+
+// plusScrimDelay is how long the + menu's scrim stays down once it opens:
+// ShortcutsMenuTriggerButton's effect sets the overlay
+// (.c-popover--shortcuts_menu_trigger_button, the window-wide layer a
+// click outside the menu hits) to height 0 for 250 ms when the menu
+// opens, unless N, so the second click of a double click reaches the
+// button. The menu itself shows and takes clicks meanwhile.
+const plusScrimDelay = 250 * time.Millisecond
 
 // gifNewBadge is how often the GIF row shows its "New" tag
 // (seen_gif_new_badge < 3).
@@ -726,7 +790,7 @@ func (a *attachments) plusMenuItems(pm plusMenu) []popups.MenuItem {
 	// "Ctrl+O" / "⌘O"
 	snippetKey, uploadKey := shortcut.FormatAsWritten("Mod+Shift+Enter"), shortcut.Format("Mod+O")
 	var items []popups.MenuItem
-	if pm.gif != nil {
+	if pm.gif != nil && !pm.restricted {
 		// nativeGifPickerEnabled: "GIF" (svgIcon gif) with EducationTag's
 		// micro "New" until seen_gif_new_badge reaches 3
 		it := popups.MenuItem{Label: i18n.T("menu_file", "GIF"), Icon: "gif", Do: func() { pm.gif(pm.anchor) }}
@@ -743,8 +807,17 @@ func (a *attachments) plusMenuItems(pm plusMenu) []popups.MenuItem {
 			items = append(items, *it)
 		}
 	}
-	return append(items, popups.MenuItem{Label: i18n.T("menu_file", "Upload from your computer"), Icon: "laptop", Hint: uploadKey, Do: a.Pick})
+	if pm.restricted {
+		return items
+	}
+	return append(items, popups.MenuItem{Label: i18n.T("menu_file", "Upload from your computer"), Icon: "laptop", Hint: uploadKey,
+		Disabled: pm.blocked, Do: func() { uploadFromComputer(a) }})
 }
+
+// uploadFromComputer is what Upload from your computer and the + button's
+// double click both run (onUploadFromComputerClick and E click the same
+// hidden file input): the file chooser. Tests hook it.
+var uploadFromComputer = (*attachments).Pick
 
 // Menu opens the + menu above the button; anchor is the button in window
 // coordinates.
@@ -765,7 +838,32 @@ func (a *attachments) Menu(anchor image.Rectangle, pm plusMenu) {
 		}
 	}
 	// the shortcuts menu's template menu is 360 wide
-	a.h.ShowOverlay(popups.NewMenuOpts(a.h, items, popups.MenuOpts{Anchor: anchor, Side: popups.Above, Width: 360}))
+	var m *popups.Menu
+	o := popups.MenuOpts{Anchor: anchor, Side: popups.Above, Width: 360, OnClose: func() {
+		if !a.plusToggling && (a.plus == nil || a.plus == m) {
+			a.plusOpen = false // onPopoverClose (D): x(false)
+		}
+	}}
+	if !pm.blocked {
+		o.ScrimAfter = plusScrimDelay
+	}
+	m = popups.NewMenuOpts(a.h, items, o)
+	a.plus, a.plusOpen = m, true // onPopoverOpen (L): x(true)
+	a.h.ShowOverlay(m)
+}
+
+// closePlusMenu closes the + menu if it's open and reports whether it
+// was: the trigger's toggle, which leaves plusOpen as it is.
+func (a *attachments) closePlusMenu() bool {
+	m := a.plus
+	a.plus = nil
+	if m == nil || m.Dismissed() {
+		return false
+	}
+	a.plusToggling = true
+	m.Dismiss()
+	a.plusToggling = false
+	return true
 }
 
 // ---- picking files ----
@@ -1002,20 +1100,25 @@ var (
 // PasteClipboardImage probes the system clipboard for an image (async) and
 // attaches it as "image.png", like Slack. Called on every Ctrl+V; it skips
 // office-app copies (rich text plus a rendered picture of it). Files copied
-// in Explorer (Windows) attach as those files.
-func (a *attachments) PasteClipboardImage() { a.pasteImage(false) }
+// in Explorer (Windows) and Finder (macOS) attach as those files. The
+// result says whether they did (nil when a paste's probe is still
+// running): then the paste inserts no text (filePaste).
+func (a *attachments) PasteClipboardImage() *filePaste { return a.pasteImage(false) }
 
-func (a *attachments) pasteImage(explicit bool) {
+func (a *attachments) pasteImage(explicit bool) *filePaste {
 	if !a.pasting.CompareAndSwap(false, true) {
-		return
+		return nil
 	}
+	fp := newFilePaste()
 	go func() {
 		defer a.pasting.Store(false)
+		defer fp.decide(false)
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		// Files copied in a file manager attach as themselves (Chromium
 		// hands them to the page as the paste's files).
 		if paths, err := attClipboardFiles(ctx); err == nil && len(paths) > 0 {
+			fp.decide(true)
 			a.addPaths(paths)
 			return
 		}
@@ -1023,6 +1126,9 @@ func (a *attachments) pasteImage(explicit bool) {
 		if err == nil && !strings.HasPrefix(http.DetectContentType(data), "image/") {
 			err = errAttNoClipImage
 		}
+		// a file too big to upload is still the paste's file (Slack
+		// rejects it after preventDefault)
+		fp.decide(err == nil || errors.Is(err, errAttTooBig))
 		if err != nil {
 			switch {
 			case errors.Is(err, errAttTooBig):
@@ -1034,6 +1140,7 @@ func (a *attachments) pasteImage(explicit bool) {
 		}
 		a.add(attPastedName(mime), data)
 	}()
+	return fp
 }
 
 // attClipImageTypes are the image targets we fetch, best first.
@@ -1184,6 +1291,8 @@ type attView struct {
 	failed    bool
 	asImage   bool
 	size      int64 // bytes (or Slack's size of a restored file)
+	// loading and gone are the chip's (draft_meta.go)
+	loading, gone bool
 }
 
 // Layout draws the file gallery (zero size when empty): Slack's
@@ -1206,7 +1315,8 @@ func (a *attachments) Layout(gtx layout.Context) layout.Dimensions {
 		}
 		views[i] = attView{c: c, name: c.name, title: c.title, thumb: c.thumb, thumbPx: c.thumbPx,
 			preparing: c.preparing, failed: c.prepErr != nil && c.prepared == nil,
-			asImage: c.kind.Image && !c.thumbBad, size: c.size()}
+			asImage: c.kind.Image && !c.thumbBad && !c.loading && !c.gone, size: c.size(),
+			loading: c.loading, gone: c.gone}
 	}
 	a.mu.Unlock()
 
@@ -1221,7 +1331,10 @@ func (a *attachments) Layout(gtx layout.Context) layout.Dimensions {
 	x, y := 0, 0
 	for _, v := range views {
 		w := px
-		if !v.asImage {
+		switch {
+		case v.c.clip != nil: // the pillow around the 184px audio player
+			w = min(gtx.Dp(attClipW), avail)
+		case !v.asImage:
 			w = min(gtx.Dp(attCardW), avail)
 		}
 		if x > 0 && x+w > avail {
@@ -1282,6 +1395,8 @@ func (a *attachments) layoutChip(gtx layout.Context, v attView, sz image.Point) 
 			c.open.Add(gtx.Ops)
 			pointer.CursorPointer.Add(gtx.Ops)
 		}()
+	} else if c.clip != nil {
+		a.drawClipCard(gtx, th, v, r, rad) // clips.go
 	} else {
 		a.drawCard(gtx, th, v, r, rad)
 	}
@@ -1336,19 +1451,24 @@ func (a *attachments) layoutChip(gtx layout.Context, v attView, sz image.Point) 
 		slackc.Component(gtx, "FileFieldset", attItem{a: a, v: v, sz: sz}, attItem.fieldsetProps, attItem.layoutFieldset)
 	}
 	tip := v.title
+	if v.loading { // nothing to name yet: no id in a tooltip either
+		tip = ""
+	}
 	if onBtn {
-		tip = attRemoveTip(v.name) // RemoveFileButton's tooltip
+		tip = attRemoveTip(c.subtype()) // RemoveFileButton's tooltip
 	}
 	popups.Tooltip(gtx, th, &c.tip, hovered, sz, popups.Above, tip, "")
 }
 
-// attRemoveTip is RemoveFileButton's tooltip.
-func attRemoveTip(name string) string {
-	m := attMime(name)
-	switch {
-	case strings.HasPrefix(m, "audio/"):
+// attRemoveTip is RemoveFileButton's tooltip (boot-shared 4dwn): by the
+// File's subtype (lqEY: audio_story, slack_audio, slack_name_pronunciation;
+// 7OiV: video_story, slack_video), not its type, so an uploaded .mp3 is a
+// file.
+func attRemoveTip(subtype string) string {
+	switch subtype {
+	case "audio_story", "slack_audio", "slack_name_pronunciation":
 		return "Remove audio clip"
-	case strings.HasPrefix(m, "video/"):
+	case "video_story", "slack_video":
 		return "Remove video clip"
 	}
 	return "Remove file"
@@ -1422,6 +1542,10 @@ func (a *attachments) drawCard(gtx layout.Context, th *theme.Theme, v attView, r
 	strokeRRect(gtx, r, rad, max(1, gtx.Dp(1)), th.C.Border)
 	pad := gtx.Dp(11)
 	tile := gtx.Dp(40)
+	if v.loading || v.gone {
+		a.drawMetaCard(gtx, th, v, pad, tile, r)
+		return
+	}
 	fillRRect(gtx, image.Rect(pad, pad, pad+tile, pad+tile), gtx.Dp(8), rgb(k.Color))
 	ic := gtx.Dp(22)
 	offset(gtx, pad+(tile-ic)/2, pad+(tile-ic)/2, func(gtx layout.Context) layout.Dimensions {
@@ -1504,7 +1628,8 @@ type attBrowser struct {
 	clicks  []widget.Clickable
 	list    layout.List
 	focused bool
-	reveal  bool // scroll the cursor into view
+	reveal  bool   // scroll the cursor into view
+	lastHit string // the entry the last click hit (doubleClicked)
 }
 
 func (a *attachments) openBrowser() {
@@ -1564,6 +1689,19 @@ func (b *attBrowser) confirm() {
 	if len(paths) > 0 {
 		go b.a.addPaths(paths)
 	}
+}
+
+// doubleClicked reports whether a click on entry i, the window's click n
+// of its run (Gio patch 48), double-clicks the entry: the run's last click
+// hit it too. A folder opens on its first click, so a double click's
+// second click lands on whatever entry the folder's listing puts under
+// the pointer, and a list that scrolled between the clicks moves another
+// entry there: such a click is a single one, not an attach.
+func (b *attBrowser) doubleClicked(i, n int) bool {
+	p := b.entries[i].path
+	dbl := n >= 2 && b.lastHit == p
+	b.lastHit = p
+	return dbl
 }
 
 // activate opens a folder or acts on a file; it reports whether the entry
@@ -1679,7 +1817,7 @@ clicks:
 				break
 			}
 			b.cursor = i
-			if b.activate(i, cl.NumClicks >= 2) {
+			if b.activate(i, b.doubleClicked(i, cl.NumClicks)) {
 				break clicks
 			}
 		}

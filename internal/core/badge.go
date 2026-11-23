@@ -4,11 +4,14 @@ package core
 // decides it (CDN build a84662d2d135, 2026-11-08):
 //
 //   - BaseMessageSender.renderBotLabel (boot-shared zWB7 / BaseMessageSender):
-//     no badge when memberIsHuman (the message has a user who is neither
-//     is_bot nor is_app_user, nor "USLACK"; Slackbot is served is_bot
-//     false, so it has none) or for huddle, canvas-update, welcome,
+//     no badge when memberIsHuman or for huddle, canvas-update, welcome,
 //     custom-response and AI huddle-summary messages. A user-less message
-//     always gets one.
+//     always gets one. memberIsHuman (connected MessageSender JA+h, build
+//     35b42de8b870) is `et || isSlackSystemUser(member)`: getBotByMsg's
+//     isMemberHuman (Emf2: a member that isn't app-or-bot, qSRE, which
+//     counts "USLACK" as one), or the Slack system user itself (iXFk). So a
+//     message from USLACK has no badge, nor has Slackbot (served is_bot
+//     false).
 //   - BaseAppBadge (members, client-boot): EXPERIMENTAL (sidekick, not
 //     passed by messages) > AGENTFORCE > AGENT > WORKFLOW > APP.
 //     AGENTFORCE: the member's is_agentforce_bot. WORKFLOW: the member's
@@ -35,14 +38,21 @@ const (
 
 // SenderBadge is the badge Slack draws after the sender of a message from
 // user (or, user-less, from bot botID): "" for people and Slackbot.
-func (a *App) SenderBadge(user, botID string) string {
+func (a *App) SenderBadge(user, botID string) string { return a.SenderBadgeBP(user, botID, nil) }
+
+// SenderBadgeBP is SenderBadge with the message's bot_profile: a
+// user-less sender's bot is the store's (bots.info), else the bot_profile
+// (Emf2's bot: c = botProfile while getBotById hasn't it), whose
+// is_workflow_bot makes a Workflow Builder post WORKFLOW before (or
+// without) bots.info answering.
+func (a *App) SenderBadgeBP(user, botID string, bp *BotProfile) string {
 	if user != "" {
 		u, ok := a.User(user)
 		if !ok {
 			return "" // Slack draws the unknown-sender placeholder
 		}
 		human := user != "USLACKBOT" && !u.IsBot && !u.AppUser && user != "USLACK"
-		if human || user == "USLACKBOT" {
+		if human || user == "USLACKBOT" || user == "USLACK" { // JA+h: || isSlackSystemUser
 			return ""
 		}
 		switch {
@@ -55,14 +65,21 @@ func (a *App) SenderBadge(user, botID string) string {
 		}
 		return BadgeApp
 	}
+	if botID == "" && bp != nil {
+		botID = bp.ID
+	}
 	if botID == "" {
 		return BadgeApp
 	}
-	b, _ := a.S.Bot(botID)
+	b, held := a.S.Bot(botID)
+	workflow := b.Workflow
+	if !held && bp != nil && bp.ID == botID {
+		workflow = bp.Workflow
+	}
 	switch {
 	case a.botIsAgent(botID):
 		return BadgeAgent
-	case b.Workflow:
+	case workflow:
 		return BadgeWorkflow
 	}
 	return BadgeApp

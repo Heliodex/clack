@@ -202,7 +202,8 @@ func crWysiwygFor(className string) *slackc.ClassDef {
 
 // kid returns the host nodes standing for the nested boundary name in a
 // patched native's children. patched is false when p is nil (the parent
-// was not patched: render the boundary yourself). Under a patch the
+// was not patched: render the boundary yourself), or holds the props Go
+// built rather than a plugin's. Under a patch the
 // nested part is the top-level node that is (or wraps, like
 // BetterTypingIndicator's span around TypingNames) the slot named name,
 // plus the plugin nodes after it (and before it, when nothing before
@@ -214,6 +215,13 @@ func kid(p slackc.Props, name string) (e slackc.Element, patched bool) {
 	}
 	ch, ok := slackc.PropChildren(p)
 	if !ok {
+		// Props Go built (a native drawn in a reserved slot before the
+		// plugin's first tree, slackc.renderPatched) hold the parts as
+		// slots, not host nodes: draw them as unpatched. A plugin's
+		// <Original> never passes children as anything but an Element.
+		if _, own := p["children"].([]any); own {
+			return slackc.Element{}, false
+		}
 		return slackc.Element{}, true
 	}
 	ns := ch.Nodes
@@ -309,10 +317,11 @@ var crEnableFlags = [...]struct {
 
 // crNoRecorder is the clip buttons Slack leaves out of a client that
 // can't record: MessagePaneInput's isStoriesButtonEnabled and
-// isAudioButtonEnabled (boot-shared Jg9Y yD / hP) need window.MediaRecorder,
-// and Clack has no clip recorder, so enableStoryButton and
-// enableAudioButton are false and TextyButtons drops the clips group and
-// its divider.
+// isAudioButtonEnabled (boot-shared Qre6 yD / hP) need window.MediaRecorder,
+// so enableStoryButton and enableAudioButton are false and TextyButtons
+// drops the clips group and its divider. Clack records audio clips where
+// it can open a microphone (clipHide, clips.go); the video button always
+// stays out.
 const crNoRecorder = 1<<crVideo | 1<<crAudio
 
 // hideBits returns the buttons a plugin turned off (enable…: false).
@@ -408,6 +417,7 @@ func (c *Composer) layoutPane(gtx layout.Context, p slackc.Props) layout.Dimensi
 	s := def.Enter(gtx, 0, 0)
 	defer s.Leave()
 	if s.Hidden() {
+		c.cssHidden = true
 		return layout.Dimensions{}
 	}
 	c.paneP = p
@@ -577,6 +587,7 @@ func (c *Composer) layoutRoadblock(gtx layout.Context, p slackc.Props) layout.Di
 // drawRoadblock draws Slack's roadblock: the message centred in a
 // bordered box where the composer would be, then the hint bar's space.
 func (c *Composer) drawRoadblock(gtx layout.Context, p slackc.Props) layout.Dimensions {
+	c.drewRoadblock = true
 	th := c.h.Theme()
 	W := gtx.Constraints.Max.X
 	m := gtx.Dp(20)
@@ -622,7 +633,7 @@ func (c *Composer) drawRoadblock(gtx layout.Context, p slackc.Props) layout.Dime
 // composer.addButton infra's broadcast context).
 func (c *Composer) inputProps() slackc.Props {
 	p := c.convProps()
-	putEnableFlags(p, crNoRecorder)
+	putEnableFlags(p, c.clipHide())
 	p["enableGifPicker"] = true
 	if c.edit != nil {
 		p["enableScheduleSendButton"] = false
@@ -678,7 +689,7 @@ func (c *Composer) onBroadcastChange(e slackc.Props) {
 }
 
 func (c *Composer) layoutInput(gtx layout.Context, p slackc.Props) layout.Dimensions {
-	c.cs.Hide = crNoRecorder
+	c.cs.Hide = c.clipHide()
 	if p != nil {
 		c.cs.Hide |= hideBits(p)
 	}
@@ -686,6 +697,7 @@ func (c *Composer) layoutInput(gtx layout.Context, p slackc.Props) layout.Dimens
 	s := crInputClass[c.cs.Mode].Enter(gtx, 0, 0)
 	defer s.Leave()
 	if s.Hidden() {
+		c.cssHidden = true
 		return layout.Dimensions{}
 	}
 	c.inputP = p

@@ -12,6 +12,7 @@ import (
 	"gioui.org/io/transfer"
 	"gioui.org/layout"
 
+	"github.com/some-du6e/clack/internal/ui/slackc"
 	"github.com/some-du6e/clack/internal/ui/uipref"
 )
 
@@ -30,8 +31,6 @@ func (e *Editor) keyFilters() []event.Filter {
 		transfer.TargetFilter{Target: e, Type: "application/text"},
 		key.Filter{Focus: e, Name: key.NameEnter, Optional: anyMod},
 		key.Filter{Focus: e, Name: key.NameReturn, Optional: anyMod},
-		key.Filter{Focus: e, Name: key.NameTab, Optional: key.ModShift},
-		key.Filter{Focus: e, Name: key.NameEscape, Optional: anyMod},
 
 		key.Filter{Focus: e, Name: "A", Required: sc},
 		key.Filter{Focus: e, Name: "B", Required: sc},
@@ -55,6 +54,12 @@ func (e *Editor) keyFilters() []event.Filter {
 		key.Filter{Focus: e, Name: key.NameRightArrow, Optional: move},
 		key.Filter{Focus: e, Name: key.NameUpArrow, Optional: move},
 		key.Filter{Focus: e, Name: key.NameDownArrow, Optional: move},
+	}
+	if !e.textOnly {
+		// a text-only input leaves Tab to the focus order and Escape to
+		// its dialog (Texty binds neither there)
+		fs = append(fs, key.Filter{Focus: e, Name: key.NameTab, Optional: key.ModShift},
+			key.Filter{Focus: e, Name: key.NameEscape, Optional: anyMod})
 	}
 	// Mod+Shift+. is the keyboard module's "blockquote-alt" (keyCode
 	// 190): "." or, shifted on X11, ">".
@@ -109,6 +114,10 @@ func (e *Editor) command(gtx layout.Context, k key.Event) {
 			return
 		}
 		e.emit(EvCancel)
+		// in a plugin's layer the Escape goes on to it, as a DOM keydown
+		// bubbles on: a Popover's RichTextInput closes the Popover (the
+		// editor's Escape stays its own anywhere else)
+		slackc.PassEscape(gtx)
 	case key.NameTab:
 		e.tab(shift)
 	case key.NameDeleteBackward:
@@ -159,18 +168,27 @@ func (e *Editor) command(gtx layout.Context, k key.Event) {
 		e.moveV(1, shift)
 		keepX = true
 	case key.NamePageUp:
+		if mods == 0 && e.doc.Len() == 0 {
+			e.emit(EvPageUpEmpty)
+		}
 		if e.PageKeysHandled && mods == 0 {
 			return
 		}
 		e.movePage(-1, shift)
 		keepX = true
 	case key.NamePageDown:
+		if mods == 0 && e.doc.Len() == 0 {
+			e.emit(EvPageDownEmpty)
+		}
 		if e.PageKeysHandled && mods == 0 {
 			return
 		}
 		e.movePage(1, shift)
 		keepX = true
 	case key.NameHome:
+		if mods == 0 && e.doc.Len() == 0 {
+			e.emit(EvHomeEmpty)
+		}
 		// onHome / onEnd: on macOS Home and End go to the start and end
 		// of the whole message; elsewhere the browser's line motion
 		if short || edMacHomeEnd {
@@ -179,6 +197,9 @@ func (e *Editor) command(gtx layout.Context, k key.Event) {
 			e.moveTo(e.visualLineStart(e.caret), shift)
 		}
 	case key.NameEnd:
+		if mods == 0 && e.doc.Len() == 0 {
+			e.emit(EvEndEmpty)
+		}
 		if short || edMacHomeEnd {
 			e.moveTo(e.doc.Len(), shift)
 		} else {
@@ -189,6 +210,17 @@ func (e *Editor) command(gtx layout.Context, k key.Event) {
 
 // shortcut handles Ctrl/Cmd combinations; it reports whether name was one.
 func (e *Editor) shortcut(gtx layout.Context, name key.Name, shift, alt bool) bool {
+	if e.textOnly {
+		// a text-only input has no formats: the formatting keys do nothing
+		switch name {
+		case "B", "I", "U", "F", "7", "&", "8", "*", "9", "(", ".", ">":
+			return true
+		case "C", "X":
+			if shift {
+				return true
+			}
+		}
+	}
 	switch name {
 	case "A":
 		e.anchor, e.caret = 0, e.doc.Len()
@@ -242,18 +274,21 @@ func (e *Editor) shortcut(gtx layout.Context, name key.Name, shift, alt bool) bo
 	case "V":
 		// Shift: paste and match style (plain text), like Slack.
 		e.plainPaste = shift
-		e.richRead = nil
+		e.richRead, e.filesRead = nil, nil
 		if !shift {
 			e.richRead = startClipHTML()
 		}
 		gtx.Execute(clipboard.ReadCmd{Tag: e})
-		e.emit(EvPasted)
+		e.emit(EvPasted) // the composer sets filesRead
 	case "Z":
 		switch {
 		case shift:
 			e.Redo()
-		case e.doc.Len() == 0: // quill.getLength() === 1: nothing at all
-			e.emit(EvUndoEmpty) // Slack's onCmdZWhenEmpty: unsend the message just sent
+		case e.doc.Len() == 0 && !e.textOnly: // quill.getLength() === 1: nothing at all
+			// Slack's onCmdZWhenEmpty: unsend the message just sent. A
+			// text-only input passes none (LPC/ binds the empty-Z key only
+			// with it), so Quill's history undoes there
+			e.emit(EvUndoEmpty)
 		default:
 			e.Undo()
 		}
@@ -310,6 +345,10 @@ func (e *Editor) copySel(gtx layout.Context) bool {
 // Mod+Shift+Enter with snippets on (the snippet dialog) is caught before
 // this, in command.
 func (e *Editor) enter(mods key.Modifiers) {
+	if e.textOnly {
+		e.newline() // onTextyEnter returns true: Texty adds the line
+		return
+	}
 	meta := mods.Contain(key.ModCommand) || mods.Contain(key.ModSuper)
 	ctrl := mods.Contain(key.ModCtrl)
 	shift := mods.Contain(key.ModShift)

@@ -18,9 +18,13 @@ var sidebarExperiments = map[string]string{
 	"agents_in_dm_sidebar": "on", "agents_in_dm_sidebar_pref": "on",
 	"suggested_sections_auto_sort_v2": "on",
 	"lists_tabbing_navigation":        "on",
+	// the mini player (videoplayer/pip.go: a playing video docks)
+	"clips_pip": "on",
 	// channel details' Agents & apps / Automations tabs and Settings'
 	// tab permissions (views/details.go, details_more.go)
 	"channel_details_agents_apps_tab": "on", "move_channel_tabs_settings": "on",
+	// the rosters' "…" menu and RemoveMemberDialog (core/exp_wave10.go)
+	"agent_channel_header": "on", "sc_remove_full_access_user": "on",
 	// focus mode and the Availability section (see core's defaultExperimentGroups)
 	"silent_sidebar": "on", "availability_prefs_section": "on",
 	// search and the switcher (2026-11-10). desktop_search_recents_read
@@ -30,6 +34,9 @@ var sidebarExperiments = map[string]string{
 	"fe_nav_first_apply_post_processing_rules": "treatment", "omni_date_quick_filters": "on",
 	"srp_card_explore": "on", "search_file_channel_messages": "on",
 	"work_objects_message_search_xp_v2": "on",
+	// an app DM's About tab is the About page (core/app_about.go)
+	"agent_about_page": "on", "flexpane_content_parity": "on", "revamp_agent_app_profile": "on",
+	"scope_app_install_reads_to_viewer_team": "on",
 	// work object cards (core/workobjects.go), as the account had them on 2026-11-10
 	"work_objects_rearrangement": "on", "work_objects_refresh_timestamp": "on", "wo_comment_sync_client_xp": "on",
 	"work_objects_embedded_preview": "on", "third_party_integrations_video_previews": "on",
@@ -80,6 +87,9 @@ var accountExperiments = map[string]string{
 	"lists_file_backed_templates": "on",
 	"lists_export_enrichment":     "on",
 	"lists_grid_todos":            "on",
+	// email files draw as FileEmailV2 (core.ExpNewEmailRendering): the
+	// account's group, recorded in core/testdata/account_experiments.json
+	"new_email_rendering": "on",
 }
 
 // withAccountExperiments adds accountExperiments to an

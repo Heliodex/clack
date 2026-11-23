@@ -17,11 +17,27 @@ package core
 // clientOnlinePoll while the session lasts, waits clientOfflineThrottle
 // before it believes an offline reading (the offline event's throttle) and
 // emits "client_online" when the answer changes.
+//
+// The same poll watches for the two things that kill every open
+// connection at once: the machine waking from sleep (the wall clock ran
+// ahead of the monotonic one, slack.ClockReading) and a change in its
+// network addresses (a VPN tunnel up or down, a Wi-Fi switch). Either way
+// the pooled API connections and the realtime socket belong to a path that
+// is gone, so core flushes the pool and reconnects the socket on a fresh
+// URL, as Chromium's NetworkChangeNotifier (OnIPAddressChanged flushing
+// the socket pools with ERR_NETWORK_CHANGED) and power monitor make Slack's
+// client do. Nothing else would notice: idle sockets on a dead path get no
+// RST until they are written to.
 
 import (
+	"log"
 	"net"
+	"sort"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/some-du6e/clack/internal/slack"
 )
 
 // The watcher's poll and the offline throttle (vars for tests).
@@ -34,18 +50,45 @@ var (
 // (tests replace it).
 var clientOnlineProbe = probeInterfaces
 
+// networkFingerprint names the machine's network addresses; a change
+// means the network path changed (tests replace it).
+var networkFingerprint = interfaceFingerprint
+
 type onlineState struct {
-	once sync.Once
-	mu   sync.Mutex
-	on   bool
+	once   sync.Once
+	mu     sync.Mutex
+	on     bool
+	pinned bool // PinNetwork: the host's network is none of this App's business
+	// changed is the connectivity store's lastClientConnection: set at
+	// start and whenever clientOnline changes
+	changed time.Time
 }
+
+// PinNetwork takes the machine as online on one network that never
+// changes, from now on: the watcher (the poll that reconnects on a network
+// change or a wake from sleep, and flips isClientOnline) never starts, or
+// stops at its next tick. For tests over a loopback fake: the host's own
+// network (a CI runner's interfaces going away for two seconds) must
+// neither reconnect them nor mark them offline mid-measurement. Call it
+// before boot.
+func (a *App) PinNetwork() {
+	o := &a.online
+	o.once.Do(func() { o.changed = time.Now() }) // no first probe, no watcher
+	o.mu.Lock()
+	o.pinned, o.on = true, true
+	o.mu.Unlock()
+}
+
+// recentlyOnlineGrace is how long wasRecentlyOnline outlasts a lost
+// connection (Vdrr TP: 1e4 ms).
+const recentlyOnlineGrace = 10 * time.Second
 
 // ClientOnline is isClientOnline: whether the machine has a network
 // connection.
 func (a *App) ClientOnline() bool {
 	o := &a.online
 	o.once.Do(func() {
-		o.on = clientOnlineProbe()
+		o.on, o.changed = clientOnlineProbe(), time.Now()
 		go a.watchOnline()
 	})
 	o.mu.Lock()
@@ -53,15 +96,55 @@ func (a *App) ClientOnline() bool {
 	return o.on
 }
 
+// RecentlyOnline is wasRecentlyOnline (client-boot Vdrr TP), which the
+// composer's hint bar reads: online (isOnline: the client has a network
+// and the service is up, Clack's nearest being a session that wasn't
+// ended, membersOnline), or clientOnline changed under 10s ago
+// (lastClientConnection, set at start too). until is when a lost
+// connection stops counting as recent (zero while online): Slack forces
+// a re-render then (refreshRecentlyOnline).
+func (a *App) RecentlyOnline() (on bool, until time.Time) {
+	if a.membersOnline() {
+		return true, time.Time{}
+	}
+	o := &a.online
+	o.mu.Lock()
+	until = o.changed.Add(recentlyOnlineGrace)
+	o.mu.Unlock()
+	return time.Now().Before(until), until
+}
+
 func (a *App) watchOnline() {
-	probe, poll, throttle := clientOnlineProbe, clientOnlinePoll, clientOfflineThrottle
+	probe, poll, throttle, fingerprint := clientOnlineProbe, clientOnlinePoll, clientOfflineThrottle, networkFingerprint
 	t := time.NewTicker(poll)
 	defer t.Stop()
+	last, addrs := slack.ReadClock(), fingerprint()
 	for {
 		select {
 		case <-a.bg.Done():
 			return
 		case <-t.C:
+		}
+		a.online.mu.Lock()
+		pinned := a.online.pinned
+		a.online.mu.Unlock()
+		if pinned {
+			return // PinNetwork
+		}
+		now := slack.ReadClock()
+		var why []string
+		if slept := now.Slept(last); slept > slack.WakeDrift {
+			log.Printf("core: woke after %s", slept.Round(time.Second))
+			why = append(why, "woke from sleep")
+		}
+		last = now
+		if f := fingerprint(); f != addrs {
+			log.Printf("core: network addresses changed (%d → %d)", countAddrs(addrs), countAddrs(f))
+			addrs = f
+			why = append(why, "network changed")
+		}
+		if len(why) > 0 {
+			a.networkChanged(strings.Join(why, ", "))
 		}
 		on := probe()
 		if !on && a.ClientOnline() {
@@ -80,10 +163,13 @@ func (a *App) watchOnline() {
 // setClientOnline is setClientOnline: a change emits "client_online".
 func (a *App) setClientOnline(on bool) {
 	o := &a.online
-	o.once.Do(func() {}) // a test's value isn't overwritten by a first probe
+	o.once.Do(func() { o.changed = time.Now() }) // a test's value isn't overwritten by a first probe
 	o.mu.Lock()
 	was := o.on
 	o.on = on
+	if was != on {
+		o.changed = time.Now()
+	}
 	o.mu.Unlock()
 	if was != on {
 		a.emit(Event{Type: "client_online", Connected: on})
@@ -120,3 +206,50 @@ func probeInterfaces() bool {
 	}
 	return false
 }
+
+// networkChanged drops everything that rode the old network path: the
+// idle API connections and the realtime socket, which reconnects at once
+// with a fresh gateway URL.
+func (a *App) networkChanged(why string) {
+	a.C.ResetConns()
+	if a.RTM != nil {
+		a.RTM.Reconnect(why)
+	}
+}
+
+// interfaceFingerprint lists the addresses probeInterfaces counts (up,
+// running, not loopback, not link-local), sorted. Link-local addresses
+// are left out: macOS's AWDL interfaces come and go with nothing but
+// those, and no Slack connection uses them.
+func interfaceFingerprint() string {
+	ifs, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	var out []string
+	for _, ifc := range ifs {
+		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagRunning == 0 || ifc.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := ifc.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, ad := range addrs {
+			var ip net.IP
+			switch v := ad.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip != nil && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() && !ip.IsUnspecified() {
+				out = append(out, ifc.Name+"="+ip.String())
+			}
+		}
+	}
+	sort.Strings(out)
+	return strings.Join(out, " ")
+}
+
+func countAddrs(fp string) int { return len(strings.Fields(fp)) }

@@ -81,7 +81,9 @@ type appState struct {
 // is_app_user, is_bot, or the USLACK id); Slackbot (USLACKBOT, is_bot
 // false) is human there and keeps the member card's "Built by Slack".
 func (p *ProfileCard) isApp(u core.User, ok bool) bool {
-	if p.id == "" {
+	if p.id == "" || !ok {
+		// no member (or none the store holds yet): a bot is found by its
+		// id (maybeGetBotAndMemberByIds), so its app's card
 		return p.bot != ""
 	}
 	return ok && !pfHuman(u)
@@ -108,28 +110,44 @@ func (p *ProfileCard) loadApp() {
 	if card, ok := c.CachedAppCard(p.id, p.bot); ok {
 		p.app.card = &card
 	}
-	uid, bid := p.id, p.bot
-	type res struct {
-		card       core.AppCard
-		team, icon string
+	if u, ok := c.User(p.id); ok && p.app.card == nil && p.bot == "" && u.BotID == "" && u.AppID == "" {
+		// a non-human member with no bot or app (the Slack system user,
+		// USLACK): useProfileHoverApp (MB9A) finds no app and isHuman is
+		// false, so ProfileHoverCard (JM3T) renders nothing, not even
+		// AppHoverCard's loading state (AppCardOf: ErrNotAnApp)
+		p.app.failed = true
+		return
 	}
-	run(p.h, func(ctx context.Context) (res, error) {
-		card, err := c.AppCardOf(ctx, uid, bid)
-		if err != nil {
-			return res{}, err
-		}
-		c.EnsureTeam(ctx, card.TopTeam())
-		if card.InstallerID != "" {
-			c.EnsureUsers(ctx, []string{card.InstallerID})
-		}
-		name, icon, _ := c.Team(card.TopTeam(), 20)
-		return res{card, name, icon}, nil
-	}, func(r res, err error) {
+	uid, bid := p.id, p.bot
+	// The card draws as soon as apps.profile.get answers, as Slack's
+	// AppProfileCard renders once the app is in the store: the home team
+	// (appHomeTeamDisplayName, the teams store) and the installer
+	// (getMemberById) are what the store holds then, each filled in as its
+	// own read lands. Waiting for team.info and users.info too kept the
+	// 380px loading card up for two more round trips.
+	run(p.h, func(ctx context.Context) (core.AppCard, error) {
+		return c.AppCardOf(ctx, uid, bid)
+	}, func(card core.AppCard, err error) {
 		if err != nil {
 			p.app.failed = p.app.card == nil
 			return
 		}
-		p.app.card, p.app.team, p.app.teamIcon = &r.card, r.team, r.icon
+		p.app.card = &card
+		p.app.team, p.app.teamIcon, _ = c.Team(card.TopTeam(), 20)
+		top, installer := card.TopTeam(), card.InstallerID
+		type team struct{ name, icon string }
+		run(p.h, func(ctx context.Context) (team, error) {
+			c.EnsureTeam(ctx, top)
+			if installer != "" {
+				c.EnsureUsers(ctx, []string{installer})
+			}
+			name, icon, _ := c.Team(top, 20)
+			return team{name, icon}, nil
+		}, func(t team, err error) {
+			if err == nil && t.name != "" {
+				p.app.team, p.app.teamIcon = t.name, t.icon
+			}
+		})
 	})
 }
 
@@ -158,6 +176,7 @@ func (p *ProfileCard) layoutApp(gtx layout.Context, th *theme.Theme, cl *Colors,
 		w = mw
 	}
 	native := func(gtx layout.Context, _ slackc.Props) layout.Dimensions { return p.appContent(gtx, th, cl, w) }
+	cm := appCardClass.Inspect(0) // the inspect tool: the card holds its content (slackc EndCardAt)
 	call, d := record(loose(gtx, image.Pt(w, win.Y)), func(gtx layout.Context) layout.Dimensions {
 		return slackc.RenderLazy(gtx, "ProfileHoverCard", func() slackc.Props {
 			return slackc.Props{
@@ -177,7 +196,9 @@ func (p *ProfileCard) layoutApp(gtx layout.Context, th *theme.Theme, cl *Colors,
 	r := image.Rectangle{Min: pos, Max: pos.Add(d.Size)}
 	rad := dp(gtx, 5)
 	st := appCardClass.Enter(gtx, 0, 0)
+	var box image.Rectangle
 	if !st.Hidden() {
+		box = r
 		lk := cardLook{fill: cl.Bg, ring: color.NRGBA{}, shadow: func(gtx layout.Context, r image.Rectangle, rad int) {
 			softShadow(gtx, r, rad, dp(gtx, 5), dp(gtx, 10), rgba(0x000000, 0.12))
 		}}
@@ -190,6 +211,7 @@ func (p *ProfileCard) layoutApp(gtx layout.Context, th *theme.Theme, cl *Colors,
 		})
 	}
 	st.Leave()
+	cm.EndCardAt(gtx, box)
 	return r
 }
 
@@ -198,13 +220,16 @@ var appCardClass = slackc.Class("p-app_profile_card__container", "data-qa", "app
 // appContent is AppProfileCard at the origin, w wide.
 func (p *ProfileCard) appContent(gtx layout.Context, th *theme.Theme, cl *Colors, w int) layout.Dimensions {
 	c := p.app.card
-	if c == nil { // .p-app_profile_card--loading: 380 tall, centered
+	if c == nil {
+		// .p-app_profile_card--loading: 380 tall, its content centred both
+		// ways (flex), the jumbo blue InfiniteSpinner (xRE+: 52px, margin 0
+		// auto) inside
 		h := dp(gtx, 380)
-		d := dp(gtx, 8)
-		for i := -1; i <= 1; i++ {
-			x := w/2 + i*2*d - d/2
-			rrect(gtx, image.Rect(x, h/2-d/2, x+d, h/2+d/2), d/2, cl.Selected)
-		}
+		sd := dp(gtx, 52)
+		at(gtx, image.Pt((w-sd)/2, (h-sd)/2), func(gtx layout.Context) layout.Dimensions {
+			infiniteSpinner(gtx, sd, cl.Link, cl.Fg3)
+			return layout.Dimensions{Size: image.Pt(sd, sd)}
+		})
 		return layout.Dimensions{Size: image.Pt(w, h)}
 	}
 	h := p.h

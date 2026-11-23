@@ -30,6 +30,9 @@ const REAL_SOURCES = {
   GifPicker: '"gif-picker-host", e.onGifSelected, e.emojiSearchQuery',
   // Slick's ChannelListTyping: {displayName: 'Channel', filter: isSidebarChannel}
   Channel: '"getSidebarChannelUiInfo"',
+  // Slack's message actions menu renderer (boot-shared 2rcC): Slick's
+  // ChatTabs before #473 finds it with a filter on its render's source
+  MAMenu: 'renderActionGroup, dispatchMessageAction',
 }
 
 /**
@@ -222,7 +225,10 @@ const KNOWN_COMPONENTS = ('MessageBackground;MessageWrapper;MessageListItem;Sear
   'HuddleInviteWindowWithPreviewContent;HuddleMiniPanel;HuddleMvaWindowTitle;HuddleRecordingIndicator;LocalTimeRow;MemberProfileBaseEntity;' +
   'MemberSlug;Menu;Message;MessageActionsMenu;MessageAttachmentYouTube;MessageFile;MessageFiles;MessageKitAttachments;MessageText;' +
   'MultiFileUploadItem;PeopleGrid;Presence;ProfileHoverCard;ProgressiveDisclosureSuccessCoachmarkWrapper;ReplyBarAvatar;SearchAutocomplete;' +
-  'SearchInputBox;SendButton;TextyAutocomplete;ThreadReplies;ThreadReplyGeneric;MessageAvatar;MessageKitGutter').split(';')
+  'SearchInputBox;SendButton;TextyAutocomplete;ThreadReplies;ThreadReplyGeneric;MessageAvatar;MessageKitGutter;' +
+  // Slick's api.menu.addMessageActions (since #473) and BetterMessageMenu;
+  // the message actions submenus, each with a MAMenu of its own
+  'MAMenu;OrganizeMessageActionsSubmenu;ConnectToAppsMessageActionsSubmenu').split(';')
 
 const rawNatives = new Map() // name → the unpatched native component
 const wrappers = new Map() // name → the patch-following component plugins get
@@ -234,8 +240,15 @@ const slotContext = () => (slotCtx ??= G.React.createContext(null))
 function nativeFor(name) {
   let c = rawNatives.get(name)
   if (c) return c
-  const native = typeof host.native === 'function' ? host.native(name) : null
   const React = G.React
+  // The host native, memoized: a patch that renders again with what it
+  // passed before stops here, so the native's host node, and the root
+  // drawing it, don't change. Every patch calling usePatchVersion renders
+  // again on each api.redux.refresh (Message Logger's, on every edit and
+  // delete it logs): about 1,000 of them in a long channel, each
+  // re-rendering its native, which re-serialized its props (a message's
+  // blocks and all) and sent its root's same tree to Go again.
+  const native = typeof host.native === 'function' ? React.memo(host.native(name)) : null
   const render = function SlackNative(props) {
     const view = React.useContext(stateViewContext())
     const el = native ? React.createElement(native, view ? { ...props, $view: view.id } : props) : React.createElement('clack-native', { name, props })
@@ -338,6 +351,69 @@ function compose(name) {
   return reps.reduce((cur, r) => applyReplacer(r, cur), original)
 }
 
+// ---- a patch that throws draws the original ----
+
+/**
+ * Every patched component Go draws is a React root of its own, and React
+ * unmounts a whole root on an error nothing catches: one throw anywhere in
+ * a patched subtree, while rendering or in an effect, emptied the root's
+ * host tree and Go drew nothing for the component. A composer that Better
+ * Typing Indicator patches (it wraps MessagePaneInput, and its TypingNames
+ * renders again whenever someone types) vanished that way and stayed gone
+ * until a restart. So each patched render runs under a PatchGuard: what a
+ * patch throws is logged and the component draws as though no plugin
+ * patched it (its Original; the patched parts inside keep their own
+ * guards). New props try the patches again.
+ */
+let PatchGuard
+function patchGuard() {
+  if (PatchGuard) return PatchGuard
+  const React = G.React
+  PatchGuard = class PatchGuard extends React.Component {
+    constructor(props) {
+      super(props)
+      this.state = { failed: false }
+    }
+    static getDerivedStateFromError() {
+      return { failed: true }
+    }
+    componentDidCatch(err, info) {
+      notePatchError(this.props.name, err, info)
+    }
+    componentDidUpdate(prev) {
+      // after the commit, not in getDerivedStateFromProps: a reset there
+      // would also run in the render that shows the fallback, render the
+      // throwing patch again, and send the error on up to the root
+      if (this.state.failed && prev.props !== this.props.props) this.setState({ failed: false })
+    }
+    render() {
+      return this.state.failed ? React.createElement(originalObject(this.props.name), this.props.props) : this.props.children
+    }
+  }
+  return PatchGuard
+}
+
+/** component name → {at, n}: the last line about its patches throwing, and the throws since */
+const patchErrors = new Map()
+const PATCH_ERROR_EVERY = 60e3
+/** logs a patch's error: the first at once, then a line a minute per component with the count */
+function notePatchError(name, err, info) {
+  const now = Date.now()
+  let s = patchErrors.get(name)
+  if (!s) patchErrors.set(name, (s = { at: -Infinity, n: 0 }))
+  s.n++
+  if (now - s.at < PATCH_ERROR_EVERY) return
+  const stack = String(info?.componentStack ?? '')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .slice(0, 6)
+    .join(' < ')
+  error(`a plugin's patch of ${name} threw${s.n > 1 ? ` (${s.n} times)` : ''}; drawing ${name} without it:`, err, stack ? `[${stack}]` : '')
+  s.at = now
+  s.n = 0
+}
+
 /** the component a plugin gets for Slack's `name`: it follows patches as they come and go */
 function slackComponent(name) {
   let w = wrappers.get(name)
@@ -352,6 +428,8 @@ function slackComponent(name) {
     if (props && props.__original) {
       const { __original, ...rest } = props
       el = React.createElement(nativeFor(name), rest)
+    } else if (C !== originalObject(name)) {
+      el = React.createElement(patchGuard(), { name, props }, React.createElement(C, props))
     } else {
       el = React.createElement(C, props)
     }
@@ -389,7 +467,23 @@ const sameSet = (a, b) => a.size === b.size && [...a].every((x) => b.has(x))
 
 const patchTargetNames = new Set()
 
+/**
+ * patchComponent's patch placed innermost, next to the component itself,
+ * whenever it comes and goes: a runtime's own patch that plugins' patches
+ * wrap (Slick's MAMenu patch, which Slick loads before the plugin whose
+ * menu API asks for it starts, so every plugin's MAMenu patch sits outside
+ * it; Clack installs it only while it has a message action to add).
+ */
+function patchComponentInner(matcher, replacement) {
+  return addPatch(matcher, replacement, true)
+}
+
+/** a plugin's patch: outside the ones before it */
 function patchComponent(matcher, replacement) {
+  return addPatch(matcher, replacement, false)
+}
+
+function addPatch(matcher, replacement, inner) {
   const displayName = typeof matcher === 'string' ? matcher : matcher?.displayName
   const filter = typeof matcher === 'string' ? undefined : matcher?.filter
   const component = typeof matcher === 'string' ? undefined : matcher?.component
@@ -406,7 +500,15 @@ function patchComponent(matcher, replacement) {
   }
   // a filter-only spec matches any component its filter accepts, so offer it every one Clack draws
   if (filter) for (const n of KNOWN_COMPONENTS) nativeFor(n)
-  replacements.set(fn, replacement)
+  if (inner && replacements.size) {
+    // compose() applies patches in insertion order, the first innermost
+    const rest = [...replacements]
+    replacements.clear()
+    replacements.set(fn, replacement)
+    for (const [m, r] of rest) replacements.set(m, r)
+  } else {
+    replacements.set(fn, replacement)
+  }
   applyPatches()
   return () => {
     replacements.delete(fn)
@@ -435,9 +537,38 @@ T.fnElement = (fnId, args) => {
 T.callHostFn = (id, args) => {
   const fn = typeof host.fnById === 'function' ? host.fnById(id) : null
   if (typeof fn !== 'function') throw new Error(`[Taut] function ${id} is gone`)
-  return Promise.resolve(fn(...decode(args || []))).then(encode)
+  const [a, events] = T.decodeArgs(args)
+  const r = fn(...a)
+  // a synthetic event's handler: what it did with it, at once (00_core.js)
+  if (events) return T.eventAnswer(events)
+  return Promise.resolve(r).then(encode)
 }
+/**
+ * Go → JS: calls a function prop the way Slack calls a handler whose
+ * return value decides what runs next (MAMenu's dispatchMessageAction:
+ * `onSelectAction(…) || native(…)`): whether it returned something truthy,
+ * right away (a returned Promise is truthy and isn't awaited), or threw
+ * (then nothing else runs, as when Slack's handler throws)
+ */
+function truthyCall(fn, args) {
+  if (typeof fn !== 'function') return { gone: true } // released with its tree: no handler to decide
+  const [a] = T.decodeArgs(args)
+  try {
+    return { truthy: !!fn(...a) }
+  } catch (err) {
+    error('a handler threw', err)
+    return { truthy: false, threw: true }
+  }
+}
+T.callHostFnTruthy = (id, args) => truthyCall(typeof host.fnById === 'function' ? host.fnById(id) : null, args)
+T.callFnTruthy = (id, args) => truthyCall(jsFns.get(id), args)
 T.patchedComponents = () => [...patchedNames]
+/** component name → how many patches match it (introspection: which patches a plugin left behind) */
+T.patchCounts = () => {
+  const out = {}
+  for (const name of patchedNames) out[name] = matchers(name).length
+  return out
+}
 
 // ---- lookups (getComponent, lazyComponent, …) ----
 
@@ -734,4 +865,4 @@ T.preferencesTabElement = (id) => {
 }
 const preferences = { addTab }
 
-Object.assign(T, { patchComponent, slackComponent, nativeFor, feedNative, getComponent, waitForComponent, getRenderedComponent, waitForRenderedComponent, getComponentSource, componentName, lazyComponent, elementsApi, modalApi, menuApi, dialogHelpersFor, openOverlay })
+Object.assign(T, { patchComponent, patchComponentInner, slackComponent, nativeFor, feedNative, getComponent, waitForComponent, getRenderedComponent, waitForRenderedComponent, getComponentSource, componentName, lazyComponent, elementsApi, modalApi, menuApi, dialogHelpersFor, openOverlay })

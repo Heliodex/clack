@@ -41,6 +41,7 @@ import (
 	"github.com/some-du6e/clack/internal/slack"
 	"github.com/some-du6e/clack/internal/ui/hovercard"
 	"github.com/some-du6e/clack/internal/ui/icons"
+	"github.com/some-du6e/clack/internal/ui/richview"
 	"github.com/some-du6e/clack/internal/ui/shortcut"
 	"github.com/some-du6e/clack/internal/ui/slackc"
 	"github.com/some-du6e/clack/internal/ui/theme"
@@ -50,10 +51,11 @@ import (
 
 // srTok is a placed word or space run.
 type srTok struct {
-	s    string
-	hit  bool
-	x, y int // y is the line index
-	w    int
+	s       string
+	hit     bool
+	mention uint8 // a mention slug's (srSeg.Mention)
+	x, y    int   // y is the line index
+	w       int
 }
 
 // srSplitWords splits s into word runs, space runs and "\n" tokens,
@@ -102,7 +104,11 @@ func srWrap(gtx layout.Context, th *theme.Theme, segs []srSeg, width, maxLines, 
 	}
 	var words []string
 	for _, sg := range segs {
-		words = srSplitWords(sg.Text, words[:0])
+		if sg.Mention != srMentionNone {
+			words = append(words[:0], sg.Text) // a slug never breaks
+		} else {
+			words = srSplitWords(sg.Text, words[:0])
+		}
 		for _, wd := range words {
 			if wd == "\n" {
 				line++
@@ -132,7 +138,7 @@ func srWrap(gtx layout.Context, th *theme.Theme, segs []srSeg, width, maxLines, 
 				}
 				if pw > lim {
 					// a word wider than the line: clip it (ellipsized)
-					toks = append(toks, srTok{s: wd, hit: sg.Hit, y: line, w: lim})
+					toks = append(toks, srTok{s: wd, hit: sg.Hit, mention: sg.Mention, y: line, w: lim})
 					x = lim
 					if maxLines > 0 && line == maxLines-1 {
 						return toks, maxLines, true
@@ -140,7 +146,7 @@ func srWrap(gtx layout.Context, th *theme.Theme, segs []srSeg, width, maxLines, 
 					continue
 				}
 			}
-			toks = append(toks, srTok{s: wd, hit: sg.Hit, x: x, y: line, w: pw})
+			toks = append(toks, srTok{s: wd, hit: sg.Hit, mention: sg.Mention, x: x, y: line, w: pw})
 			x += pw
 		}
 	}
@@ -169,18 +175,36 @@ func srEndX(toks []srTok, line int) int {
 }
 
 // srDrawToks draws placed tokens at the origin, lines lh px apart, with
-// the search highlight behind hits.
+// the search highlight behind hits and mentions as Slack's mention slug
+// (c-member_slug--mention: the mention colours on a radius 3 background;
+// the viewer's own and broadcasts in the self-mention yellow).
 func srDrawToks(gtx layout.Context, th *theme.Theme, cl *Colors, toks []srTok, lh int, fg color.NRGBA) {
+	var pal *richview.Palette
 	for i := range toks {
 		t := toks[i]
 		y := t.y * lh
-		if t.hit {
+		col := fg
+		if t.mention != srMentionNone {
+			if pal == nil {
+				p := richview.LightPalette()
+				if th != nil && th.Dark {
+					p = richview.DarkPalette()
+				}
+				pal = &p
+			}
+			bg, tc := pal.MentionBg, pal.MentionText
+			if t.mention == srMentionSelf {
+				bg, tc = pal.SelfMentionBg, pal.SelfMentionText
+			}
+			rrect(gtx, image.Rect(t.x, y+dp(gtx, 1), t.x+t.w, y+lh-dp(gtx, 1)), dp(gtx, 3), bg)
+			col = tc
+		} else if t.hit {
 			fill(gtx, image.Rect(t.x, y+dp(gtx, 1), t.x+t.w, y+lh-dp(gtx, 1)), cl.MatchBg)
 		}
 		at(gtx, image.Pt(t.x, y), func(gtx layout.Context) layout.Dimensions {
 			gtx.Constraints = layout.Constraints{Max: image.Pt(t.w+dp(gtx, 2), lh)}
 			return vcenter(gtx, lh, func(gtx layout.Context) layout.Dimensions {
-				return text(gtx, th, 15, theme.Regular, fg, t.s)
+				return text(gtx, th, 15, theme.Regular, col, t.s)
 			})
 		})
 	}
@@ -257,9 +281,13 @@ type srCard struct {
 	name, avatar, when string
 	where              srWhere
 	flat, full         []srSeg
-	ovText             string // a plugin's text the tokens came from (overText)
+	ovText             string       // a plugin's text the tokens came from (overText)
+	ovDoc              richtext.Doc // ovText's document
+	rich               srCardRich   // the rich body, attachments and files (search_card_rich.go)
+	laid               srRichParts  // their last frame's layout
 	expanded           bool
 	click, more, chip  widget.Clickable
+	hov                bool // hovered, last frame: its background and hover bar
 	toks               []srTok
 	tokW               int
 	tokExp             bool
@@ -269,6 +297,18 @@ type srCard struct {
 	// Slack's ProfileHoverTrigger on the sender's avatar and name
 	// (SearchResult: BaseAvatar showCard at 36px, MessageSender)
 	avHov, nameHov hovercard.Trigger
+
+	// the density card (core.SearchCardExplore, search_card.go,
+	// search_card_rich.go): what renderBlocks needs (dense; denseOwn
+	// without a plugin's text), the
+	// count pills and their tooltips, the attachments count, the
+	// attachments pill (card coords, last frame) and the viewer's reply
+	dense, denseOwn       srDense
+	reacts, atts          widget.Clickable
+	tipReplies, tipReacts TipState
+	attN                  int
+	attR                  image.Rectangle
+	reply                 srViewerReply
 
 	// hover action bar
 	bar, fwd, jump, kebab    widget.Clickable
@@ -282,10 +322,14 @@ var srBarShadow = linearAlpha(rgba(0x000000, .08), rgb(0xffffff))
 
 // SearchView is the full search results page.
 type SearchView struct {
-	h      Host
-	q      srQuery
-	tab    int
-	sortBy string // score | timestamp | oldest
+	h     Host
+	typed string // the query the page opened with (the title's)
+	// the cards' rich style without the ui root's (srRichStyle)
+	richSt   *richview.Style
+	richDark bool
+	q        srQuery
+	tab      int
+	sortBy   string // score | timestamp | oldest
 	// sortState is the messages module's sortForcedToRecent and the
 	// window's disableSortOverride (srSortState)
 	sortState srSortState
@@ -307,8 +351,9 @@ type SearchView struct {
 	err     string
 	sess    core.SearchSession // one per query: every module call shares it
 	exact   bool               // More > Exact matches only (search_exact_matches_only)
-	// exclArch is More > Exclude archived (channel_type exclude_archived),
-	// shown with search_explore_freshness_signals on
+	// exclArch is channel_type exclude_archived. Nothing sets it since
+	// More lost Exclude archived (search_view_filters.go); kept for the
+	// saved filters' plumbing
 	exclArch bool
 	visible  []string // the filters the row shows as pills (srFSources first), last frame
 	// tabSort is the Files, Canvases, Channels and People tabs' Sort
@@ -349,10 +394,16 @@ type SearchView struct {
 	chans  []core.ChannelHit
 	people []core.User
 	files  []core.File
-	rows   []widget.Clickable
-	btns   []widget.Clickable
+	// a result's controls, kept by the result (its file, channel or
+	// member id) as Slack keys its result rows: a row or button held
+	// while more results load or a new search lands keeps its press and
+	// its result. By index, growth moved every Clickable (Gio routes a
+	// press by its handler's address) and a new search put another result
+	// under a held one.
+	rows   map[string]*widget.Clickable // a result's body (file, channel, person)
+	btns   map[string]*widget.Clickable // a channel's Join / Joined / Leave
+	chanUI map[string]*srChanUI         // a channel's other controls, by channel (search_rows.go)
 	listY  int
-	rowH   int
 
 	// numbered pagination (Slack's c-pagination)
 	prevBtn, nextBtn widget.Clickable
@@ -381,7 +432,7 @@ func NewSearchView(h Host, query string) *SearchView {
 		}
 	}
 	srRecordQuery(query)
-	v := &SearchView{h: h, q: srParse(query), tab: tab, sortBy: DefaultSearchSort(h.Core()), menuCard: -1, sess: core.NewSearchSession()}
+	v := &SearchView{h: h, typed: query, q: srParse(query), tab: tab, sortBy: DefaultSearchSort(h.Core()), menuCard: -1, sess: core.NewSearchSession()}
 	for t := range v.tabSort {
 		v.tabSort[t] = srDefaultTabSort(h.Core(), t)
 	}
@@ -412,9 +463,31 @@ func (v *SearchView) Query() string { return v.q.String() }
 
 func (v *SearchView) setQuery(q srQuery) {
 	v.q = q
+	v.typed = srTypedLeft(v.typed, q)
 	srRecordQuery(q.String())
 	v.sess = core.NewSearchSession() // a new query is a new search session
 	v.search(1)
+}
+
+// srTypedLeft is the typed query less the modifiers q no longer has (a
+// pill's menu clearing a typed one, "Search without filters"): the title
+// shows what's left of what was typed, never the filters a pill adds
+// (Slack keeps those in the query filter).
+func srTypedLeft(typed string, q srQuery) string {
+	toks := srTokens(typed)
+	out := toks[:0:0]
+	for _, t := range toks {
+		if p := srParse(t); len(p.Mods) == 1 && !slices.ContainsFunc(q.Mods, func(m srMod) bool {
+			return m.Key == p.Mods[0].Key && m.Neg == p.Mods[0].Neg && strings.EqualFold(m.Val, p.Mods[0].Val)
+		}) {
+			continue
+		}
+		out = append(out, t)
+	}
+	if len(out) == len(toks) {
+		return typed
+	}
+	return strings.Join(out, " ")
 }
 
 func (v *SearchView) setTab(t int) {
@@ -605,13 +678,67 @@ func (v *SearchView) search(page int) {
 	}
 }
 
-func (v *SearchView) growRows(n int) {
-	for len(v.rows) < n {
-		v.rows = append(v.rows, widget.Clickable{})
+// growRows is a new page of results: the controls of results no longer
+// listed go, and no join or leave is in flight.
+func (v *SearchView) growRows(int) {
+	keep := make(map[string]bool, len(v.files)+len(v.chans)+len(v.people))
+	for _, f := range v.files {
+		keep[f.ID] = true
 	}
-	for len(v.btns) < n {
-		v.btns = append(v.btns, widget.Clickable{})
+	for _, c := range v.chans {
+		keep[c.ID] = true
 	}
+	for _, u := range v.people {
+		keep[u.ID] = true
+	}
+	for k := range v.rows {
+		if !keep[k] {
+			delete(v.rows, k)
+		}
+	}
+	for k := range v.btns {
+		if !keep[k] {
+			delete(v.btns, k)
+		}
+	}
+	for k, ui := range v.chanUI {
+		if !keep[k] {
+			delete(v.chanUI, k)
+		} else {
+			ui.busy = false
+		}
+	}
+}
+
+// row is result id's body button, made on its first draw.
+func (v *SearchView) row(id string) *widget.Clickable { return srClick(&v.rows, id) }
+
+// btn is channel id's Join / Joined / Leave button.
+func (v *SearchView) btn(id string) *widget.Clickable { return srClick(&v.btns, id) }
+
+// chanUIOf is channel id's other controls.
+func (v *SearchView) chanUIOf(id string) *srChanUI {
+	ui := v.chanUI[id]
+	if ui == nil {
+		if v.chanUI == nil {
+			v.chanUI = map[string]*srChanUI{}
+		}
+		ui = &srChanUI{}
+		v.chanUI[id] = ui
+	}
+	return ui
+}
+
+func srClick(m *map[string]*widget.Clickable, id string) *widget.Clickable {
+	b := (*m)[id]
+	if b == nil {
+		if *m == nil {
+			*m = map[string]*widget.Clickable{}
+		}
+		b = new(widget.Clickable)
+		(*m)[id] = b
+	}
+	return b
 }
 
 func (v *SearchView) addMessages(res core.SearchResult, page int) {
@@ -631,12 +758,15 @@ func (v *SearchView) addMessages(res core.SearchResult, page int) {
 	for i := range res.Messages {
 		m := &res.Messages[i]
 		name, av := srAuthor(v.h, m)
-		body := srBody(m)
+		runs := srBodyRuns(v.h, m)
+		dense := srDenseOf(m)
 		v.cards = append(v.cards, srCard{
 			name: name, avatar: av, when: dayTime(tsTime(m.TS), now),
 			where: srWhereOf(v.h, v.convs, m),
-			flat:  srHighlight(srFlatten(body), terms),
-			full:  srHighlight(strings.TrimSpace(body), terms),
+			flat:  srRunSegs(runs, terms, true),
+			full:  srRunSegs(runs, terms, false),
+			dense: dense, denseOwn: dense,
+			attN: srAttachmentCount(m),
 		})
 	}
 	v.msgs = append(v.msgs, res.Messages...)
@@ -651,8 +781,8 @@ func (v *SearchView) snapshot() (core.Snapshot, bool) {
 		return core.Snapshot{}, false
 	}
 	select {
-	case <-c.Ready():
-		return c.Snapshot(), true
+	case <-c.DataReady():
+		return c.SnapshotNow(), true
 	default:
 		return core.Snapshot{}, false
 	}
@@ -994,16 +1124,29 @@ func (v *SearchView) handle(gtx layout.Context) {
 	}
 	switch v.tab {
 	case srTabFiles, srTabCanvases:
-		for i := range v.files {
-			if v.rows[i].Clicked(gtx) {
+		for i := 0; i < len(v.files); i++ {
+			if v.row(v.files[i].ID).Clicked(gtx) {
 				v.openFile(v.files[i])
+				break
 			}
 		}
 	case srTabMessages, srTabDMs:
 		for i := range v.cards {
 			c := &v.cards[i]
+			if c.rich.moreAtt.Clicked(gtx) { // the attachments' Show more expands the card too
+				c.expanded = true
+			}
 			if c.more.Clicked(gtx) {
 				c.expanded = !c.expanded
+			}
+			if c.reacts.Clicked(gtx) {
+				// onReactionsPillClick: the message, scrolled to its
+				// reactions
+				RecordRecentConversation(v.msgs[i].Channel)
+				openResult(v.h, v.msgs[i])
+			}
+			if c.atts.Clicked(gtx) {
+				v.srOpenAttachments(gtx, i)
 			}
 			if c.chip.Clicked(gtx) {
 				m := v.msgs[i]
@@ -1018,7 +1161,7 @@ func (v *SearchView) handle(gtx layout.Context) {
 			body, jump := c.click.Clicked(gtx), c.jump.Clicked(gtx)
 			if body || jump {
 				RecordRecentConversation(v.msgs[i].Channel)
-				v.h.Navigate(msgRoute(v.msgs[i]))
+				openResult(v.h, v.msgs[i])
 			}
 			if c.fwd.Clicked(gtx) {
 				v.h.ShowOverlay(NewForwardModal(v.h, v.msgs[i]))
@@ -1028,22 +1171,9 @@ func (v *SearchView) handle(gtx layout.Context) {
 			}
 		}
 	case srTabChannels:
-		for i := range v.chans {
-			if v.rows[i].Clicked(gtx) || v.btns[i].Clicked(gtx) {
-				RecordRecentConversation(v.chans[i].ID)
-				v.h.Navigate("c/" + v.chans[i].ID)
-			}
-		}
+		v.handleChannels(gtx)
 	case srTabPeople:
-		for i := range v.people {
-			if v.rows[i].Clicked(gtx) {
-				y := v.listY + (i-v.list.Position.First)*v.rowH - v.list.Position.Offset
-				pad := v.padX(gtx, gtx.Constraints.Max.X)
-				r := image.Rect(pad, y, pad+dp(gtx, 52), y+v.rowH)
-				w := v.win(gtx, r)
-				v.h.OpenProfile(image.Pt(w.Max.X, w.Min.Y), v.people[i].ID)
-			}
-		}
+		v.handlePeople(gtx)
 	}
 }
 
@@ -1242,11 +1372,12 @@ func (v *SearchView) Layout(gtx layout.Context) layout.Dimensions {
 	return layout.Dimensions{Size: sz}
 }
 
+// title is SearchTitle: "Search" without a query, else "Results for:"
+// and the query as Slack displays it (srTitleQuery: members as @name,
+// channels as #name, modifiers with theirs), the typed query, not the
+// filters the pills add (Slack keeps those in the query filter).
 func (v *SearchView) title(gtx layout.Context, th *theme.Theme, cl *Colors) layout.Dimensions {
-	q := v.q.Text()
-	if q == "" {
-		q = v.q.String()
-	}
+	q := srTitleQuery(v.h, v.typed)
 	h := dp(gtx, 26)
 	if q == "" {
 		return vcenter(gtx, h, func(gtx layout.Context) layout.Dimensions {
@@ -1402,27 +1533,24 @@ func (v *SearchView) results(gtx layout.Context, th *theme.Theme, cl *Colors, px
 		return layout.Dimensions{Size: sz}
 	}
 	pager := v.pages > 1
-	items := n
+	rows := n
+	if v.tab == srTabPeople { // PeopleGrid: one list row per grid row
+		cols, _ := srPeopleGrid(gtx, cw)
+		rows = (n + cols - 1) / cols
+	}
+	items := rows
 	if pager {
 		items++
 	}
-	switch v.tab {
-	case srTabChannels:
-		v.rowH = dp(gtx, 64)
-	case srTabPeople:
-		v.rowH = dp(gtx, 60)
-	case srTabFiles, srTabCanvases:
-		v.rowH = dp(gtx, 64)
-	}
 	return v.list.Layout(gtx, items, func(gtx layout.Context, i int) layout.Dimensions {
-		if i == n {
+		if i == rows {
 			return v.pagination(gtx, th, cl, sz.X)
 		}
 		switch v.tab {
 		case srTabChannels:
 			return v.chanRow(gtx, th, cl, i, px, cw)
 		case srTabPeople:
-			return v.personRow(gtx, th, cl, i, px, cw)
+			return v.peopleRow(gtx, th, cl, i, px, cw)
 		case srTabFiles, srTabCanvases:
 			return v.fileRow(gtx, th, cl, i, px, cw)
 		}
@@ -1561,66 +1689,6 @@ func (v *SearchView) pagination(gtx layout.Context, th *theme.Theme, cl *Colors,
 	return layout.Dimensions{Size: image.Pt(w, h)}
 }
 
-// fileRow is a Files / Canvases result: the type tile, the title, and
-// "Name · date" under it.
-func (v *SearchView) fileRow(gtx layout.Context, th *theme.Theme, cl *Colors, i, px, cw int) layout.Dimensions {
-	f := v.files[i]
-	h := v.rowH
-	return at(gtx, image.Pt(px, 0), func(gtx layout.Context) layout.Dimensions {
-		return clickBox(gtx, &v.rows[i], nil, func(gtx layout.Context) layout.Dimensions {
-			r := image.Rect(0, 0, cw, h-dp(gtx, 8))
-			bg := cl.Bg
-			if v.rows[i].Hovered() {
-				bg = cl.BgHover
-			}
-			rrect(gtx, r, dp(gtx, 12), bg)
-			stroke(gtx, r, dp(gtx, 12), border1(gtx), cl.Divider)
-			tile := dp(gtx, 36)
-			ty := (r.Dy() - tile) / 2
-			ic := "files"
-			switch {
-			case f.IsCanvas:
-				ic = "canvas"
-			case f.IsList:
-				ic = "list-tab"
-			case f.IsImage:
-				ic = "image"
-			}
-			rrect(gtx, image.Rect(dp(gtx, 12), ty, dp(gtx, 12)+tile, ty+tile), dp(gtx, 8), cl.BgHover)
-			at(gtx, image.Pt(dp(gtx, 12)+(tile-dp(gtx, 20))/2, ty+(tile-dp(gtx, 20))/2), func(gtx layout.Context) layout.Dimensions {
-				return icon(gtx, ic, 20, cl.Fg2)
-			})
-			tx := dp(gtx, 12) + tile + dp(gtx, 12)
-			tw := maxInt(1, cw-tx-dp(gtx, 12))
-			title := f.Title
-			if title == "" {
-				title = f.Name
-			}
-			at(gtx, image.Pt(tx, ty-dp(gtx, 1)), func(gtx layout.Context) layout.Dimensions {
-				gtx.Constraints = layout.Constraints{Max: image.Pt(tw, dp(gtx, 22))}
-				return text(gtx, th, 15, theme.Black, cl.Fg, title)
-			})
-			sub := ""
-			if u, ok := lookupUser(v.h, f.User); ok {
-				sub = userName(u)
-			}
-			if f.Created > 0 {
-				when := srShortDay(time.Unix(f.Created, 0), time.Now())
-				if sub != "" {
-					sub += " · " + when
-				} else {
-					sub = when
-				}
-			}
-			at(gtx, image.Pt(tx, ty+dp(gtx, 20)), func(gtx layout.Context) layout.Dimensions {
-				gtx.Constraints = layout.Constraints{Max: image.Pt(tw, dp(gtx, 18))}
-				return text(gtx, th, 13, theme.Regular, cl.Fg2, sub)
-			})
-			return layout.Dimensions{Size: image.Pt(cw, h)}
-		})
-	})
-}
-
 // openFile opens a file result like the Files browser does.
 func (v *SearchView) openFile(f core.File) { srOpenFile(v.h, f) }
 
@@ -1712,7 +1780,8 @@ func (v *SearchView) overText(i int, over slackc.Props) {
 		return
 	}
 	c.ovText = t
-	body := srBody(m)
+	runs := srBodyRuns(v.h, m)
+	c.ovDoc = richtext.Doc{}
 	if t != "" {
 		mm := *m
 		mm.Text, mm.Doc = t, richtext.Doc{}
@@ -1723,11 +1792,18 @@ func (v *SearchView) overText(i int, over slackc.Props) {
 			}
 			mm.Doc = richtext.FromMessage(app.S, &slack.Message{Type: "message", TS: m.TS, User: m.User, Text: t, Blocks: raw})
 		}
-		body = srBody(&mm)
+		runs = srBodyRuns(v.h, &mm)
+		c.ovDoc = mm.Doc
 	}
 	terms := v.q.Highlights()
-	c.flat, c.full = srHighlight(srFlatten(body), terms), srHighlight(strings.TrimSpace(body), terms)
+	c.flat, c.full = srRunSegs(runs, terms, true), srRunSegs(runs, terms, false)
 	c.tokW = -1 // wrap again
+	// the density body shows the plugin's text whole (compactCardBlocks
+	// keeps it: it has no blocks of its own), its own text again after
+	c.dense = c.denseOwn
+	if t != "" {
+		c.dense.heur = false
+	}
 }
 
 func (a srCardArgs) resultProps() slackc.Props {
@@ -1768,7 +1844,13 @@ func (v *SearchView) cardNative(gtx layout.Context, th *theme.Theme, cl *Colors,
 		bw = 1
 	}
 	lh := dp(gtx, 22)
-	if c.tokW != bw || c.tokExp != c.expanded {
+	explore := srExplore(v.h)
+	var rich srRichParts
+	if explore { // the density card's rich body (search_card_rich.go)
+		rich = v.srRichMeasure(gtx, th, i, bw, lh)
+		c.laid = rich
+	}
+	if !explore && (c.tokW != bw || c.tokExp != c.expanded) {
 		c.tokW, c.tokExp = bw, c.expanded
 		if c.expanded {
 			c.toks, c.lines, c.over = srWrapFit(gtx, th, c.full, bw, 0, 0)
@@ -1780,19 +1862,35 @@ func (v *SearchView) cardNative(gtx layout.Context, th *theme.Theme, cl *Colors,
 	lines := maxInt(1, c.lines)
 	nameH := dp(gtx, 20)
 	bodyY := padT + nameH
+	var pills []srPill
+	if explore {
+		pills = srPills(c, m)
+		v.srAskViewerReply(i)
+	}
 	h := bodyY + lines*lh
-	if c.expanded {
+	if explore {
+		h = bodyY + rich.h
+	} else if c.expanded {
 		h += dp(gtx, 20) // "Show less"
 	}
-	if m.ReplyCount > 0 {
+	switch {
+	case explore:
+		h += srPillsHeight(gtx, th, pills, bw)
+	case m.ReplyCount > 0:
 		h += dp(gtx, 9) + dp(gtx, 22)
 	}
 	h += padB
 	sz := image.Pt(w, h)
 	r := image.Rectangle{Max: sz}
 	rad := dp(gtx, 12)
+	// the rich body and attachments are drawn over the card's click
+	// target and take the pointer there (SearchResult's onMouseMove is on
+	// the card's root: the text keeps it hovered)
+	overRich := explore && (c.rich.body != nil && c.rich.body.Pointer() || c.rich.extra != nil && c.rich.extra.Pointer())
 	hovered := c.click.Hovered() || c.more.Hovered() || c.chip.Hovered() || c.bar.Hovered() ||
+		c.reacts.Hovered() || c.atts.Hovered() || overRich ||
 		c.fwd.Hovered() || c.jump.Hovered() || c.kebab.Hovered() || v.menuCard == i
+	c.hov = hovered
 	bg := cl.Bg
 	if hovered {
 		bg = cl.BgHover
@@ -1811,7 +1909,7 @@ func (v *SearchView) cardNative(gtx layout.Context, th *theme.Theme, cl *Colors,
 	}
 	at(gtx, image.Pt(padL, padT+dp(gtx, 2)), func(gtx layout.Context) layout.Dimensions {
 		d := srAvatar(gtx, v.h, m, avURL, 36, rp)
-		c.avHov.LayoutBot(gtx, m.User, srHoverBot(m), d.Size)
+		c.avHov.LayoutBotFn(gtx, m.User, func() string { return srHoverBot(v.h, m, true) }, d.Size)
 		return d
 	})
 	right := w - padR
@@ -1829,10 +1927,20 @@ func (v *SearchView) cardNative(gtx layout.Context, th *theme.Theme, cl *Colors,
 		d := vcenter(gtx, nameH, func(gtx layout.Context) layout.Dimensions {
 			return text(gtx, th, 15, theme.Black, cl.Fg, name)
 		})
-		c.nameHov.LayoutBot(gtx, m.User, srHoverBot(m), d.Size)
+		c.nameHov.LayoutBotFn(gtx, m.User, func() string { return srHoverBot(v.h, m, true) }, d.Size)
 		return d
 	})
 	srDrawWhere(gtx, v.h, c.where, tx+d.Size.X+dp(gtx, 4), padT, right, nameH, bg)
+	if explore {
+		y := bodyY + v.srRichDraw(gtx, th, cl, c, rich, tx, bodyY, bw, lh, bg)
+		v.srDrawPills(gtx, th, cl, c, m, pills, tx, y, bw)
+		if hovered {
+			v.hoverBar(gtx, th, cl, c, w)
+		} else {
+			c.tipFwd, c.tipJump, c.tipMore = TipState{}, TipState{}, TipState{}
+		}
+		return layout.Dimensions{Size: sz}
+	}
 	at(gtx, image.Pt(tx, bodyY), func(gtx layout.Context) layout.Dimensions {
 		srDrawToks(gtx, th, cl, c.toks, lh, cl.Fg)
 		return layout.Dimensions{}
@@ -1858,7 +1966,10 @@ func (v *SearchView) cardNative(gtx layout.Context, th *theme.Theme, cl *Colors,
 		})
 		y += dp(gtx, 20)
 	}
-	if m.ReplyCount > 0 {
+	switch {
+	case explore:
+		v.srDrawPills(gtx, th, cl, c, m, pills, tx, y, bw)
+	case m.ReplyCount > 0:
 		y += dp(gtx, 9)
 		at(gtx, image.Pt(tx, y), func(gtx layout.Context) layout.Dimensions {
 			return v.replyChip(gtx, th, cl, &c.chip, m.ReplyCount)
@@ -2024,7 +2135,14 @@ func (v *SearchView) cardHidden(gtx layout.Context, th *theme.Theme, cl *Colors,
 	toks, lines := srRichLayout(gtx, th, 15, srHiddenContents(v.h, m), bw)
 	bodyY := padT + nameH
 	h := bodyY + lines*lh
-	if m.ReplyCount > 0 {
+	explore := srExplore(v.h)
+	var pills []srPill
+	switch {
+	case explore:
+		pills = srPills(c, m)
+		v.srAskViewerReply(i)
+		h += srPillsHeight(gtx, th, pills, bw)
+	case m.ReplyCount > 0:
 		h += dp(gtx, 9) + dp(gtx, 22)
 	}
 	h += padB
@@ -2032,6 +2150,7 @@ func (v *SearchView) cardHidden(gtx layout.Context, th *theme.Theme, cl *Colors,
 	r := image.Rectangle{Max: sz}
 	rad := dp(gtx, 12)
 	hovered := c.click.Hovered() || c.chip.Hovered() || c.bar.Hovered() ||
+		c.reacts.Hovered() || c.atts.Hovered() ||
 		c.fwd.Hovered() || c.jump.Hovered() || c.kebab.Hovered() || v.menuCard == i
 	bg := cl.Bg
 	if hovered {
@@ -2051,7 +2170,10 @@ func (v *SearchView) cardHidden(gtx layout.Context, th *theme.Theme, cl *Colors,
 	srDrawHiddenHead(gtx, th, cl, m, tx, padT, w-padR, nameH)
 	srDrawRich(gtx, th, cl, toks, tx, bodyY, lh) // the break, then the contents
 	y := bodyY + lines*lh
-	if m.ReplyCount > 0 {
+	switch {
+	case explore:
+		v.srDrawPills(gtx, th, cl, c, m, pills, tx, y, bw)
+	case m.ReplyCount > 0:
 		y += dp(gtx, 9)
 		at(gtx, image.Pt(tx, y), func(gtx layout.Context) layout.Dimensions {
 			return v.replyChip(gtx, th, cl, &c.chip, m.ReplyCount)
@@ -2137,11 +2259,23 @@ func (v *SearchView) resultMenu(gtx layout.Context, i int) {
 	v.menuSeq++
 	seq := v.menuSeq
 	v.menuCard = i
-	v.h.ShowOverlay(NewMenuOpts(v.h, srResultItems(v.h, v.msgs[i]), MenuOpts{Anchor: a, OnClose: func() {
+	v.h.ShowOverlay(newSearchResultMenu(v.h, v.msgs[i], a, k, func() {
 		if v.menuSeq == seq {
 			v.menuCard = -1
 		}
-	}}))
+	}))
+}
+
+// newSearchResultMenu is a search result's More actions menu placed by
+// anchor, opened from the kebab at trigger (window px): MessageActions-
+// OverflowMenu > MessageActionsMenu > MAMenu, as on every message's
+// (isOnSearchTab, messageContainerType search), so plugins that add to the
+// message actions menu reach it.
+func newSearchResultMenu(h Host, m core.Message, anchor, trigger image.Rectangle, onClose func()) *Menu {
+	p := actMenuProps(m, trigger)
+	p["messageContainerType"], p["isOnSearchTab"] = "search", true
+	return NewMenuOpts(h, srResultItems(h, m), MenuOpts{Anchor: anchor, Trigger: trigger, OnClose: onClose,
+		Within: "MessageActionsMenu", WithinProps: p, MAMenu: MessageActionsProps(p, "overflow")})
 }
 
 // srResultItems is a search result's More actions menu (search_more.png):
@@ -2166,13 +2300,13 @@ func srResultItems(h Host, m core.Message) []MenuItem {
 		}
 	}
 	// authors and repliers follow a thread by default
-	follow := MenuItem{Label: "Get notified about new replies", Icon: "bell", Do: func() {
+	follow := MenuItem{Key: "subscribe", Action: "subscribe", Label: "Get notified about new replies", Icon: "bell", Do: func() {
 		actDo(h, "You'll be notified about new replies", func(ctx context.Context, a *core.App) error {
 			return a.SubscribeThread(ctx, ch, root, true)
 		})
 	}}.In(nsMessage)
 	if self != "" && (m.User == self || slices.Contains(m.ReplyUsers, self)) {
-		follow = MenuItem{Label: "Turn off notifications for replies", Icon: "bell-off", Do: func() {
+		follow = MenuItem{Key: "subscribe", Action: "subscribe", Label: "Turn off notifications for replies", Icon: "bell-off", Do: func() {
 			actDo(h, "You won't be notified about new replies", func(ctx context.Context, a *core.App) error {
 				return a.SubscribeThread(ctx, ch, root, false)
 			})
@@ -2183,21 +2317,21 @@ func srResultItems(h Host, m core.Message) []MenuItem {
 	// actions_todo.go): oMi4's save row and its aSBj click, ih0g's name
 	sa := SaveActionFor(h.Core(), &m)
 	return []MenuItem{
-		MenuItem{Label: sa.Label, Icon: sa.Icon, Hint: shortcut.Format("Mod+Shift+S"), Keys: KeySaveTodos, Do: func() {
+		MenuItem{Action: "later", Label: sa.Label, Icon: sa.Icon, Hint: shortcut.Format("Mod+Shift+S"), Keys: KeySaveTodos, Do: func() {
 			RunSaveAction(h, m)
 		}}.In(nsSaved),
-		MenuItem{Label: ReminderLabel(h.Core(), &m), Icon: "remind", Hint: nsMessage.T("M"), Keys: KeyRemind, Sub: rems[:len(rems)-1]}.In(nsMessage), // no Custom… here
+		MenuItem{Action: "remind", Label: ReminderLabel(h.Core(), &m), Icon: "remind", Hint: nsMessage.T("M"), Keys: KeyRemind, Sub: rems[:len(rems)-1]}.In(nsMessage), // no Custom… here
 		follow,
 		Sep(),
-		MenuItem{Label: "Copy link", Icon: "link", Hint: "L", Keys: KeyCopyLink, DoCtx: func(gtx layout.Context) {
+		MenuItem{Action: "copy_link", Label: "Copy link", Icon: "link", Hint: "L", Keys: KeyCopyLink, DoCtx: func(gtx layout.Context) {
 			copyText(gtx, link)
 			h.Toast("Link copied")
 		}}.In(nsMessage),
-		MenuItem{Label: "Copy message", Icon: "text-format", Hint: shortcut.Format("Mod+C"), Keys: KeyCopyText, DoCtx: func(gtx layout.Context) {
+		MenuItem{Action: "copy_text", Label: "Copy message", Icon: "text-format", Hint: shortcut.Format("Mod+C"), Keys: KeyCopyText, DoCtx: func(gtx layout.Context) {
 			copyMessage(gtx, m)
 		}}.In(nsMessage),
 		Sep(),
-		MenuItem{Label: "Connect to apps", Sub: []MenuItem{{Label: "No apps", Disabled: true}}}.In(nsMessage),
+		MenuItem{Action: "connect_to_apps_actions_menu", Label: "Connect to apps", Sub: []MenuItem{{Label: "No apps", Disabled: true}}}.In(nsMessage),
 	}
 }
 
@@ -2227,127 +2361,12 @@ func (v *SearchView) replyChip(gtx layout.Context, th *theme.Theme, cl *Colors, 
 	})
 }
 
-func (v *SearchView) chanRow(gtx layout.Context, th *theme.Theme, cl *Colors, i, px, cw int) layout.Dimensions {
-	gtx.Constraints.Min = image.Point{}
-	ch := &v.chans[i]
-	h := v.rowH
-	sz := image.Pt(cw, h)
-	at(gtx, image.Pt(px, 0), func(gtx layout.Context) layout.Dimensions {
-		if v.rows[i].Hovered() || v.btns[i].Hovered() {
-			rrect(gtx, image.Rectangle{Max: sz}, dp(gtx, 8), cl.BgHover)
-		}
-		g := gtx
-		g.Constraints = layout.Exact(sz)
-		v.rows[i].Layout(g, func(gtx layout.Context) layout.Dimensions {
-			pointerCursor(gtx, sz)
-			return layout.Dimensions{Size: sz}
-		})
-		box := dp(gtx, 36)
-		x := dp(gtx, 12)
-		rrect(gtx, image.Rect(x, (h-box)/2, x+box, (h+box)/2), dp(gtx, 8), cl.Disabled)
-		at(gtx, image.Pt(x+(box-dp(gtx, 20))/2, (h-dp(gtx, 20))/2), func(gtx layout.Context) layout.Dimensions {
-			return icon(gtx, convIcon(ch.Kind), 20, cl.Fg2)
-		})
-		tx := x + box + dp(gtx, 12)
-		label := nsSearch.T("View")
-		if !ch.IsMember {
-			label = nsSearch.T("Join")
-		}
-		bw := textW(gtx, th, 13, theme.Bold, label) + dp(gtx, 24)
-		bx := cw - dp(gtx, 12) - bw
-		at(gtx, image.Pt(bx, (h-dp(gtx, 28))/2), func(gtx layout.Context) layout.Dimensions {
-			return Button(gtx, th, &v.btns[i], BtnOutline, BtnSmall, label, "", 0)
-		})
-		maxW := maxInt(1, bx-dp(gtx, 12)-tx)
-		at(gtx, image.Pt(tx, dp(gtx, 11)), func(gtx layout.Context) layout.Dimensions {
-			gtx.Constraints = layout.Constraints{Max: image.Pt(maxW, dp(gtx, 22))}
-			return vcenter(gtx, dp(gtx, 22), func(gtx layout.Context) layout.Dimensions {
-				name := ch.Name
-				if ch.IsArchived {
-					name += " " + nsSearch.T("(archived)") // ChannelName's
-				}
-				return text(gtx, th, 15, theme.Bold, cl.Fg, name)
-			})
-		})
-		sub := plural(ch.NumMembers, "member")
-		if i18n.Locale() != i18n.EnUS {
-			sub = nsSearch.T("{count, plural, =1 {# member} other {# members}}", "count", ch.NumMembers) // BrowsePageChannelSubtext
-		}
-		if ch.IsMember {
-			sub = nsSearch.T("Joined") + " · " + sub
-		}
-		if p := strings.TrimSpace(ch.Purpose); p != "" {
-			sub += " · " + strings.Join(strings.Fields(p), " ")
-		}
-		at(gtx, image.Pt(tx, dp(gtx, 33)), func(gtx layout.Context) layout.Dimensions {
-			gtx.Constraints = layout.Constraints{Max: image.Pt(maxW, dp(gtx, 20))}
-			return vcenter(gtx, dp(gtx, 20), func(gtx layout.Context) layout.Dimensions {
-				return text(gtx, th, 13, theme.Regular, cl.Fg3, sub)
-			})
-		})
-		return layout.Dimensions{Size: sz}
-	})
-	return layout.Dimensions{Size: image.Pt(px+cw, h)}
-}
-
-func (v *SearchView) personRow(gtx layout.Context, th *theme.Theme, cl *Colors, i, px, cw int) layout.Dimensions {
-	gtx.Constraints.Min = image.Point{}
-	u := &v.people[i]
-	h := v.rowH
-	sz := image.Pt(cw, h)
-	at(gtx, image.Pt(px, 0), func(gtx layout.Context) layout.Dimensions {
-		g := gtx
-		g.Constraints = layout.Exact(sz)
-		return clickBox(g, &v.rows[i], func(gtx layout.Context, sz image.Point, hovered bool) {
-			if hovered {
-				rrect(gtx, image.Rectangle{Max: sz}, dp(gtx, 8), cl.BgHover)
-			}
-		}, func(gtx layout.Context) layout.Dimensions {
-			x := dp(gtx, 12)
-			av := dp(gtx, 36)
-			at(gtx, image.Pt(x, (h-av)/2), func(gtx layout.Context) layout.Dimensions {
-				return avatar(gtx, v.h, u.Avatar, 36)
-			})
-			tx := x + av + dp(gtx, 12)
-			maxW := maxInt(1, cw-tx-dp(gtx, 12))
-			d := at(gtx, image.Pt(tx, dp(gtx, 9)), func(gtx layout.Context) layout.Dimensions {
-				gtx.Constraints = layout.Constraints{Max: image.Pt(maxW-dp(gtx, 16), dp(gtx, 22))}
-				return vcenter(gtx, dp(gtx, 22), func(gtx layout.Context) layout.Dimensions {
-					return text(gtx, th, 15, theme.Bold, cl.Fg, userName(*u))
-				})
-			})
-			if u.Presence != "" {
-				at(gtx, image.Pt(tx+d.Size.X+dp(gtx, 6), dp(gtx, 9)+(dp(gtx, 22)-dp(gtx, 9))/2), func(gtx layout.Context) layout.Dimensions {
-					return presenceDot(gtx, th, u.Presence == "active", 9)
-				})
-			}
-			sub := u.Title
-			if u.RealName != "" && u.RealName != userName(*u) {
-				if sub != "" {
-					sub = u.RealName + " · " + sub
-				} else {
-					sub = u.RealName
-				}
-			}
-			if sub != "" {
-				at(gtx, image.Pt(tx, dp(gtx, 31)), func(gtx layout.Context) layout.Dimensions {
-					gtx.Constraints = layout.Constraints{Max: image.Pt(maxW, dp(gtx, 20))}
-					return vcenter(gtx, dp(gtx, 20), func(gtx layout.Context) layout.Dimensions {
-						return text(gtx, th, 13, theme.Regular, cl.Fg3, sub)
-					})
-				})
-			}
-			return layout.Dimensions{Size: sz}
-		})
-	})
-	return layout.Dimensions{Size: image.Pt(px+cw, h)}
-}
-
-// srHoverBot is the bot a result's sender opens AppHoverCard for when the
-// message has no user.
-func srHoverBot(m *core.Message) string {
-	if m.User != "" {
-		return ""
+// srHoverBot is the bot a result's sender opens AppHoverCard for with its
+// member: the message row's (core.App.SenderBot, Emf2's bot), with or
+// without a user.
+func srHoverBot(h Host, m *core.Message, ask bool) string {
+	if app := h.Core(); app != nil {
+		return app.SenderBot(m, ask)
 	}
 	if m.BotID != "" {
 		return m.BotID

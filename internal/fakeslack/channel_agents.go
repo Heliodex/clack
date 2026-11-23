@@ -23,8 +23,12 @@ import (
 //   - Triage Agent and Poll Maker are in neither; edge users/search finds
 //     them (and the channel's), and conversations.invite into either
 //     channel adds them to its agents and apps.
+//   - conversations.kick {channel, user} out of either channel takes an
+//     agent, an app or a person off its members (Kicked lists them);
+//     kicking the viewer is cant_kick_self, anyone else not_in_channel.
 //
-// Both channels are public.
+// Both channels are public (#no-agents private under
+// Size.ChannelAgentsPrivate).
 
 const (
 	ChannelAgentsID   = "C0FAKE00001" // #agents-lab
@@ -81,7 +85,8 @@ func (s *Server) channelAgentUser(id string) (slack.User, bool) {
 	return slack.User{}, false
 }
 
-// channelAgentsConvs names the two channels and makes them public.
+// channelAgentsConvs names the two channels and makes them public
+// (#no-agents private under Size.ChannelAgentsPrivate).
 func (s *Server) channelAgentsConvs() {
 	if !s.Size.ChannelAgents {
 		return
@@ -91,7 +96,7 @@ func (s *Server) channelAgentsConvs() {
 		case ChannelAgentsID:
 			s.convs[i].Name, s.convs[i].IsPrivate = "agents-lab", false
 		case ChannelNoAgentsID:
-			s.convs[i].Name, s.convs[i].IsPrivate = "no-agents", false
+			s.convs[i].Name, s.convs[i].IsPrivate = "no-agents", s.Size.ChannelAgentsPrivate
 		}
 	}
 }
@@ -124,10 +129,20 @@ func (s *Server) channelPeople() []slack.User {
 	return out
 }
 
+// channelPeopleIn is ch's people: channelPeople without those
+// conversations.kick took out.
+func (s *Server) channelPeopleIn(ch string) []slack.User {
+	s.convMu.Lock()
+	kicked := append([]string(nil), s.caKicks[ch]...)
+	s.convMu.Unlock()
+	return slices.DeleteFunc(s.channelPeople(), func(u slack.User) bool { return slices.Contains(kicked, u.ID) })
+}
+
 // channelApps is ch's agents and apps, the invited ones first.
 func (s *Server) channelApps(ch string) []slack.User {
 	s.convMu.Lock()
 	invited := append([]string(nil), s.caInvites[ch]...)
+	kicked := append([]string(nil), s.caKicks[ch]...)
 	s.convMu.Unlock()
 	var out []slack.User
 	for i := len(invited) - 1; i >= 0; i-- {
@@ -144,7 +159,7 @@ func (s *Server) channelApps(ch string) []slack.User {
 			}
 		}
 	}
-	return out
+	return slices.DeleteFunc(out, func(u slack.User) bool { return slices.Contains(kicked, u.ID) })
 }
 
 // channelAgentsList answers edge users/list for the two channels.
@@ -158,9 +173,9 @@ func (s *Server) channelAgentsList(edge map[string]json.RawMessage, filter strin
 	case "apps":
 		return ok("results", s.channelApps(chs[0]), "next_marker", ""), true
 	case "everyone AND NOT bots AND NOT apps":
-		return ok("results", s.channelPeople(), "next_marker", ""), true
+		return ok("results", s.channelPeopleIn(chs[0]), "next_marker", ""), true
 	}
-	return ok("results", append(s.channelPeople(), s.channelApps(chs[0])...), "next_marker", ""), true
+	return ok("results", append(s.channelPeopleIn(chs[0]), s.channelApps(chs[0])...), "next_marker", ""), true
 }
 
 // channelAgentsCounts answers edge users/counts for the two channels.
@@ -170,9 +185,16 @@ func (s *Server) channelAgentsCounts(edge map[string]json.RawMessage) (any, bool
 	if !s.Size.ChannelAgents || !channelAgentsChannel(ch) {
 		return nil, false
 	}
-	people, apps := len(s.channelPeople()), len(s.channelApps(ch))
-	return ok("counts", map[string]int{"everyone": people + apps, "people": people, "members": people - 1,
-		"guests": 1, "bots": apps, "apps": apps}), true
+	in := s.channelPeopleIn(ch)
+	people, apps := len(in), len(s.channelApps(ch))
+	guests := 0 // Gale, until a kick takes her out
+	for _, u := range in {
+		if u.IsRestricted {
+			guests++
+		}
+	}
+	return ok("counts", map[string]int{"everyone": people + apps, "people": people, "members": people - guests,
+		"guests": guests, "bots": apps, "apps": apps}), true
 }
 
 // channelAgentsSearch adds the fixture's users matching q to edge
@@ -190,9 +212,30 @@ func (s *Server) channelAgentsSearch(q string, res []slack.User) []slack.User {
 	return res
 }
 
-// handleChannelAgents is conversations.invite into the two channels.
+// handleChannelAgents is conversations.invite into the two channels and
+// conversations.kick out of them.
 func (s *Server) handleChannelAgents(method string, f url.Values) (any, bool) {
-	if !s.Size.ChannelAgents || method != "conversations.invite" || !channelAgentsChannel(f.Get("channel")) {
+	if !s.Size.ChannelAgents || !channelAgentsChannel(f.Get("channel")) {
+		return nil, false
+	}
+	if method == "conversations.kick" {
+		ch, u := f.Get("channel"), f.Get("user")
+		if u == SelfID {
+			return fail("cant_kick_self"), true
+		}
+		in := func(m slack.User) bool { return m.ID == u }
+		if !slices.ContainsFunc(s.channelApps(ch), in) && !slices.ContainsFunc(s.channelPeopleIn(ch), in) {
+			return fail("not_in_channel"), true
+		}
+		s.convMu.Lock()
+		if s.caKicks == nil {
+			s.caKicks = map[string][]string{}
+		}
+		s.caKicks[ch] = append(s.caKicks[ch], u)
+		s.convMu.Unlock()
+		return ok(), true
+	}
+	if method != "conversations.invite" {
 		return nil, false
 	}
 	users := strings.Split(f.Get("users"), ",")
@@ -214,4 +257,12 @@ func (s *Server) ChannelInvites(ch string) []string {
 	s.convMu.Lock()
 	defer s.convMu.Unlock()
 	return append([]string(nil), s.caInvites[ch]...)
+}
+
+// Kicked returns the users conversations.kick took out of ch through the
+// fixture.
+func (s *Server) Kicked(ch string) []string {
+	s.convMu.Lock()
+	defer s.convMu.Unlock()
+	return append([]string(nil), s.caKicks[ch]...)
 }

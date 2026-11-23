@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"golang.org/x/text/collate"
-	"golang.org/x/text/language"
 
 	"github.com/some-du6e/clack/internal/slack"
 	"github.com/some-du6e/clack/internal/store"
@@ -56,11 +55,16 @@ var defaultSidebarExp = sidebarExp{filterDormant: true, improveMute: true, dmRec
 // experiments (rail.go).
 var defaultExperimentGroups = map[string]string{
 	"filter_dormant_channels": "on", "improve_mute_pref": "on", "dm_recency_sort_rollout": "without_edu",
-	"unified_file_picker": "on", // the folders' add menu (views/folder_tab_more.go), the account's group of 2026-11-13
+	"unified_file_picker":  "on", // the folders' add menu (views/folder_tab_more.go), the account's group of 2026-11-13
+	"looping_video_option": "on", // the inline video player's loop (videoplayer), as the account has it
+	"clips_pip":            "on", // the mini player (videoplayer/pip.go), as the account has it
+	// the audio player's card gets the speed and transcript controls
+	// (videoplayer/audio.go), as the account has it
+	"transcribe_opt_in_ui_v2": "on",
 	// search and the switcher, as experiments.getByUser had them on
 	// 2026-11-10 (docs/EXPERIMENTS.md); the recents experiments only
 	// matter once Slack's own answer is in
-	"omni_quick_message_results": "on", "search_autocomplete_promote_exact_name_matches": "treatment_5",
+	"search_autocomplete_promote_exact_name_matches": "treatment_5",
 	"activity_inbox": "on", "agent_tasks": "on", "agents_landing_page": "on", "later_todos": "on",
 	// the Activity page's layout toggle sits in its header (5Ns/ XW; the
 	// live audit, docs/VIEWS-AUDIT.md): its density is the global pref
@@ -76,7 +80,7 @@ var defaultExperimentGroups = map[string]string{
 	"activity_bot_item_type_reads": "on", "activity_automations_only": "on", "exclude_automations_filter": "on",
 	"agent_status_in_activity": "on",
 	// the section menus (ui/section_menu.go)
-	"sidebar_section_search": "on", "add_channels_channel_sections_slackathon": "on", "mute_channel_edu": "on",
+	"sidebar_section_search": "on", "mute_channel_edu": "on",
 	// code channels (codechannel.go), as experiments.getByUser had them on 2026-11-08
 	"session_channels": "on", "session_channel_views": "on", "code_channels_naming": "on",
 	// agents and code channels (exp-agents-code, the account on 2026-11-10): the
@@ -84,9 +88,6 @@ var defaultExperimentGroups = map[string]string{
 	"agent_member_channel_count": "on", "plan_block_coding_enhancements": "on", "code_channels_auto_close": "on",
 	"session_channels_slug_peek":         "on", // 2026-11-13: a channel-tab slug with a peek opens no channel card
 	"agent_streaming_slimmer_task_cards": "on", "app_thread_nugget_fe": "on", "app_nugget_refinement": "on",
-	// Advanced > "Enable smart quotes and symbols" shows in the live dialog
-	// (iZ.w gates it), so composer_smart_symbols is on
-	"composer_smart_symbols": "on",
 	// Navigation > "Show Agents in direct messages" shows in the live
 	// dialog (TabRail: Mq && n7)
 	"agents_in_dm_sidebar": "on", "agents_in_dm_sidebar_pref": "on",
@@ -116,7 +117,6 @@ var defaultExperimentGroups = map[string]string{
 	// (experiments.getByUser on 2026-11-10: sidebar_filter.go, temp_mute.go);
 	// the input is there from the first frame
 	"sidebar_text_filter": "on", "sidebar_text_filter_m2": "on", "sidebar_text_filter_m3": "on", "temp_mute": "on",
-	"manage_conversations_strings": "on", // the section move toast's wording (ui/section_menu.go)
 	// the sidebar's organize mode bar gets Leave (ui/sidebar_organize.go)
 	"bulk_leave_channels_from_sidebar": "on",
 	"thread_root_selected_state":       "on", // the selected thread root (ui/messages/active_thread.go)
@@ -135,12 +135,12 @@ var defaultExperimentGroups = map[string]string{
 	// every other experiment Clack reads, as experiments.getByUser had it
 	// on 2026-11-13 (testdata/account_experiments.json; TestDefaultExperimentsMatchAccount)
 	"a11y_no_auto_highlight_search_multi_select": "on", "agent_badge": "on", "agentforce_deprecation": "on",
+	"agent_channel_header": "on", "sc_remove_full_access_user": "on", // exp_wave10.go
 	"agents_in_channels_improvements": "on", "ai_channel_exclusions": "on",
 	"autocomplete_affinity_ml_model": "on", "autocomplete_demote_flannel_passthrough_rltv_exact_match": "on",
 	"autocomplete_frequently_used_emojis_frecency": "on", "basic_select_placeholder_option": "on",
-	"canvas_blockquote_layout": "on", "canvas_comment_only_mode": "on", "canvas_table_of_contents": "on",
+	"canvas_comment_only_mode": "on", "canvas_table_of_contents": "on",
 	"channel_header_with_agents": "on", "channel_join_experience_with_agents": "on",
-	"channel_topic_purpose_setting_restrict_to_channel_managers": "on", "custom_file_sections": "on",
 	"defer_notification_3p_streaming": "on", "desktop_search_recents_read": "on",
 	"desktop_search_recents_write": "on", "draft_management_in_composer": "treatment",
 	"emoji_exact_match_boost": "on", "emoji_skin_tone_picker_improvement": "on",
@@ -148,10 +148,9 @@ var defaultExperimentGroups = map[string]string{
 	"feat_flag_message_hide_replies": "on", "file_trash_updates": "on", "flag_custom_mpdm_names": "on",
 	"flag_xorg_external_team_check": "on", "flag_xorg_refinement": "treatment",
 	"focus_mode_custom_duration": "treatment", "force_native_notifications": "off", "frontline_users": "on",
-	"ia4_slash_command_fe": "on", "inviter_joiner_first_dm_v2": "control",
-	"invite_slash_command_in_threads": "on", "list_channel_tab_show_view_name_fe": "on",
+	"ia4_slash_command_fe": "on", "invite_slash_command_in_threads": "on", "list_channel_tab_show_view_name_fe": "on",
 	"lists_channel_tabs_default_view": "on", "lists_export_enrichment": "on",
-	"lists_file_backed_templates": "on", "lists_grid_todos": "on", "mcp_ai_channel_exclusions": "on",
+	"lists_file_backed_templates": "on", "lists_grid_todos": "on",
 	"miles_davis_themes": "on", "mpdm_default_exclude_history_clients_webapp": "on", "mpdm_naming": "on",
 	"mpdm_notifications_advanced_option": "on", "omni_date_quick_filters": "on", "profile_photo_comp": "on",
 	"schedule_send_forwards": "on", "sc_mpdm_naming": "on", "semantic_emoji_matching": "on",
@@ -159,6 +158,9 @@ var defaultExperimentGroups = map[string]string{
 	"slackified_checkbox": "on", "slack_kit_v2_button": "on", "status_improvements": "on",
 	"unarchive_channel_banner_polish": "on", "unified_files_3p_primary_custom_sections": "on",
 	"updated_scheduled_sends_desktop": "on", "vip_section_pref": "on", "workflow_execution_window": "on",
+	// an agent task's schedule line (agent_task_schedule.go)
+	"wfb_schedule_on_last_day_of_month": "on", "wfb_scheduled_trigger_time_buckets": "on",
+	"slackbot_mcp_tasks_card_auto_collapse_when_complete": "on", // a task card closes when done (ui/blockkit/agent.go)
 }
 
 func (a *App) sidebarExperiments() sidebarExp {
@@ -420,7 +422,7 @@ func sortSectionRows(rows []sortRow, inDMSection bool, sortOrder, self string, p
 	for _, r := range rows {
 		keys[r.id] = key{r.muted, sortGroup(r, inDMSection, sortOrder, self, p)}
 	}
-	col := collate.New(language.AmericanEnglish, collate.Numeric) // QJub: Intl.Collator("en-US",{numeric:true})
+	var col *collate.Collator // QJub's (collate_qjub.go): set while the sort below runs
 	alpha := func(a, b sortRow) int {
 		if a.name == b.name {
 			return 0
@@ -458,15 +460,18 @@ func sortSectionRows(rows []sortRow, inDMSection bool, sortOrder, self string, p
 			return alpha(a, b)
 		}
 	}
-	sort.SliceStable(rows, func(i, j int) bool {
-		ki, kj := keys[rows[i].id], keys[rows[j].id]
-		if ki.muted != kj.muted {
-			return !ki.muted
-		}
-		if ki.group != kj.group {
-			return ki.group < kj.group
-		}
-		return cmp(rows[i], rows[j]) < 0
+	withQjub(func(c *collate.Collator) {
+		col = c
+		sort.SliceStable(rows, func(i, j int) bool {
+			ki, kj := keys[rows[i].id], keys[rows[j].id]
+			if ki.muted != kj.muted {
+				return !ki.muted
+			}
+			if ki.group != kj.group {
+				return ki.group < kj.group
+			}
+			return cmp(rows[i], rows[j]) < 0
+		})
 	})
 	out := make([]string, len(rows))
 	for i, r := range rows {
@@ -554,7 +559,9 @@ func (a *App) dmCandidate(id string, keep sidebarKeep) bool {
 		if systemDMUsers[c.User] || c.User == slackbotID && a.slackbotDMHidden() {
 			return false
 		}
-		if u, ok := a.S.User(c.User); ok && u.Deleted {
+		// lJBI's deletedMembers (gIKW G): a selector over every member,
+		// which records no hit and asks for nothing
+		if u, ok := a.S.RawUser(c.User); ok && u.Deleted {
 			return false
 		}
 	}
@@ -845,7 +852,9 @@ func (a *App) sortName(c Conv) string {
 	if len(c.Members) > 0 {
 		for _, m := range c.Members {
 			if m != self {
-				names = append(names, a.S.UserName(m))
+				// raw: the snapshot reads the listed group DMs' members
+				// through getMemberById (sidebarUsers), and no others
+				names = append(names, a.rawUserName(m))
 			}
 		}
 	} else { // mpdm-alice--bob--me-1: handles, minus our own
@@ -863,6 +872,6 @@ func (a *App) sortName(c Conv) string {
 			}
 		}
 	}
-	collate.New(language.AmericanEnglish, collate.Numeric).SortStrings(names)
+	qjubSortStrings(names)
 	return strings.Join(names, ",")
 }

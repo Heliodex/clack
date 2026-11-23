@@ -11,6 +11,7 @@ import (
 
 	"github.com/some-du6e/clack/internal/ui/refocus"
 	"github.com/some-du6e/clack/internal/ui/shortcut"
+	"github.com/some-du6e/clack/internal/ui/slackc"
 )
 
 // Keyboard and focus, as Slack's modals do it (BaseModal/c-sk-modal over
@@ -88,9 +89,17 @@ func (m *Modal) stops() []event.Tag {
 // keys runs the modal's focus and keys for this frame; true when it closed.
 func (m *Modal) keys(gtx layout.Context) bool {
 	m.frames++
-	if !m.focus {
+	// the first focus waits for a live pass: laid out inside a plugin's
+	// tree (kit's ConfirmationModal) the modal is measured first with
+	// input off, where a FocusCmd goes nowhere and its autoFocus button
+	// never got the focus
+	if !m.focus && gtx.Source.Enabled() {
 		m.focus = true
-		if !m.overModal() {
+		// opened with the focus in a plugin's layer (kit's ConfirmationModal
+		// in a Popover, a modal a plugin's button opened), the window's
+		// overlay stack gives it back there (slackc layers.go), not
+		// refocus to the last composer
+		if !m.overModal() && !slackc.FocusInPluginLayer(gtx) {
 			m.prev = refocus.Last(gtx.Now)
 		}
 		if b := m.autoFocus(); b != nil {
@@ -113,9 +122,12 @@ func (m *Modal) keys(gtx layout.Context) bool {
 	if !top {
 		return false
 	}
-	filters := []event.Filter{
-		key.Filter{Name: key.NameEscape},
-		key.Filter{Name: key.NameTab, Optional: key.ModShift},
+	filters := []event.Filter{key.Filter{Name: key.NameTab, Optional: key.ModShift}}
+	if !slackc.EscapeToFocus(gtx) {
+		// with the focus in a plugin's layer (a Popover in its body, the
+		// modal itself inside a plugin's tree) the focused element there has
+		// Escape first, and its layer after it (slackc layers.go)
+		filters = append(filters, key.Filter{Name: key.NameEscape})
 	}
 	if m.o.OnCmdEnter != nil {
 		mod := key.ModSuper // Mousetrap's "command" is the meta key
@@ -135,8 +147,17 @@ func (m *Modal) keys(gtx layout.Context) bool {
 		}
 		switch ke.Name {
 		case key.NameEscape:
+			if m.o.OnEscape != nil && m.o.OnEscape() {
+				m.h.Invalidate()
+				continue
+			}
 			m.Dismiss()
-			return true
+			if m.Dismissed() {
+				return true
+			}
+			// CloseGuard kept it open (its speed bump is up): it draws
+			// this frame and the next one comes
+			m.h.Invalidate()
 		case key.NameTab:
 			m.tab(gtx, ke.Modifiers.Contain(key.ModShift))
 		case key.NameReturn, key.NameEnter:
@@ -231,6 +252,16 @@ func (m *Modal) overModal() bool {
 		}
 	}
 	return false
+}
+
+// FocusHome is where the focus comes back to in the modal (its overlay
+// layer's home: a Popover in its body closed, or the focus went): the stop
+// that had it, else the dialog.
+func (m *Modal) FocusHome() event.Tag {
+	if m.last != nil && m.hasStop(m.last) {
+		return m.last
+	}
+	return m
 }
 
 // giveBackFocus asks the widget focused before the modal opened to take

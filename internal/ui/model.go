@@ -24,13 +24,27 @@ type model struct {
 	// sidebar_filter.go).
 	FilterNames core.FilterNames
 
-	ActivityCount int  // unread mentions/reactions for the Activity tab
-	DMUnread      bool // dot on the DMs tab
-	DMCount       int
+	ActivityCount int  // the Activity tab's count (core ActivityBadgeCount)
+	ActivityDot   bool // its dot instead (core ActivityDot: no inbox, threads unread but not counted)
+	ActivityDMs   int  // activity_v2's dm count: Home's number with DMs opted out of the inbox (core HomeBadge)
+	DMUnread      bool // a DM or group DM is unread (the desktop badge's "anything unread")
+	// The DMs tab's badge inputs (core RailState.DMsBadge): DMHighlights is
+	// rHEx dmsBadgeCount, which Home and More count too; DMUnreadConvs is
+	// 6Z4k Sm getTotalUnreadDmsMpims.
+	DMHighlights  int
+	DMUnreadConvs int
 	HomeUnread    bool
-	HomeCount     int // mention total shown on Home when not on Home
+	// HomeCount is the app badge's own highlights (title, Dock, taskbar):
+	// the unread DMs' and group DMs' but the bot DMs' (ZVw+
+	// getTotalUnreadHighlights' sum; core AppBadgeCount adds channel_badges'
+	// without the inbox). ChannelHighlights is that part, for recount to
+	// notice it moving.
+	HomeCount         int
+	ChannelHighlights int
 
-	threadsUnread bool
+	// the sidebar's Threads link (core ThreadsLink): bold, and its badge
+	threadsUnread  bool
+	threadMentions int
 }
 
 type sbSection struct {
@@ -92,6 +106,9 @@ type convInfo struct {
 	Shared   bool
 	Teams    []string
 	PeerTeam string
+	// NoDMsBadge, NoDMsCount, BotDM: core.Conv's (an IM the DM badges
+	// leave out; recount)
+	NoDMsBadge, NoDMsCount, BotDM bool
 }
 
 // mentionTotal is the workspace's mention count (unmuted conversations'

@@ -393,13 +393,15 @@ func TestSearchPopoverTyping(t *testing.T) {
 	}
 }
 
-// omni_quick_message_results (suggestionsQuickMessages): on, the typed
-// words search your recent conversations (from_me, with_me) as cards and
-// the places above are cut to five; an in: filter searches its channel;
-// fewer than three characters, a phrase, or another filter search nothing.
-// Off, only the channel you're in is searched (from_me/with_me false),
-// the rows are the plain ones (text, then "name • date") and the places
-// are cut to eight.
+// The quick message results (suggestionsQuickMessages) follow Y/3h E,
+// which replaced omni_quick_message_results (the 2026-11-21 drift): on a
+// paid or enterprise team the typed words search your recent
+// conversations (from_me, with_me) as cards and the places above are cut
+// to five; an in: filter searches its channel; fewer than three
+// characters, a phrase, or another filter search nothing. Forcing the old
+// experiment off changes nothing. On a free team only the channel you're
+// in is searched (from_me/with_me false), the rows are the plain ones
+// (text, then "name • date") and the places are cut to eight.
 func TestSearchPopoverQuickMessages(t *testing.T) {
 	e := srNewEnv(t, false)
 	chs := e.fs.ChannelIDs()
@@ -427,9 +429,10 @@ func TestSearchPopoverQuickMessages(t *testing.T) {
 		}
 		return n
 	}
-	if g := e.h.a.Experiment("omni_quick_message_results"); g != "on" {
-		t.Fatalf("the fake account has omni_quick_message_results %q, want on (as the real one)", g)
+	if !e.h.a.QuickMessageResultsOn() {
+		t.Fatal("the fake team (an enterprise's) has no quick message results")
 	}
+	e.h.a.SetExperimentGroup("omni_quick_message_results", "off") // the dropped gate: no change
 	RecordRecentPlace(chs[0], "", "")
 	RecordRecentPlace(chs[1], "", "")
 
@@ -445,6 +448,24 @@ func TestSearchPopoverQuickMessages(t *testing.T) {
 	for _, r := range p.rows {
 		if r.kind == srRMsg && (r.plain || r.heightDp() != 76) {
 			t.Errorf("on: a plain quick message row %+v", r.title)
+		}
+	}
+	// the fake's extracts carry Slack's highlight markers JSON-escaped
+	// (zephyr): the row draws the word highlighted, never
+	// the markers (α.85 drew them as tofu around the match)
+	for _, r := range p.rows {
+		if r.kind != srRMsg {
+			continue
+		}
+		hit := false
+		for _, s := range r.segs {
+			if strings.ContainsAny(s.Text, "�") {
+				t.Errorf("quick message segment %q holds a highlight marker", s.Text)
+			}
+			hit = hit || (s.Hit && strings.HasPrefix(strings.ToLower(s.Text), fakeslack.SearchWord))
+		}
+		if !hit {
+			t.Errorf("quick message %+v: %q not highlighted", r.segs, fakeslack.SearchWord)
 		}
 	}
 	if n := navRows(p); n > 5 {
@@ -483,8 +504,14 @@ func TestSearchPopoverQuickMessages(t *testing.T) {
 		}
 	}
 
-	// off: only the open channel; plain rows; eight places
-	e.h.a.SetExperimentGroup("omni_quick_message_results", "off")
+	// a free team: only the open channel; plain rows; eight places
+	free := fakeslack.Small
+	free.FreeTeam = true
+	e = srNewEnvSize(t, free, false)
+	if e.h.a.QuickMessageResultsOn() {
+		t.Fatal("a free team has quick message results")
+	}
+	chs = e.fs.ChannelIDs()
 	RecordRecentPlace("view:activity", "Activity", "activity") // not in a channel: nothing to search
 	n := inline()
 	p, d = open(fakeslack.SearchWord)
@@ -731,8 +758,11 @@ func TestSearchViewResults(t *testing.T) {
 	}
 
 	// More: Slack's rows (To-dos under later_todos, on for the account;
-	// no Exclude archived without search_explore_freshness_signals)
+	// no Exclude archived in any group: Slack dropped it with
+	// search_explore_freshness_signals, the 2026-11-21 drift, so forcing
+	// that on adds nothing)
 	e.h.a.SetExperimentGroup("later_todos", "on")
+	e.h.a.SetExperimentGroup("search_explore_freshness_signals", "on")
 	v.moreMenu(layout.Context{Ops: new(op.Ops), Metric: unit.Metric{PxPerDp: 1, PxPerSp: 1}})
 	m = srMenu(e.h)
 	want := []string{"# Saved preferences", "Exclude bot messages", "Only my channels", "--", "# Results", "Exact matches only",

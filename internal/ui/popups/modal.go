@@ -2,6 +2,7 @@ package popups
 
 import (
 	"image"
+	"math"
 	"time"
 
 	"gioui.org/io/event"
@@ -10,6 +11,7 @@ import (
 	"gioui.org/op/clip"
 	"gioui.org/widget"
 
+	"github.com/some-du6e/clack/internal/ui/slackc"
 	"github.com/some-du6e/clack/internal/ui/theme"
 )
 
@@ -40,6 +42,10 @@ type ModalButton struct {
 	// Hidden, when it says so, leaves the button out of the footer (the
 	// Edit file dialog's Next on its last page, its Send before it).
 	Hidden func() bool
+	// Loading, when it says so, draws the button as Slack's LoadingButton
+	// (CEte) draws one loading, and it can't be pressed: Edit profile's
+	// Save and Yes, Remove Photo while their call runs (loading_button.go).
+	Loading func() bool
 	// Joined puts the button flush against the one before it, the two
 	// drawn as one group (Slack Kit's ButtonGroup, or the share dialog's
 	// legacy Forward with its schedule caret): the inner corners square.
@@ -67,6 +73,9 @@ func (b *ModalButton) Rect() image.Rectangle { return b.rect }
 func (b *ModalButton) draw(gtx layout.Context, th *theme.Theme, kind BtnKind, ring bool, grp grpSide) layout.Dimensions {
 	if b.Draw != nil {
 		return b.Draw(gtx, th, &b.click, kind, ring, grp)
+	}
+	if b.loading() {
+		return loadingButtonGrp(gtx, th, &b.click, BtnMedium, 80, grp)
 	}
 	if b.V2 != nil && b.V2() {
 		return buttonV2Grp(gtx, th, &b.click, kind, theme.ButtonV2Medium, b.Label, b.Icon, ring, grp)
@@ -135,7 +144,11 @@ type ModalOpts struct {
 	// OnCmdEnter runs on ⌘Enter (Block Kit modals bind command+enter to
 	// submit).
 	OnCmdEnter func()
-	OnClose    func()
+	// OnEscape, when set, is asked first on Escape: true means the body
+	// took it (an open select list closed: MultiSelectInput's onEscape
+	// stops the event), and the modal stays.
+	OnEscape func() bool
+	OnClose  func()
 	// CloseGuard, when set, is asked before the user closes the modal
 	// (the close button, Escape, a click outside): false keeps it open,
 	// and the owner shows its speed bump (Slack's getShouldShowSpeedBump).
@@ -143,6 +156,15 @@ type ModalOpts struct {
 	CloseGuard func() bool
 	// NoClose hides the header close button.
 	NoClose bool
+	// TitleWrap lets the title wrap as .c-sk-modal_title_bar__text does
+	// (no Subtitle, HeadH or Header): the title bar (min-height 70px,
+	// padding 20px 28px) grows by its lines, and the close button keeps
+	// c-sk-modal__close_button's top 20px. A title with TitleIcon or
+	// TitleAfter that doesn't fit its line is drawn as TitleWrapText
+	// instead (the whole title as text). Without it the title stays on one
+	// line, cut with an ellipsis.
+	TitleWrap     bool
+	TitleWrapText string
 	// PadX and HeadH override the side padding (default 28) and header
 	// height (default 70) in dp; Slack's link dialog uses 24 / 68.
 	PadX, HeadH float32
@@ -204,6 +226,14 @@ type ModalOpts struct {
 	// (Slack's c-modal_speed_bump veils the dialog with its sheet; the
 	// list dialogs' footer access select).
 	Over func(gtx layout.Context)
+	// Peek, asked every frame, hides the scrim while it is true: Slack's
+	// Preferences on Appearance and Navigation (prefs-dialog tabs with
+	// peekSidebar) shows the client undimmed behind the dialog,
+	//   .c-sk-overlay.p-prefs_dialog--peek_sidebar.p-prefs_dialog__overlay--ia_layout:before{opacity:0}
+	// and the scrim fades out and back in as the tab changes,
+	//   .p-prefs_dialog__overlay--ia_layout:before{transition:opacity .16s}
+	// (client-boot-styles). Clicks outside the dialog still close it.
+	Peek func() bool
 }
 
 // Modal is a centered dialog over a dimmed backdrop.
@@ -220,10 +250,53 @@ type Modal struct {
 	// keyboard focus (focus.go)
 	ring   bool      // the focused button shows Slack's focus ring
 	prev   event.Tag // focused before the modal opened (refocus)
+	kept   bool      // CloseGuard kept it open at the last Dismiss
 	last   event.Tag // the stop that had the focus last
 	wasTop bool
 	ptr    int // pointer tag: a press anywhere hides the ring
 	frames int
+	// the scrim's opacity under Peek (1 shown, 0 peeking), easing from
+	// scrimFrom at scrimAt towards scrimTo
+	scrimInit          bool
+	scrimFrom, scrimTo float64
+	scrimAt            time.Time
+}
+
+// SetPeek sets ModalOpts.Peek on an open modal (Preferences sets it on
+// the frame mkPrefsModal built).
+func (m *Modal) SetPeek(f func() bool) { m.o.Peek = f }
+
+// scrimPeekFade is the ia_layout scrim's transition: opacity .16s (ease).
+const scrimPeekFade = 160 * time.Millisecond
+
+// scrimOpacity is the scrim's opacity this frame (1 without Peek).
+func (m *Modal) scrimOpacity(gtx layout.Context) float64 {
+	if m.o.Peek == nil {
+		return 1
+	}
+	to := 1.0
+	if m.o.Peek() {
+		to = 0
+	}
+	if !m.scrimInit { // opened on a peeking tab: no scrim from the start
+		m.scrimInit, m.scrimFrom, m.scrimTo = true, to, to
+	}
+	o := m.scrimTo
+	if !m.scrimAt.IsZero() {
+		x := float64(gtx.Now.Sub(m.scrimAt)) / float64(scrimPeekFade)
+		if x >= 1 {
+			m.scrimAt = time.Time{}
+		} else {
+			o = m.scrimFrom + (m.scrimTo-m.scrimFrom)*cubicBezierY(.25, .1, .25, 1, max(x, 0))
+		}
+	}
+	if to != m.scrimTo { // the tab changed: ease from where the scrim is
+		m.scrimFrom, m.scrimTo, m.scrimAt = o, to, gtx.Now
+	}
+	if !m.scrimAt.IsZero() {
+		m.h.Invalidate() // not a mid-frame InvalidateCmd: the dialog's handlers lay out after this
+	}
+	return o
 }
 
 // NewModal builds a modal; show it with h.ShowOverlay.
@@ -239,7 +312,11 @@ func NewModal(h Host, o ModalOpts) *Modal {
 	return m
 }
 
-func (b *ModalButton) enabled() bool { return !b.hidden() && (b.Enabled == nil || b.Enabled()) }
+func (b *ModalButton) enabled() bool {
+	return !b.hidden() && !b.loading() && (b.Enabled == nil || b.Enabled())
+}
+
+func (b *ModalButton) loading() bool { return b.Loading != nil && b.Loading() }
 
 func (b *ModalButton) hidden() bool { return b.Hidden != nil && b.Hidden() }
 
@@ -250,6 +327,36 @@ func (m *Modal) press(b *ModalButton) {
 	if b.Do == nil || b.Do() {
 		m.base.Dismiss()
 	}
+}
+
+// wrapTitle is the text to wrap in a title bar maxW wide
+// (ModalOpts.TitleWrap): the plain title, or TitleWrapText for a title
+// with an icon or a tail that doesn't fit its line.
+func (m *Modal) wrapTitle(gtx layout.Context, th *theme.Theme, cl *Colors, sz, lh float32, maxW int) (string, bool) {
+	o := m.o
+	if !o.TitleWrap || o.Subtitle != "" || o.HeadH != 0 || o.Header != nil {
+		return "", false
+	}
+	if o.TitleIcon == "" && o.TitleAfter == "" {
+		return m.Title(), true
+	}
+	if o.TitleWrapText == "" {
+		return "", false
+	}
+	width := func(s string) int {
+		_, d := record(loose(gtx, image.Pt(1<<20, 1<<20)), func(gtx layout.Context) layout.Dimensions {
+			return para(gtx, th, sz, lh, theme.Black, cl.Fg, s, 1)
+		})
+		return d.Size.X
+	}
+	line := width(m.Title()) + width(o.TitleAfter)
+	if o.TitleIcon != "" {
+		line += dp(gtx, 22)
+	}
+	if line <= maxW {
+		return "", false
+	}
+	return o.TitleWrapText, true
 }
 
 // Title is the modal's title (tests).
@@ -274,11 +381,18 @@ func (m *Modal) Press(label string) bool {
 
 // Dismiss closes the modal, unless CloseGuard keeps it open.
 func (m *Modal) Dismiss() {
+	m.kept = false
 	if m.o.CloseGuard != nil && !m.done && !m.o.CloseGuard() {
+		m.kept = true
 		return
 	}
 	m.base.Dismiss()
 }
+
+// KeptOpen reports whether CloseGuard kept the modal open at the last
+// Dismiss (its speed bump is up over it): the window keeps it in its
+// stack, where an Escape that reached it leaves it.
+func (m *Modal) KeptOpen() bool { return m.kept && !m.Dismissed() }
 
 // Close closes the modal without asking CloseGuard (the owner's own
 // close: the speed bump's discard).
@@ -302,7 +416,13 @@ func (m *Modal) Layout(gtx layout.Context) layout.Dimensions {
 		return layout.Dimensions{}
 	}
 	// backdrop
-	fill(gtx, image.Rectangle{Max: win}, cl.Backdrop)
+	if o := m.scrimOpacity(gtx); o >= 1 {
+		fill(gtx, image.Rectangle{Max: win}, cl.Backdrop)
+	} else if o > 0 {
+		b := cl.Backdrop
+		b.A = uint8(math.Round(float64(b.A) * o))
+		fill(gtx, image.Rectangle{Max: win}, b)
+	}
 	if m.scrim.Layout(gtx) {
 		m.Dismiss()
 		return layout.Dimensions{}
@@ -349,6 +469,17 @@ func (m *Modal) Layout(gtx layout.Context) layout.Dimensions {
 		headH += subH
 	}
 	titleH = headH
+	titleLines, wrapped := 1, ""
+	if text, ok := m.wrapTitle(gtx, th, cl, titleSz, titleLH, w-padX-dp(gtx, 64)); ok {
+		_, d := record(loose(gtx, image.Pt(maxInt(1, w-padX-dp(gtx, 64)), 1<<20)), func(gtx layout.Context) layout.Dimensions {
+			return para(gtx, th, titleSz, titleLH, theme.Black, cl.Fg, text, 0)
+		})
+		if lh := dp(gtx, titleLH); lh > 0 && d.Size.Y > lh {
+			titleLines, wrapped = (d.Size.Y+lh/2)/lh, text
+			headH = max(headH, d.Size.Y+dp(gtx, 40))
+			titleH = headH
+		}
+	}
 	var belowCall op.CallOp
 	if m.o.HeaderBelow != nil {
 		var d layout.Dimensions
@@ -447,16 +578,22 @@ func (m *Modal) Layout(gtx layout.Context) layout.Dimensions {
 					// .p-about_modal__contents on the content and the footer
 					fill(gtx, image.Rect(pos.X, pos.Y+headH, pos.X+w, m.rect.Dy()), cl.EmojiFoot)
 				}
-				ty := (titleH - subH - dp(gtx, titleLH)) / 2
+				// the inspect tool's record of Slack's ModalHeader >
+				// ModalTitleBar (inspect_parts.go: nothing styles see)
+				hdr, bar := skHeaderClass.Inspect(0), skTitleBarClass.Inspect(0)
+				ty := (titleH - subH - titleLines*dp(gtx, titleLH)) / 2
 				at(gtx, pos.Add(image.Pt(padX, ty)), func(gtx layout.Context) layout.Dimensions {
 					maxW := w - padX - dp(gtx, 64)
-					gtx.Constraints = layout.Constraints{Max: image.Pt(maxW, dp(gtx, titleLH))}
+					gtx.Constraints = layout.Constraints{Max: image.Pt(maxW, titleLines*dp(gtx, titleLH))}
 					title := m.o.Title
 					if m.o.TitleFunc != nil {
 						title = m.o.TitleFunc()
 					}
 					if title == "" && m.o.TitleIcon == "" && m.o.TitleAfter == "" {
 						return layout.Dimensions{} // a header-less dialog (showHeader false): shape nothing
+					}
+					if titleLines > 1 {
+						return para(gtx, th, titleSz, titleLH, theme.Black, cl.Fg, wrapped, 0)
 					}
 					d := para(gtx, th, titleSz, titleLH, theme.Black, cl.Fg, title, 1)
 					if m.o.TitleIcon == "" && m.o.TitleAfter == "" {
@@ -495,8 +632,11 @@ func (m *Modal) Layout(gtx layout.Context) layout.Dimensions {
 				}
 				if !m.o.NoClose {
 					cy := pos.Y + (titleH-dp(gtx, 36))/2
-					if heroH > 0 {
+					switch {
+					case heroH > 0:
 						cy = dp(gtx, 20) // c-sk-modal__close_button: top 20px, over the hero
+					case titleLines > 1:
+						cy = pos.Y + dp(gtx, 20) // top 20px beside a wrapped title
 					}
 					at(gtx, image.Pt(w-dp(gtx, 20)-dp(gtx, 36), cy), func(gtx layout.Context) layout.Dimensions {
 						if m.ringOn(gtx, &m.close) {
@@ -504,8 +644,15 @@ func (m *Modal) Layout(gtx layout.Context) layout.Dimensions {
 						}
 						return iconButton(gtx, &m.close, "close", 36, 20, cl.Fg2, cl.BgHover, 8)
 					})
+					skCloseClass.Inspect(0).EndAt(gtx, image.Rect(w-dp(gtx, 20)-dp(gtx, 36), cy, w-dp(gtx, 20), cy+dp(gtx, 36)))
 				}
-				// body
+				if m.o.Title != "" || m.o.TitleFunc != nil || m.o.TitleIcon != "" || m.o.TitleAfter != "" {
+					skTitleClass.Inspect(0).EndAt(gtx, image.Rect(pos.X+padX, pos.Y+ty, pos.X+w-dp(gtx, 64), pos.Y+ty+titleLines*dp(gtx, titleLH)))
+				}
+				bar.EndAt(gtx, image.Rect(pos.X, pos.Y, pos.X+w, pos.Y+titleH))
+				hdr.EndAt(gtx, image.Rect(pos.X, pos.Y, pos.X+w, pos.Y+headH))
+				// body (ModalContent)
+				content := skContentClass.Inspect(0)
 				if m.o.Body != nil {
 					at(gtx, pos.Add(image.Pt(bodyX, headH)), func(gtx layout.Context) layout.Dimensions {
 						gtx.Constraints = layout.Constraints{Min: image.Pt(bodyW, 0), Max: image.Pt(bodyW, bodyH)}
@@ -520,7 +667,9 @@ func (m *Modal) Layout(gtx layout.Context) layout.Dimensions {
 						})
 					})
 				}
-				// footer
+				content.EndAt(gtx, image.Rect(pos.X+bodyX, pos.Y+headH, pos.X+bodyX+bodyW, pos.Y+headH+bodyH))
+				// footer (ModalFooter)
+				foot := skFooterClass.Inspect(0)
 				if len(m.o.Buttons) > 0 {
 					fy := pos.Y + headH + bodyH
 					if m.o.Border {
@@ -584,6 +733,11 @@ func (m *Modal) Layout(gtx layout.Context) layout.Dimensions {
 						macroAt(gtx, call, image.Pt(lx, fy+footPad+(dp(gtx, 36)-d.Size.Y)/2))
 					}
 				}
+				if footH > 0 {
+					foot.EndAt(gtx, image.Rect(pos.X, pos.Y+headH+bodyH, pos.X+w, pos.Y+headH+bodyH+footH))
+				} else {
+					foot.EndAt(gtx, image.Rectangle{})
+				}
 				if m.o.Over != nil {
 					gtx := gtx
 					gtx.Constraints = layout.Exact(m.rect.Size())
@@ -591,6 +745,7 @@ func (m *Modal) Layout(gtx layout.Context) layout.Dimensions {
 				}
 			}
 		})
+		slackc.InspectCard(gtx, m.rect) // the inspect tool: the card is the modal's box
 	}
 	return layout.Dimensions{Size: win}
 }

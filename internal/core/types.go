@@ -9,6 +9,7 @@ package core
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/some-du6e/clack/internal/richtext"
 	"github.com/some-du6e/clack/internal/slack"
@@ -27,10 +28,23 @@ type Message struct {
 	EditedTS                 string
 	EditedBy                 string // edited.user: who made the last edit (EditedLabel names them on a workflow message)
 	Permalink                string // set on search results
-	ClientMsgID              string
-	PinnedBy                 string // who pinned it (when Pinned)
-	IsBot, Edited, Pinned    bool
-	Broadcast, System        bool // System: join/leave/topic… drawn compactly
+	// Search results only (search.go): requestor_replied (the viewer
+	// replied in the thread) and the index of the first block that held a
+	// highlight marker (0 when none), compactCardBlocks' start
+	// (exp_wave7.go).
+	RequestorReplied bool
+	SearchHitBlock   int
+	// SearchMatches: which attachments and files held a match (search
+	// results only, nil elsewhere; search_matches.go).
+	SearchMatches         *SearchMatches
+	ClientMsgID           string
+	PinnedBy              string // who pinned it (when Pinned)
+	IsBot, Edited, Pinned bool
+	Broadcast, System     bool // System: join/leave/topic… drawn compactly
+	// NewerReplies: a thread broadcast whose thread has a reply newer than
+	// it, so Slack's ThreadBroadcastFooter draws "View newer replies"
+	// under it (broadcast_footer.go).
+	NewerReplies bool
 	// A system message's own fields: who added the joiner (inviter), the
 	// topic or purpose it set, a rename's old and new names.
 	Inviter, Topic, Purpose, OldName, NewName string
@@ -48,11 +62,21 @@ type Message struct {
 	Reactions       []Reaction
 	Huddle          json.RawMessage
 	Doc             richtext.Doc
+	// Refs are the members and conversations Doc was built from (msg_refs.go)
+	Refs MsgRefs
 	// Raw Slack data for plugins (Taut): memory only, never written to disk.
 	Blocks      json.RawMessage // Block Kit blocks as sent
 	Attachments json.RawMessage // legacy attachments / unfurls as sent
 	Metadata    json.RawMessage // app metadata {event_type, event_payload}
 	BotProfile  *BotProfile     // bot_profile of bot messages
+	// NoteFiles is what a notification's text reads of the files
+	// (richtext.NoteFilesOf: the first one's title, kind and uploader,
+	// the sender it's compared with, the clips; note_files.go), nil with
+	// none; a toast reads them again from the store (NoteFilesNow).
+	// Upload is msg.upload (the sender uploaded the files with it), which
+	// picks the file meta line's "uploaded" over "shared".
+	NoteFiles *richtext.NoteFiles
+	Upload    bool
 	// StreamingState is an app's chat stream (chat.startStream /
 	// appendStream / stopStream): "in_progress" while open, then
 	// "completed" or "errored" (agent.go).
@@ -66,6 +90,11 @@ type Message struct {
 	// AssistantThread is an assistant thread root's assistant_app_thread
 	// (nil for other messages).
 	AssistantThread *slack.MessageAssistantThread
+	// Stopped is an agent reply whose stream the person stopped
+	// (ai_context.result_status "stopped_by_user": Slack's StoppedLabel);
+	// StoppedBy is ai_context.stopped_by_user_id.
+	Stopped   bool
+	StoppedBy string
 	// ThreadLastRead is a followed thread's last read reply (root
 	// messages; the subscription's last_read from conversations.replies,
 	// thread_marked and subscriptions.thread.mark): Slack's
@@ -86,6 +115,17 @@ type Message struct {
 	// DocumentComment is a canvas comment root's document_comment (nil
 	// for other messages; canvas_comments.go).
 	DocumentComment *slack.MessageDocumentComment
+	// DocumentMention is a canvas mention's document_mention (nil for
+	// other messages): the canvas and section a jump to it opens.
+	DocumentMention *slack.MessageDocumentMention
+	// Ephemeral is is_ephemeral: an "Only visible to you" message (an
+	// app's chat.postEphemeral, Slackbot's local ones), never in history
+	// and never a thread's read point (Slack's isRealMsg, 8GqV).
+	Ephemeral bool
+	// NoDisplay and NoNotifications are the server's no_display and
+	// no_notifications: no desktop notification for the message
+	// (client-boot Fpyc's reasons 4 and 5; ui/notify_dm.go).
+	NoDisplay, NoNotifications bool
 }
 
 // SubtypeSlackbotResponse is the subtype of Slackbot's answers to the
@@ -113,6 +153,7 @@ type BotProfile struct {
 	Icon                            string      // best icon URL
 	Icons                           SenderIcons // bot_profile.icons as sent
 	Deleted                         bool
+	Workflow                        bool // is_workflow_bot: a Workflow Builder bot (badged WORKFLOW)
 }
 
 type Reaction struct {
@@ -129,12 +170,19 @@ type User struct {
 	// DisplaySet: profile.display_name is set, so Name is it and Slack's
 	// member rows (MediumMemberEntity) show RealName after it as the
 	// secondary name; otherwise Name is the real name and there is none.
-	DisplaySet                       bool
-	Avatar, Avatar192, Avatar512     string
-	Title, Pronouns                  string
-	Email                            string // only when Slack shows it (Hack Club: the viewer's own)
-	StatusText, StatusEmoji          string
-	StatusEmojiURL                   string
+	DisplaySet                   bool
+	Avatar, Avatar192, Avatar512 string
+	Title, Pronouns              string
+	Email                        string // only when Slack shows it (Hack Club: the viewer's own)
+	StatusText, StatusEmoji      string
+	StatusEmojiURL               string
+	// StatusEmojiInfo is profile.status_emoji_display_info by emoji_name
+	// (Slack's statusEmojiDisplayInfo): the pictures for the status emoji
+	// and the :codes: in StatusText (StatusTextParts).
+	StatusEmojiInfo map[string]StatusEmojiDisplay
+	// DND: the member's notifications are paused (BasePresence's isDnd,
+	// MemberInDND when the User was read).
+	DND                              bool
 	StatusCanonical                  string // profile.status_text_canonical (a preset's key)
 	StatusExp                        int64
 	TZ, TZLabel                      string
@@ -223,6 +271,15 @@ type Conv struct {
 	FileID    string
 	Doc       string
 	NameSpans []richtext.Span
+	// NoDMsBadge and NoDMsCount (IMs): the DM badges leave the IM out of
+	// the DMs tab's highlights (rHEx dmsBadgeCount: Slackbot's, the Slack
+	// system user's, a bot's, USEARCH's, the security bot's) or out of its
+	// unread conversations (6Z4k Sm: a bot member's). rail.go
+	// dmBadgeSkips, over the member the store holds (members.go
+	// readBadgePeople asks for a missing one). BotDM is DUy0 G isBotDm
+	// alone (Slackbot's, the Slack system user's, a bot's IM), which the
+	// classic app badge leaves out (ZVw+ getTotalUnreadHighlights).
+	NoDMsBadge, NoDMsCount, BotDM bool
 }
 
 // ConvRef describes a conversation that may not be in the sidebar
@@ -299,6 +356,11 @@ type Snapshot struct {
 	EmojiCount   int
 	EnterpriseID string
 	Rail         RailState // the left rail from Navigation prefs and experiments (rail.go)
+	// Seq orders snapshots by when their build started (1, 2, …): one
+	// started later holds at least what an earlier one does, so a UI that
+	// applies them from several goroutines skips one older than what it
+	// shows. 0 for a snapshot core didn't build.
+	Seq uint64
 	// FilterNames is what the sidebar text filter matches (sidebar_filter.go).
 	FilterNames FilterNames
 }
@@ -309,6 +371,9 @@ type Page struct {
 	HasMore  bool      // older messages exist
 	LastRead string
 	Conv     *Conv
+	// Epoch is the window's (store.Timeline.Epoch): a newest page that
+	// didn't meet the window started a new one, which a list takes whole
+	Epoch uint64
 }
 
 // Event is a realtime change. Type is one of: message, update, delete,
@@ -316,7 +381,9 @@ type Page struct {
 // emoji_changed, sidebar_changed, prefs, huddle, resync, poll (realtime
 // is off or down: refetch what is open), realtime (live updates turned
 // on/off, in Connected), activity_badges (the Activity badge counts
-// moved: ActivityBadgeCount), plus raw
+// moved: ActivityBadgeCount), history_caught_up (Channel's window, whose
+// end went stale at a slow connect, was read forward: its lists load it
+// again, reached_end.go), plus raw
 // passthroughs (thread_marked, update_thread_state, dnd_updated,
 // dnd_updated_user, pref_change, badge_counts_updated) in Raw.
 type Event struct {
@@ -333,16 +400,52 @@ type Event struct {
 	Reply    bool   // message: a thread reply
 	Mention  bool   // message: mentions the viewer
 	ConvKind string // message: kind of the conversation
+	// Ahead (message, update): a top-level message past the end of a
+	// window whose end went stale at a slow connect (store
+	// UpsertHeard): the channel's lists don't draw it until the window is
+	// read forward to it ("history_caught_up"), since after the window it
+	// left out what the socket missed (reached_end.go)
+	Ahead bool
 	// StreamDone marks the update (message_changed) that ends an app's chat
 	// stream: the stored copy was streaming_state in_progress and this one
 	// isn't. It carries UserID, User, Reply, Mention and ConvKind like a
 	// message event (Slack's messageChanged shows the deferred
 	// notification then, under defer_notification_3p_streaming).
 	StreamDone bool
-	Connected  bool   // connection: socket up; realtime: live updates on
-	Presence   string // presence: active | away
-	Users      []string
-	Prefs      *Prefs
+	// Seq (update, delete, gone) is the change's place in the change
+	// table: the n-th message change core made (msg_changes.go,
+	// MessageChangeSeq, MsgChange.Seq, an item's MsgSeq), consecutive over
+	// those three event types and 0 on every other event. It is not every
+	// event's emit order: plugin-render-3's counter of all events is
+	// Event.EmitSeq, and the two never stand in for each other.
+	Seq uint64
+	// Removes (update) is a message_changed that Slack's messageChanged
+	// answers with "Remove activity item" (P0K2): the new copy is a
+	// tombstone, moderated or thread_hidden, or the edit took the viewer's
+	// mention out (checkForMentionInMessage of previous_message and not
+	// of the new copy)
+	Removes   bool
+	Connected bool // connection: socket up; realtime: live updates on
+	// Fast (connection, up): the connect reused a reconnect_url, Slack's
+	// FAST_RECONNECTING (lastConnectWasFast); a slow one missed the gap
+	Fast bool
+	// Seen (user): when a view last read the member before this change
+	// (store.MemberAccessed); zero: none did, or the store didn't hold them
+	Seen time.Time
+	// SameNames (user, conv, conv_removed, tabs): the change left alone
+	// what message Docs read of the member or conversation (its names
+	// and picture; a channel's name, kind, membership and tabs): a
+	// status, a huddle, a topic, a bookmark (msg_refs.go)
+	SameNames bool
+	// NamePrefs (prefs): how messages name people changed
+	// (display_real_names, hidden_users)
+	NamePrefs bool
+	// DocPrefs (prefs): a pref every message's Doc reads changed (the
+	// highlight words, emoji_mode)
+	DocPrefs bool
+	Presence string // presence: active | away
+	Users    []string
+	Prefs    *Prefs
 	// sent: the confirmed message replaces the local pending row whose TS
 	// is ReplacesTS. message/sent/update/delete of own sends carry ClientMsgID.
 	ReplacesTS  string
@@ -352,6 +455,16 @@ type Event struct {
 	Saved       *SavedItem    // saved: add | update | delete
 	Activity    *ActivityItem // activity: updated item (hydrated when possible)
 	Raw         json.RawMessage
+	// EmitSeq is the event's place in the order core emitted its events (1
+	// on), the same for every subscriber, which each gets them in this
+	// order: a view that applied the event can tell when another
+	// subscriber (taut's mirror) has handled it too (App.EmitSeq). 0: a
+	// resync for a subscriber that fell behind, or an event core never
+	// emitted. It numbers every event; it is not a message change counter
+	// (activity-live-msg's per-message change sequence is another number,
+	// and must keep another name: fed to the mirror's wait, a change
+	// counter far below this one turns the wait off).
+	EmitSeq uint64
 }
 
 // SendOpts are the options for Send.
@@ -362,6 +475,9 @@ type SendOpts struct {
 	// Attachments go out as chat.postMessage attachments (prepareAndSendMessage's
 	// channelSectionBlocks: [{blocks: [channel_section]}]).
 	Attachments json.RawMessage
+	// BlocksOnly posts Blocks alone (slack.PostOpts.BlocksOnly); Text is
+	// then the optimistic local copy's only.
+	BlocksOnly bool
 	// ClientMsgID is the message's client_msg_id, as sendMessage's
 	// caller may pass one (`client_msg_id || uuid()`); "" makes one. The
 	// composer passes its own so its message list can find the message
@@ -401,6 +517,10 @@ type UploadFile struct {
 	// AltText is an image's alt text (the Edit file dialog),
 	// files.getUploadURL's alt_txt.
 	AltText string
+	// Subtype is the File's subtype ("slack_audio" for a voice clip,
+	// internal/clip): UploadQueue sends it as files.getUploadURL's subtype
+	// and in completeUpload's files entry. "" for an ordinary file.
+	Subtype string
 }
 
 type UploadedFile struct {
@@ -414,8 +534,9 @@ type SearchOpts struct {
 	Module      string // "messages" (default) | "dms"
 	Context     string // search_context ("" = the module's results tab)
 	ExactOnly   bool   // More > Exact matches only
-	// ExcludeArchived is More > Exclude archived (channel_type
-	// exclude_archived; search_explore_freshness_signals)
+	// ExcludeArchived is channel_type exclude_archived (More > Exclude
+	// archived until Slack dropped it with search_explore_freshness_signals:
+	// the 2026-11-21 drift)
 	ExcludeArchived bool
 	Session         SearchSession
 	// InChannel is search in channel (⌘F): the query runs as
@@ -480,6 +601,10 @@ type Usergroup struct {
 	IsSection bool
 	// Updated is date_update.
 	Updated int64
+	// DateDelete is date_delete: a deactivated group's (isUserGroupActive,
+	// 0dhJ V1, is false), which the directory draws dimmed as "{name}
+	// (Deactivated)".
+	DateDelete int64
 }
 
 // AutoGenerated is isAutoGeneratedUserGroup (client-boot jiA8 r2): a
@@ -569,6 +694,15 @@ type ActivityItem struct {
 	Root              *Message // thread parent, for thread items
 	Reaction          *ActivityReaction
 	Count             int // unread replies / bundled messages / posts
+	// MsgSeq is the MessageChangeSeq the item was read at (before its feed
+	// request, or its event's lookups): its entry and its copies of Msg
+	// and Root are current as of then, so a later change core made to them
+	// (MessageChange) is one they don't have (msg_changes.go).
+	MsgSeq uint64
+	// MsgGone: messages.list answered without the item's message, which
+	// Slack stores as an isNonExistent stub (UFM) and draws no body for;
+	// RootGone is the same of its thread root
+	MsgGone, RootGone bool
 
 	// Priority is the entry's priority (from a VIP; /29I isPriority:
 	// !!priority) and Archived its is_archived (a cleared item).
@@ -600,6 +734,10 @@ type ActivityItem struct {
 	// LatestTS is a bundle's latest message (thread_entry.latest_ts, a DM's
 	// or channel's latest_message.ts): Slack's latestTs.
 	LatestTS string
+	// MinUnreadTS is a thread bundle's first unread reply
+	// (thread_entry.min_unread_ts): Slack's minUnreadTs, where an unread
+	// thread_v2 item opens its thread.
+	MinUnreadTS string
 
 	// Invite is a Slack Connect invitation's connect invite (nil for
 	// anything else, or a feed entry without one).
@@ -658,6 +796,10 @@ type ThreadsPage struct {
 	TotalUnread int
 	State       ThreadsState
 	Convs       map[string]ConvRef
+	// MsgSeq is the MessageChangeSeq the page was read at (before its
+	// request): what core changed after it the threads may not have
+	// (msg_changes.go)
+	MsgSeq uint64
 }
 
 type SavedItem struct {
@@ -703,6 +845,7 @@ type Draft struct {
 	FileIDs               []string
 	FileInfo              []DraftFile // the attached files as drafts.list describes them (by FileIDs order when known)
 	FromComposer          bool        // is_from_composer
+	DateStashed           int64       // date_stashed (ms): when the composer's "Save as draft" saved it
 	// Attachments are the draft's message attachments (the composer's GIFs).
 	Attachments json.RawMessage
 }
@@ -725,6 +868,9 @@ type DraftOpts struct {
 	Blocks                json.RawMessage
 	FileIDs               []string
 	DateScheduled         int64 // set when editing a scheduled draft (keeps it scheduled)
+	// DateStashed (ms) saves a composer draft (is_from_composer, with
+	// date_stashed): the composer's "Save as draft"
+	DateStashed int64
 	// Attachments are the draft's message attachments (drafts.create's
 	// attachments: the composer's GIFs); nil sends "[]".
 	Attachments json.RawMessage
@@ -764,6 +910,12 @@ type Command struct {
 
 type CommandOpts struct {
 	Channel, Command, Text, ThreadTS string
+	// Blocks is the arguments as executeCommand sends them (the
+	// composer's CommandBlocks): with blocks, chat.command carries no
+	// text, as in Slack, and the server reads mentions from them. Text
+	// stays the plain words, for the local commands and for callers
+	// that have no blocks.
+	Blocks json.RawMessage
 	// AppID is executeCommand's slashCommandAppId: the app whose command
 	// a plugin turned the message into (chat.command app_id).
 	AppID string

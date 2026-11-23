@@ -101,7 +101,8 @@ func TestSearchModuleParams(t *testing.T) {
 		map[string]string{"search_session_id": s.ID, "client_req_id": s.ReqID, "max_ts": "1794199974", "count": "3",
 			"page": "1", "query": "test", "thread_replies": "", "extract_len": "110", "recent_channels": "C1,D2",
 			"from_me": "true", "with_me": "true"})
-	// omni_quick_message_results off: only the open channel, from/with me false
+	// QuickMessageResultsOn false (a free team): only the open channel,
+	// from/with me false
 	wantForm(t, "inline (off)", inlineParams(InlineOpts{Query: "test", Channel: "C1", Session: s, Now: now}),
 		map[string]string{"search_session_id": s.ID, "client_req_id": s.ReqID, "max_ts": "1794199974", "count": "3",
 			"page": "1", "query": "test", "thread_replies": "", "extract_len": "110", "channel": "C1",
@@ -126,7 +127,7 @@ func TestSearchAgainstFake(t *testing.T) {
 		t.Fatalf("page 1: total %d pages %d page %d, %d messages", r.Total, r.Pages, r.Page, len(r.Messages))
 	}
 	for _, m := range r.Messages {
-		if strings.ContainsAny(m.Text, "") {
+		if strings.ContainsAny(m.Text, "\ue000\ue001") {
 			t.Fatalf("highlight markers left in %q", m.Text)
 		}
 		if !strings.Contains(m.Text, fakeslack.SearchWord) || m.Permalink == "" || m.Channel == "" {
@@ -176,8 +177,11 @@ func TestSearchAgainstFake(t *testing.T) {
 	if err != nil || len(in.Messages) != 3 || in.Total != fakeslack.SearchFixtureCount {
 		t.Fatalf("inline: %v %d of %d", err, len(in.Messages), in.Total)
 	}
-	if strings.ContainsAny(in.Messages[0].Text, "") || in.Messages[0].User == "" {
-		t.Errorf("inline hit %+v", in.Messages[0])
+	// the fake sends the markers JSON-escaped, as Slack does
+	for _, m := range in.Messages {
+		if strings.ContainsAny(m.Text, "\ue000\ue001\ufffd") || !strings.Contains(strings.ToLower(m.Text), fakeslack.SearchWord) || m.User == "" {
+			t.Errorf("inline hit %+v", m)
+		}
 	}
 	files, err := a.AutocompleteFiles(ctx, "zephyr")
 	if err != nil || len(files) != 1 || files[0].Title != fakeslack.SearchFileTitle {
@@ -363,5 +367,61 @@ func TestSearchTabFilters(t *testing.T) {
 	forms := fs.SearchForms("search.modules.people")
 	if last := forms[len(forms)-1]; last.Get("profile_title") != pp.Titles[0].Value {
 		t.Errorf("profile_title sent %q", last.Get("profile_title"))
+	}
+}
+
+// Slack's highlight markers come raw or JSON-escaped (\ue000, any hex
+// case); all go before decoding, and an escaped backslash stays.
+func TestStripHighlightJSON(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{`{"text":"a \ue000zephyr\ue001 b"}`, "a zephyr b"},
+		{`{"text":"\uE000Zephyr\uE001 rollout"}`, "Zephyr rollout"},
+		{"{\"text\":\"raw \ue000hit\ue001\"}", "raw hit"},
+		{`{"text":"mixed \ue000one\ue001 and ` + "\ue000two\ue001" + `"}`, "mixed one and two"},
+		{`{"text":"a literal \\ue000 stays"}`, `a literal \ue000 stays`},
+		{`{"text":"\\\ue000x\ue001"}`, `\x`},
+		{`{"text":"\u00e9t\u00e9 \ue002"}`, "été \ue002"},
+		{`{"text":"plain"}`, "plain"},
+	} {
+		var v struct{ Text string }
+		if err := json.Unmarshal(stripHighlightJSON([]byte(c.in)), &v); err != nil || v.Text != c.want {
+			t.Errorf("%s: %q, %v; want %q", c.in, v.Text, err, c.want)
+		}
+	}
+	for _, c := range []struct {
+		in   string
+		want bool
+	}{{`"\ue000"`, true}, {`"\uE000"`, true}, {"\"\ue000\"", true}, {`"\ue001"`, false},
+		{"\"\ue001\"", false}, {`"\\ue000"`, false}, {`"x"`, false}} {
+		if got := hasHighlightStart([]byte(c.in)); got != c.want {
+			t.Errorf("hasHighlightStart(%s) = %v", c.in, got)
+		}
+	}
+}
+
+// QuickMessageResultsOn is Y/3h E, which replaced omni_quick_message_results
+// (build 8f19be21ed7e, the 2026-11-21 drift): a team with a plan, or an
+// enterprise's, whatever the old experiment's group.
+func TestQuickMessageResultsFollowPlan(t *testing.T) {
+	a, _ := testApp(t)
+	a.C.Creds.EnterpriseID = ""
+	a.SetExperimentGroup("omni_quick_message_results", "on") // the dropped gate: no effect
+	a.setTeamPlan("", "")
+	if a.QuickMessageResultsOn() {
+		t.Error("a free team has quick message results")
+	}
+	a.SetExperimentGroup("omni_quick_message_results", "off")
+	a.setTeamPlan("std", "")
+	if !a.QuickMessageResultsOn() {
+		t.Error("a paid team has none")
+	}
+	a.setTeamPlan("", "E1")
+	if !a.QuickMessageResultsOn() {
+		t.Error("an enterprise workspace has none")
+	}
+	a.setTeamPlan("", "")
+	a.C.Creds.EnterpriseID = "E1" // signed in to a grid: true before team.info says so
+	if !a.QuickMessageResultsOn() {
+		t.Error("a grid sign-in has none")
 	}
 }

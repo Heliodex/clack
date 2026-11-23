@@ -7,6 +7,7 @@ import (
 
 	"gioui.org/f32"
 	"gioui.org/font"
+	"gioui.org/io/pointer"
 	"gioui.org/layout"
 	"gioui.org/op"
 	"gioui.org/op/clip"
@@ -32,16 +33,26 @@ func rgba(v uint32, a float32) color.NRGBA {
 
 // colors are the message-pane colors measured from the 2026 client.
 type colors struct {
+	// raw is the see-through fills drawn inside a row (a reaction pill, a
+	// badge) as their rgba, before flatten pre-blended them over the pane
+	// (zero where one is opaque): a row over a fill of its own (the jump
+	// highlight, the hover) blends that over it instead (row.seeFill), as
+	// Slack's rgba fills do
+	raw                                          rowSee
 	Bg, Hover, Text, Text2, Text3                color.NRGBA
 	Edited, PinIcon, Muted70, TimeSystem         color.NRGBA
 	Pinned, PinnedHover, Highlight, ActiveThread color.NRGBA
 	CustomTint                                   color.NRGBA // .c-message_kit__background--labels--custom_response
 	Important                                    color.NRGBA // --dt_color-content-imp (the reply bar's Unread)
 	BadgeBg, BadgeText                           color.NRGBA
-	ReactBg, ReactHoverBorder                    color.NRGBA
-	ReactSelfBg, ReactSelfHoverBg                color.NRGBA
-	ReactSelfBorder, ReactSelfText               color.NRGBA
-	Link, NewLine, DayLine, PillBorder           color.NRGBA
+	// the deleted message's square and its trash glyph
+	// (.c-message_kit__tombstone__icon: rgba(fg_low,.13) under
+	// rgba(fg_high,.5), the glyph blended over the square)
+	TombBg, TombGlyph                  color.NRGBA
+	ReactBg, ReactHoverBorder          color.NRGBA
+	ReactSelfBg, ReactSelfHoverBg      color.NRGBA
+	ReactSelfBorder, ReactSelfText     color.NRGBA
+	Link, NewLine, DayLine, PillBorder color.NRGBA
 	// .c-message_actions__button (client-boot-styles cf726c4f): the icon
 	// rgba(var(--sk_foreground_max_solid)), and under the pointer
 	// rgba(var(--sk_foreground_min), .04) behind
@@ -71,6 +82,9 @@ type colors struct {
 	// .c-missing_text--unknown's --dt_color-base-ter and --non-existent's
 	// rgb(--sk_foreground_low_solid) border
 	Missing, MissingLine color.NRGBA
+	// .c-avatar--no_image: rgba(var(--sk_foreground_low_solid), 1), the
+	// avatar of a member with no picture to draw yet (paintAvatar)
+	NoImage color.NRGBA
 }
 
 var lightColors = colors{
@@ -79,6 +93,7 @@ var lightColors = colors{
 	Pinned: rgba(0xf2c744, 0.1), PinnedHover: rgba(0xf2c744, 0.14), Highlight: rgba(0xf2c744, 0.2),
 	// CustomTint is #1d9bd11a in both modes
 	CustomTint: rgba(0x1d9bd1, 0x1a/255.0), BadgeBg: rgba(0x1d1c1d, 0.06), BadgeText: rgb(0x454447), Important: rgb(0xc01343),
+	TombBg: rgba(0x1d1c1d, 0.13), TombGlyph: rgba(0x1d1c1d, 0.5),
 	ReactBg: rgba(0x1d1c1d, 0.06), ReactHoverBorder: rgb(0x7c7a7f),
 	// .c-reaction--reacted(:hover): base-hgl-1, content-hgl-1 bold and a
 	// 1px base-inv-hgl-1 ring; hover changes nothing
@@ -100,15 +115,16 @@ var lightColors = colors{
 
 	FindMuted: rgb(0x5e5d60), FindBorder: rgba(0x5e5d60, 0x21/255.0),
 
-	Missing: rgb(0xeaeaea), MissingLine: rgb(0xdddddd),
+	Missing: rgb(0xeaeaea), MissingLine: rgb(0xdddddd), NoImage: rgb(0xdddddd),
 }
 
 var darkColors = colors{
 	Bg: rgb(0x1a1d21), Hover: rgb(0x222529), Text: rgb(0xf8f8f8), // --dt_color-content-pry (sender names)
 	Text2: rgb(0xababad), Text3: rgb(0xd1d2d3),
 	Edited: rgb(0x868686), PinIcon: rgb(0xe8912d), Muted70: rgba(0xe8e8e8, 0.7), TimeSystem: rgb(0xababad),
-	Pinned: rgba(0xf2c744, 0.1), PinnedHover: rgba(0xf2c744, 0.14), Highlight: rgba(0xf2c744, 0.1),
+	Pinned: rgba(0xf2c744, 0.1), PinnedHover: rgba(0xf2c744, 0.14), Highlight: rgba(0xf2c744, 0.2), // no dark override of #f2c74433
 	CustomTint: rgba(0x1d9bd1, 0x1a/255.0), BadgeBg: rgba(0xe8e8e8, 0.13), BadgeText: rgba(0xe8e8e8, 0.7), Important: rgb(0xde678a),
+	TombBg: rgba(0xe8e8e8, 0.13), TombGlyph: rgba(0xe8e8e8, 0.5),
 	ReactBg: rgba(0xe8e8e8, 0.06), ReactHoverBorder: rgba(0xe8e8e8, 0.3),
 	// .sk-client-theme--dark .c-reaction--reacted: a solid base-inv-hgl-1
 	// pill, no ring, content-pry text (bold), the same under the pointer
@@ -130,7 +146,7 @@ var darkColors = colors{
 
 	FindMuted: rgb(0x9a9b9e), FindBorder: rgba(0x797c81, 0x4d/255.0),
 
-	Missing: rgb(0x212428), MissingLine: rgb(0x35373b),
+	Missing: rgb(0x212428), MissingLine: rgb(0x35373b), NoImage: rgb(0x35373b),
 }
 
 func colorsFor(th *theme.Theme) *colors {
@@ -151,14 +167,27 @@ var (
 	lightFlat, darkFlat colors
 )
 
+// rowSee is colors' see-through fills before flatten (colors.raw).
+type rowSee struct {
+	BadgeBg, ReactBg, ReactSelfBg, ReactSelfHoverBg, TombBg, HuddleTile color.NRGBA
+}
+
 // flatten pre-blends the translucent row/pill fills over the pane color in
 // sRGB, the way browsers composite CSS rgba(). Gio blends in linear light,
 // which makes e.g. rgba(242,199,68,.1) on the dark pane look far brighter
 // than Slack's.
 func flatten(c colors) colors {
 	bg := c.Bg
+	for _, p := range []struct{ fill, raw *color.NRGBA }{{&c.BadgeBg, &c.raw.BadgeBg}, {&c.ReactBg, &c.raw.ReactBg},
+		{&c.ReactSelfBg, &c.raw.ReactSelfBg}, {&c.ReactSelfHoverBg, &c.raw.ReactSelfHoverBg}, {&c.TombBg, &c.raw.TombBg},
+		{&c.HuddleTile, &c.raw.HuddleTile}} {
+		*p.raw = color.NRGBA{}
+		if p.fill.A > 0 && p.fill.A < 255 {
+			*p.raw = *p.fill
+		}
+	}
 	for _, p := range []*color.NRGBA{&c.Hover, &c.Pinned, &c.PinnedHover, &c.Highlight, &c.Editing, &c.CustomTint,
-		&c.BadgeBg, &c.ReactBg, &c.ReactSelfBg, &c.ReactSelfHoverBg, &c.ToolbarHoverBg, &c.CloseHover,
+		&c.BadgeBg, &c.ReactBg, &c.ReactSelfBg, &c.ReactSelfHoverBg, &c.TombBg, &c.ToolbarHoverBg, &c.CloseHover,
 		&c.DayLine, &c.PillBorder, &c.ThreadBorder, &c.HeaderBorder, &c.BorderStrong, &c.ReactHoverBorder, &c.Muted70, &c.HuddleTile,
 		&c.FindBorder} {
 		*p = richview.Over(*p, bg)
@@ -221,9 +250,15 @@ func fill(ops *op.Ops, r image.Rectangle, c color.NRGBA) {
 	paint.FillShape(ops, c, clip.Rect(r).Op())
 }
 
+// rrectHook sees every rounded fill rrect paints (tests).
+var rrectHook func(r image.Rectangle, c color.NRGBA)
+
 func rrect(ops *op.Ops, r image.Rectangle, radius int, c color.NRGBA) {
 	if c.A == 0 || r.Empty() {
 		return
+	}
+	if rrectHook != nil {
+		rrectHook(r, c)
 	}
 	paint.FillShape(ops, c, clip.UniformRRect(r, radius).Op(ops))
 }
@@ -323,6 +358,15 @@ func measure(gtx layout.Context, th *theme.Theme, s textStyle, txt string) image
 	return d.Size
 }
 
+// pointerCursor sets the hand cursor over r, a hand-drawn button's area.
+// Call it inside the button's Clickable.Layout, so the area exists only
+// while the button is drawn.
+func pointerCursor(gtx layout.Context, r image.Rectangle) {
+	t := clip.Rect(r).Push(gtx.Ops)
+	pointer.CursorPointer.Add(gtx.Ops)
+	t.Pop()
+}
+
 // at runs w at offset (x, y) and returns its dims.
 func at(gtx layout.Context, x, y int, w layout.Widget) layout.Dimensions {
 	t := op.Offset(image.Pt(x, y)).Push(gtx.Ops)
@@ -337,6 +381,14 @@ func drawAvatar(gtx layout.Context, h Host, url string, r image.Rectangle, c *co
 	paintAvatar(gtx, h.Images(), url, r, c)
 }
 
+// paintAvatar is BaseAvatar (client-boot xc3R) in r: the picture, or
+// .c-base_icon's --dt_color-base-ter behind it while it loads. Without
+// one (url ""), ConnectedBaseAvatar (ztjr) had no imageUrl to give: a
+// member getMemberById hands back as the unknown stub (isUnknown: a
+// sender only a plugin named, users/info not answered yet) or as
+// non-existent (no avatar_hash). BaseAvatar draws that as
+// .c-avatar--no_image, rgba(var(--sk_foreground_low_solid)) in the
+// avatar's rounded square, until "names" resolves the row again.
 func paintAvatar(gtx layout.Context, imgs *imgcache.Cache, url string, r image.Rectangle, c *colors) {
 	radius := avatarRadius(r.Dx())
 	if isDefaultBotAvatar(url) {
@@ -351,11 +403,20 @@ func paintAvatar(gtx layout.Context, imgs *imgcache.Cache, url string, r image.R
 			return
 		}
 	}
-	rrect(gtx.Ops, r, radius, c.Skeleton)
+	rrect(gtx.Ops, r, radius, avatarFill(url, c))
+}
+
+// avatarFill is what an avatar without its picture shows: the no-image
+// square when there is no picture to load, the loading tile otherwise.
+func avatarFill(url string, c *colors) color.NRGBA {
+	if url == "" {
+		return c.NoImage
+	}
+	return c.Skeleton
 }
 
 // drawEmoji paints an emoji image contained in r.
-func drawEmoji(gtx layout.Context, h Host, url string, r image.Rectangle) bool {
+func drawEmoji(gtx layout.Context, h TipHost, url string, r image.Rectangle) bool {
 	if url == "" || h.Images() == nil {
 		return false
 	}
@@ -368,7 +429,7 @@ func drawEmoji(gtx layout.Context, h Host, url string, r image.Rectangle) bool {
 
 // drawEmojiAt is drawEmoji with the picture decoded at px (sharper under
 // a transform that grows it), else at r's size while that loads.
-func drawEmojiAt(gtx layout.Context, h Host, url string, r image.Rectangle, px int) bool {
+func drawEmojiAt(gtx layout.Context, h TipHost, url string, r image.Rectangle, px int) bool {
 	if url != "" && h.Images() != nil && px != r.Dx() {
 		if img, ok := h.Images().Get(url, px); ok {
 			richview.DrawImage(gtx.Ops, img, r, 0, false)

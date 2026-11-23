@@ -8,21 +8,72 @@ package fakeslack
 // 24 hours: files.recentlyDeleted lists it ({id, title, date_delete,
 // file_type: quip | list}, filtered by file_type) and files.undelete
 // {file_id} puts it back. Every write is recorded (FilesViewCalls).
+//
+// One read: the browser's Images type (search.modules.files, search_context
+// desktop_files_browser, type:images) lists #files-gallery's images,
+// newest share first (FilesBrowserImages), the un-thumbnailed ones
+// (FilesUnthumbedImage, FilesUnthumbedSized) among them.
 
 import (
 	"net/url"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
 
+// FilesBrowserImages are the Files browser's Images results:
+// #files-gallery's image/* files, as search items.
+func (s *Server) FilesBrowserImages() []map[string]any {
+	var out []map[string]any
+	for _, it := range s.ChannelFilesTab(true) {
+		if mime, _ := it["mimetype"].(string); strings.HasPrefix(mime, "image/") {
+			out = append(out, it)
+		}
+	}
+	return out
+}
+
+// filesBrowserImages answers the browser's type:images search (handled
+// false for any other).
+func (s *Server) filesBrowserImages(f url.Values) (any, bool) {
+	if f.Get("search_context") != "desktop_files_browser" || !strings.Contains(" "+f.Get("query")+" ", " type:images ") {
+		return nil, false
+	}
+	items := s.FilesBrowserImages()
+	return ok("items", items, "pagination", map[string]any{"total_count": len(items), "page": 1, "page_count": 1}), true
+}
+
+// recordFilesBrowserSearch keeps each Files browser search
+// (search.modules.files with search_context desktop_files_browser) for
+// FilesBrowserSearches; it answers nothing.
+func (s *Server) recordFilesBrowserSearch(method string, f url.Values) {
+	if method != "search.modules.files" || f.Get("search_context") != "desktop_files_browser" {
+		return
+	}
+	fv := s.filesView()
+	fv.mu.Lock()
+	fv.searches = append(fv.searches, f)
+	fv.mu.Unlock()
+}
+
+// FilesBrowserSearches returns the Files browser's search.modules.files
+// forms, in order.
+func (s *Server) FilesBrowserSearches() []url.Values {
+	fv := s.filesView()
+	fv.mu.Lock()
+	defer fv.mu.Unlock()
+	return append([]url.Values(nil), fv.searches...)
+}
+
 type filesViewStore struct {
-	mu      sync.Mutex
-	starred []string          // files.favorites.add order, oldest first (as Slack's file_ids)
-	deleted map[string]bool   // files.delete
-	titles  map[string]string // files.edit titles
-	trash   map[string]trashed
-	calls   []FilesViewCall
+	mu       sync.Mutex
+	searches []url.Values      // the browser's searches (recordFilesBrowserSearch)
+	starred  []string          // files.favorites.add order, oldest first (as Slack's file_ids)
+	deleted  map[string]bool   // files.delete
+	titles   map[string]string // files.edit titles
+	trash    map[string]trashed
+	calls    []FilesViewCall
 	// file collections (files_sections.go): the custom ones, the starred
 	// files' positions and the starred collection's sort
 	colls             []*fakeCollection
@@ -55,7 +106,7 @@ type FilesViewCall struct {
 	Args   url.Values
 }
 
-var filesViewStores sync.Map // *Server -> *filesViewStore
+var filesViewStores = newPerServer() // *Server -> *filesViewStore
 
 func (s *Server) filesView() *filesViewStore {
 	if v, ok := filesViewStores.Load(s); ok {

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"gioui.org/f32"
+	"gioui.org/internal/clickrule"
 	f32internal "gioui.org/internal/f32"
 	"gioui.org/internal/ops"
 	"gioui.org/io/clipboard"
@@ -49,17 +50,30 @@ type Router struct {
 	// InvalidateCmd summary.
 	wakeup     bool
 	wakeupTime time.Time
+	// Clack patch 57: the areas the frame being laid out read through
+	// FollowArea, and where they were (clack_follow.go)
+	follow map[event.Tag]followedArea
 	// Changes queued for next call to Frame.
 	commands []Command
 	// transfers is the pending transfer.DataEvent.Open functions.
 	transfers []io.ReadCloser
 	// Clack patch 15: per-window values for gestures (Source.Value).
 	values map[any]any
+	// Clack patch 48: the window's run of clicks (clack_clicks.go)
+	clicks clickrule.Run
+	// Clack patch 35: the frame in progress is the last one's ops again
+	// (Source.Replay): Frame keeps the handlers' filters
+	replay bool
 	// deferring is set if command execution and event delivery is deferred
 	// to the next frame.
 	deferring bool
+	// replayed counts the events a command's immediate execution queued
+	// again (Clack patch 61's tests).
+	replayed int
 	// scratchFilters is for garbage-free construction of ephemeral filters.
 	scratchFilters []taggedFilter
+	// Clack patch 28: the key presses for Source.KeyPresses.
+	keyLog keyLog
 }
 
 // Source implements the interface between a Router and user interface widgets.
@@ -332,6 +346,7 @@ func (q *Router) Event(filters ...event.Filter) (event.Event, bool) {
 				change.events = slices.Delete(change.events, j, j+1)
 				// Fast forward state to last matched.
 				q.collapseState(i)
+				q.notePointerRead(evt) // Clack patch 49
 				return evt.event, true
 			}
 		}
@@ -362,6 +377,16 @@ func (q *Router) collapseState(idx int) {
 // handlers from the frame argument. Remaining events are discarded,
 // unless they were deferred by a command.
 func (q *Router) Frame(frame *op.Ops) {
+	// Clack patch 35: a replayed frame (Source.Replay) is the last frame's
+	// ops again, with no layout: nothing asked for events or read the key
+	// log in it, so the handlers keep their filters (below) and the key log
+	// carries on as the last laid-out frame left it (patch 28: it logs
+	// while a Source reads it every frame, and a replayed frame reads none)
+	replay := q.replay
+	q.replay = false
+	if !replay {
+		q.frameKeyLog() // Clack patch 28
+	}
 	var remaining []event.Event
 	if n := len(q.changes); n > 0 {
 		if q.deferring {
@@ -386,14 +411,20 @@ func (q *Router) Frame(frame *op.Ops) {
 	}
 	q.transfers = nil
 	q.deferring = false
+	// Clack patch 35: a replayed frame's handlers asked for nothing (no
+	// layout ran): they keep the filters they asked for in the last frame
 	for _, h := range q.handlers {
-		h.filter, h.nextFilter = h.nextFilter, h.filter
+		if !replay {
+			h.filter, h.nextFilter = h.nextFilter, h.filter
+		}
 		h.nextFilter.Reset()
 		h.processedFilter.Reset()
 		h.pointer.Reset()
 		h.key.Reset()
 	}
-	q.key.filter, q.key.nextFilter = q.key.nextFilter, q.key.filter
+	if !replay {
+		q.key.filter, q.key.nextFilter = q.key.nextFilter, q.key.filter
+	}
 	clear(q.key.nextFilter) // Clack patch 18
 	q.key.nextFilter = q.key.nextFilter[:0]
 	var ops *ops.Ops
@@ -409,8 +440,9 @@ func (q *Router) Frame(frame *op.Ops) {
 			h.active = false
 		}
 	}
+	q.followFrame() // Clack patch 57
 	q.executeCommands()
-	q.Queue(remaining...)
+	q.requeue(remaining...) // Clack patch 28: Queue, not logged again
 	st := q.lastState()
 	pst, evts := q.pointer.queue.Frame(q.handlers, st.pointerState)
 	st.pointerState = pst
@@ -428,6 +460,11 @@ func (q *Router) Queue(events ...event.Event) {
 		if system {
 			e = se.Event
 		}
+		if pe, ok := e.(pointer.Event); ok && !q.keyLog.replay {
+			e = q.countClick(pe) // Clack patch 48: the window's click count
+		}
+		q.noteKey(e) // Clack patch 28
+		noteInput(e) // Clack patch 33
 		q.processEvent(e, system)
 	}
 }
@@ -518,6 +555,15 @@ func (q *Router) processEvent(e event.Event, system bool) {
 }
 
 func (q *Router) execute(c Command) {
+	// Clack patch 61: an InvalidateCmd changes no input state and sends no
+	// events; it only asks for a frame. It records its wakeup at once,
+	// deferring or not, and never takes the immediate path below, which
+	// replays every event still queued (a widget ticking in the middle of
+	// layout replayed the input of everything laid out after it).
+	if inv, ok := c.(op.InvalidateCmd); ok {
+		q.executeCommand(inv)
+		return
+	}
 	// The command can be executed immediately if event delivery is not frozen, and
 	// no event receiver has completed their event handling.
 	if !q.deferring {
@@ -527,6 +573,7 @@ func (q *Router) execute(c Command) {
 			h, ok := q.handlers[e.tag]
 			immediate = immediate && (!ok || !h.processedFilter.Matches(e.event))
 		}
+		immediate = immediate || immediateCmd(c) // Clack patch 49: ResetPointers
 		if immediate {
 			// Hold on to the remaining events for state replay.
 			var evts []event.Event
@@ -540,7 +587,7 @@ func (q *Router) execute(c Command) {
 				q.changes = q.changes[:1]
 			}
 			q.changeState(nil, ch.state, ch.events)
-			q.Queue(evts...)
+			q.requeue(evts...) // Clack patch 28: Queue, not logged again
 			return
 		}
 	}
@@ -592,6 +639,8 @@ func (q *Router) executeCommand(c Command) stateChange {
 		state.clipboardState = q.cqueue.ProcessReadClipboard(state.clipboardState, req.Tag)
 	case pointer.GrabCmd:
 		state.pointerState, evts = q.pointer.queue.grab(state.pointerState, req)
+	case resetPointersCmd: // Clack patch 49 (clack_reset.go)
+		state.pointerState, evts = q.pointer.queue.resetPointers(q.handlers, state.pointerState)
 	case op.InvalidateCmd:
 		if !q.wakeup || req.At.Before(q.wakeupTime) {
 			q.wakeup = true

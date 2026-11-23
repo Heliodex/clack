@@ -6,16 +6,19 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"gioui.org/app"
@@ -26,13 +29,32 @@ import (
 	"github.com/some-du6e/clack/internal/core"
 	"github.com/some-du6e/clack/internal/desktop"
 	"github.com/some-du6e/clack/internal/imgcache"
+	_ "github.com/some-du6e/clack/internal/media/avf" // video on macOS: AVFoundation
+	_ "github.com/some-du6e/clack/internal/media/mf"  // video on Windows: Media Foundation (cgo builds)
 	"github.com/some-du6e/clack/internal/slack"
 	"github.com/some-du6e/clack/internal/slick"
 	"github.com/some-du6e/clack/internal/store"
 	"github.com/some-du6e/clack/internal/ui"
 )
 
-var started = time.Now()
+// mainAt is when package main's variables were set: the loader, the Go
+// runtime and every package's init had run by then.
+var mainAt = time.Now()
+
+// started is the startup timeline's zero: when the OS started the process
+// (applog.ProcessStart), so every milestone counts what a launch waits
+// for, the time before main included; mainAt where the OS doesn't say.
+var started = processStarted()
+
+func processStarted() time.Time {
+	if t, ok := applog.ProcessStart(); ok && !t.After(mainAt) {
+		// mainAt's monotonic reading, moved back by the wall-clock gap:
+		// durations from it stay monotonic (a clock step in the first
+		// minute moves neither the timeline nor its timeouts)
+		return mainAt.Add(t.Sub(mainAt))
+	}
+	return mainAt
+}
 
 // version is set at release builds (-ldflags "-X main.version=v0.1.0").
 var version = "dev"
@@ -146,6 +168,13 @@ func main() {
 		}
 		return
 	}
+	// `clack intro-preview`: the introduction's renderer, a child of the
+	// window (internal/ui/intro_preview_child.go). Before everything else:
+	// no log file, config, credentials, single-instance check or window;
+	// loopback-only network.
+	if len(os.Args) > 1 && os.Args[1] == "intro-preview" {
+		os.Exit(ui.RunIntroPreview(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	// `clack --update`: download and install the newest release from the
 	// terminal, for a Clack that won't open. Before everything else: no
 	// window, config, credentials or Slack.
@@ -168,20 +197,20 @@ func main() {
 	// The startup timeline (applog/startup.go) counts from the process
 	// start; its debug lines are on for the first minute.
 	applog.StartTimeline(started)
+	applog.MarkAt("main", mainAt, "")
+	// Gio's own startup points: macOS's finished launching (the Dock's
+	// bounce ends), the window on screen, the GPU's first frame
+	app.SetStartupMark(func(name string, at time.Time) { go applog.MarkAt(name, at, "") }) // never the log on AppKit's main thread
 	// Go panics nothing recovers and the runtime's fatal errors go to fd 2
 	// only; the runtime also writes them to crash.log next to clack.log,
-	// and the next start copies the trace, redacted, into clack.log.
+	// and the next start copies the trace, redacted, into clack.log. That
+	// capture is always on: see captureCrashes.
 	//
 	// Slick main halves' Chromium switches for this start work Clack's own
-	// knobs (internal/slick/switches.go): Snappy's "Disable crash reporter"
-	// turns that crash capture off, its "Ignore GPU blocklist" lets an X11
-	// window use Vulkan.
+	// knobs (internal/slick/switches.go): Snappy's "Ignore GPU blocklist"
+	// lets an X11 window use Vulkan.
 	sw := slick.StartupSwitches("")
-	if slices.Contains(sw, slick.SwitchDisableCrashpad) || slices.Contains(sw, slick.SwitchDisableCrashReporter) {
-		log.Printf("slick: crash reporter disabled by a plugin's switches (%s): no crash.log this run", strings.Join(sw, " "))
-	} else {
-		logs.CaptureCrashes(fmt.Sprintf("clack %s %s/%s pid %d, started %s", version, runtime.GOOS, runtime.GOARCH, os.Getpid(), time.Now().Format(time.RFC3339)))
-	}
+	crashNote := captureCrashes(logs.CaptureCrashes, sw, fmt.Sprintf("clack %s %s/%s pid %d, started %s", version, runtime.GOOS, runtime.GOARCH, os.Getpid(), time.Now().Format(time.RFC3339)))
 	if slices.Contains(sw, slick.SwitchIgnoreGPUBlocklist) {
 		app.IgnoreGPUBlocklist()
 	}
@@ -221,6 +250,7 @@ func main() {
 	flag.Parse()
 	if *showVersion {
 		fmt.Println("clack", version)
+		logs.ExitQuiet("printed the version (-version)", time.Second)
 		return
 	}
 
@@ -230,25 +260,37 @@ func main() {
 		if *unregURL {
 			f = desktop.UnregisterURLHandler
 		}
+		what := "-register-url-handler"
+		if *unregURL {
+			what = "-unregister-url-handler"
+		}
 		r, err := f()
 		if err != nil {
 			if runtime.GOOS == "windows" {
 				fmt.Fprintln(os.Stderr, "clack:", err) // the console attachConsole found
 			}
-			log.Fatal(err)
+			exitWith(logs, 1, fmt.Sprintf("%s failed: %v", what, err))
 		}
 		fmt.Println(urlHandlerMessage(*unregURL, r))
+		logs.ExitQuiet(what+" done", time.Second)
 		return
 	}
 
 	if flag.Arg(0) == "login" {
 		if err := loginCLI(*credsPath, flag.Arg(1)); err != nil {
-			log.Fatal(err)
+			exitWith(logs, 1, fmt.Sprintf("clack login failed: %v", err))
 		}
+		logs.ExitQuiet("clack login done", time.Second)
 		return
 	}
 
 	log.Printf("clack %s starting (%s/%s, %s)", version, runtime.GOOS, runtime.GOARCH, runtime.Version())
+	// the launch harness (.github/perf/launch.py) reads the process and its
+	// start from this line
+	log.Printf("startup: process %d started at unix ms %d, main after %v", os.Getpid(), started.UnixMilli(), mainAt.Sub(started).Round(100*time.Microsecond))
+	if crashNote != "" {
+		log.Print(crashNote)
+	}
 	cfg := configDir()
 	// One Clack per user (and config dir): a second launch, or the OS
 	// running `clack slack://…` for a link, hands it to the running one.
@@ -274,8 +316,10 @@ func main() {
 			case <-time.After(3 * time.Second):
 			}
 		}
+		logs.ExitQuiet("handed this launch to the Clack already running", time.Second)
 		return
 	}
+	applog.Mark("single-instance", "")
 	// The image cache's disk tier is the signed-in account's (build sets it).
 	images := imgcache.New(imgcache.PublicFetch, "", nil)
 	croot := cacheRoot(cfg)
@@ -295,6 +339,15 @@ func main() {
 		liveMu.Unlock()
 		if old != nil && old != c {
 			old.PersistSession(nil)
+		}
+	}
+	// a desktop session's last rotated cookies, before the process ends
+	flushSession := func() {
+		liveMu.Lock()
+		c := live
+		liveMu.Unlock()
+		if c != nil {
+			c.FlushSession()
 		}
 	}
 	opts := ui.Options{ConfigDir: cfg, Dark: *dark, Started: started, NoRealtime: *noRealtime, InvokedOnStartup: *startup,
@@ -334,8 +387,22 @@ func main() {
 	}
 
 	creds, err := slack.ReadCreds(*credsPath)
+	// before any account's store opens: finish a sign-out this process's
+	// predecessor didn't live through (never the signed-in account's
+	// directory: store.SweepAccounts)
+	keep := ""
+	if err == nil {
+		keep = store.AccountDir(croot, firstNonEmpty(creds.Team, creds.EnterpriseID), creds.UserID)
+	}
+	store.SweepAccounts(croot, keep)
+	applog.Mark("creds", "")
 	ui.SetVersion(version)
 	a := ui.New(opts, images)
+	applog.Mark("ui-new", "")
+	// macOS: Cmd+Q in the stub menu (before Clack's menu bar installs,
+	// after the first frame) quits as Clack's own Quit does, with the
+	// menu's reason for the exit line
+	app.SetQuitHandler(func() { a.QuitBecause("Quit in the menu") })
 	// A slack:// link is a navigation, except a magic-login link, which
 	// is Slack's browser handing "the Slack app" a sign-in: that signs in
 	// (on the sign-in screen only; see ui.App.SignInWithLink).
@@ -359,6 +426,19 @@ func main() {
 	if lerr != nil {
 		log.Printf("desktop: single instance: %v", lerr)
 	}
+	// The run record (applog/exitreason.go): this run's start, and the
+	// line about how the last one ended. Not when another Clack holds the
+	// socket: the record is that one's.
+	if !errors.Is(lerr, desktop.ErrAnotherInstance) {
+		if prev := logs.StartRun(desktop.InstanceKey(cfg), fmt.Sprintf("clack %s %s/%s pid %d, started %s", version, runtime.GOOS, runtime.GOARCH, os.Getpid(), started.Format(time.RFC3339))); prev != "" {
+			log.Print(prev)
+		}
+	}
+	// Linux X11: a broken X connection ends the process in Xlib's IO error
+	// handler (Gio patch 59); the reason goes first
+	app.X11ConnectionLost = func() {
+		logs.Exit("the X server's connection broke (the X session ended, or the server stopped or was killed)", time.Second)
+	}
 	cacheDir := filepath.Join(cfg, "cache")
 	// build makes the session's client, store and core: it reads the
 	// DPoP key, so after sign-in or an account switch it runs off the UI
@@ -380,6 +460,7 @@ func main() {
 		migrateLegacyCache(cfg, acct, creds.UserID)
 		go store.RemoveBootFiles(acct) // alpha.28's boot snapshot (it held message text)
 		st := store.New(acct)
+		st.ClearSignedOut() // signed in again: an earlier sign-out's unfinished mark isn't this session's
 		svc := core.New(c, st)
 		images.SetDir(filepath.Join(acct, "img"))
 		// After core.New (which listens for the session ending): a bound
@@ -388,20 +469,17 @@ func main() {
 		if err := c.EnableDPoP(filepath.Dir(*credsPath)); err != nil {
 			log.Printf("slack: %v", err)
 		}
-		images.SetFetcher(func(ctx context.Context, raw string) ([]byte, error) {
-			// https slack.com hosts (files.slack.com, …) need the session
-			// cookie and stay in memory (core.Fetch). Everything else is
-			// fetched with no credentials (imgcache.PublicFetch): https only,
-			// Slack's CDNs directly, any other host (unfurls, attachment and
-			// block images, bot icons, plugin CSS) through Slack's image
-			// proxy so a sender never sees your IP address, and never from a
-			// private address.
-			if c.CredentialsOK(raw) {
-				b, _, err := svc.Fetch(ctx, raw)
-				return b, err
-			}
-			return imgcache.PublicFetch(ctx, raw)
-		})
+		// https slack.com hosts (files.slack.com, …) need the session
+		// cookie and stay in memory (core.Fetch). Everything else is
+		// fetched with no credentials (imgcache.PublicFetch): https on
+		// Slack's CDNs directly, any other host and any http URL (unfurls,
+		// attachment and block images, bot icons, plugin CSS) through
+		// Slack's image proxy so a sender never sees your IP address, and
+		// never from a private address.
+		images.SetFetcher(imgcache.SessionFetch(c.CredentialsOK, func(ctx context.Context, raw string) ([]byte, error) {
+			b, _, err := svc.Fetch(ctx, raw)
+			return b, err
+		}))
 		return svc
 	}
 	connect := func(creds slack.Creds) { a.Attach(build(creds), cacheDir) }
@@ -431,6 +509,7 @@ func main() {
 	} else {
 		a.SetLogin(login)
 	}
+	applog.Mark("attached", "")
 	if link != "" {
 		log.Printf("desktop: started with a slack:// %s", linkKind(link))
 		openLink(link)
@@ -454,6 +533,27 @@ func main() {
 	if os.Getenv("CLACK_TIMING") != "" || os.Getenv("YOLOSLACK_TIMING") != "" {
 		log.Printf("timing: main ready: %v", time.Since(started).Round(100*time.Microsecond))
 	}
+	// quit is a request from outside to end Clack (a signal, Windows ending
+	// the session, macOS's terminate:): the exit line and the run record
+	// first, then Clack quits as its own Quit does. The fallback is armed
+	// before anything that can block: a window that never closes (its
+	// thread stuck) still ends the process, 10 s on, and says so.
+	var quitOnce sync.Once
+	quit := func(why string) {
+		quitOnce.Do(func() {
+			time.AfterFunc(10*time.Second, func() {
+				log.Printf("exit: the window didn't close within 10 s of %q, so Clack ended itself", why)
+				logs.Flush(time.Second)
+				os.Exit(1)
+			})
+			logs.Exit(why, time.Second)
+			go func() {
+				flushSession()
+				a.QuitBecause(why)
+			}()
+		})
+	}
+	runDone := make(chan struct{}) // closed once Run's end is recorded
 	var tray *desktop.Tray
 	if runtime.GOOS == "windows" { // Slack's notification-area icon
 		var terr error
@@ -464,25 +564,54 @@ func main() {
 			log.Printf("desktop: tray: %v", terr)
 		} else {
 			a.SetTray(tray) // closing the window leaves Clack here (runFromTray)
+			// Windows ending the session (sign-out, shut down, restart, an
+			// installer's Restart Manager) ends the process once the tray
+			// window's WM_ENDSESSION returns: the exit line goes first, then
+			// the quit it starts gets up to 3 s.
+			tray.OnSessionEnd(func(why string) {
+				quit(why)
+				select {
+				case <-runDone:
+				case <-time.After(3 * time.Second):
+				}
+			})
+		}
+	}
+	// Ctrl+C or a closed terminal, kill's SIGTERM, a Linux session's end;
+	// on Windows a console's control events (Go's SIGTERM for close,
+	// sign-out and shutdown). A second signal ends Clack at once.
+	// A signal the launcher ignored stays ignored (nohup's SIGHUP, the
+	// SIGINT of a job a script put in the background): Notify would
+	// install a handler for it.
+	sigs := make(chan os.Signal, 1)
+	for _, s := range []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGHUP} {
+		if !signal.Ignored(s) {
+			signal.Notify(sigs, s)
 		}
 	}
 	go func() {
+		s := <-sigs
+		signal.Stop(sigs)
+		quit("signal: " + s.String())
+	}()
+	go func() {
 		err := a.Run()
-		liveMu.Lock()
-		c := live
-		liveMu.Unlock()
-		if c != nil {
-			c.FlushSession() // a desktop session's last rotated cookies
-		}
-		tray.Close()
-		inst.Close()
-		code := 0
+		code, why := 0, a.ExitReason()
 		if err != nil {
 			log.Print(err)
 			code = 1
+			if !strings.Contains(why, err.Error()) { // the window's own error is in why already
+				why = fmt.Sprintf("%s (%v)", why, err)
+			}
 		}
-		logs.Close(time.Second) // what's still queued for the log file
-		os.Exit(code)
+		// the reason and the run record before the instance socket goes: a
+		// Clack started once it's gone makes the record its own
+		logs.Exit(why, time.Second)
+		flushSession()
+		tray.Close()
+		inst.Close()
+		close(runDone)
+		exitWith(logs, code, why) // after what's still queued for the log file
 	}()
 	// app.Events replaces app.Main: macOS delivers slack:// links opened
 	// while Clack runs (or that launched it) as URLEvents.
@@ -493,15 +622,31 @@ func main() {
 	// queues work for the main thread and waits for it, so calling it here
 	// deadlocked: Clack beachballed when a browser handed it a sign-in link
 	// while it was running (2026-11-08). Do nothing here but hand off.
+	applog.Mark("app-main", "")
 	for e := range app.Events {
-		if u, ok := e.(app.URLEvent); ok && u.URL != nil {
-			link := u.URL.String()
-			go func() {
-				a.Raise()
-				openLink(link)
-			}()
+		switch e := e.(type) {
+		case app.URLEvent:
+			if e.URL != nil {
+				link := e.URL.String()
+				go func() {
+					a.Raise()
+					openLink(link)
+				}()
+			}
+		case app.TerminateEvent:
+			// macOS asked Clack to quit (Gio patch 58): AppKit waits while
+			// Clack logs and records why and quits as its own Quit does;
+			// the process ends when Clack exits
+			go quit("macOS asked Clack to quit (the Dock's Quit, log out, restart or shut down, or a quit Apple Event)")
 		}
 	}
+}
+
+// exitWith ends the process with code after its exit line (applog's
+// Exit: "exit: <why>", written to the log file before the process goes).
+func exitWith(logs *applog.Logger, code int, why string) {
+	logs.Exit(why, time.Second)
+	os.Exit(code)
 }
 
 // signInWithLink is desktop-style sign-in: trade a slack:// magic-login
@@ -641,4 +786,22 @@ func linkKind(u string) string {
 		return "sign-in link"
 	}
 	return "link"
+}
+
+// captureCrashes turns on crash capture (capture is
+// applog.Logger.CaptureCrashes) whatever a Slick plugin's switches say,
+// and returns the line to log after "clack … starting" when they asked
+// for no crash reporter ("" otherwise). Snappy's "Disable crash reporter"
+// (default on) appends Chromium's disable-crashpad and
+// disable-crash-reporter: in Electron they stop the crashpad handler and
+// its minidump upload to Slack. Clack has no crashpad and uploads nothing;
+// crash.log is a local file, imported redacted into clack.log at the next
+// start, so there's nothing for the switches to turn off. Honouring them
+// cost every run's crash evidence from 11-13 to 11-15.
+func captureCrashes(capture func(header string), sw []string, header string) string {
+	capture(header)
+	if slices.Contains(sw, slick.SwitchDisableCrashpad) || slices.Contains(sw, slick.SwitchDisableCrashReporter) {
+		return "slick: disable-crashpad/disable-crash-reporter kept for Chromium; Clack uploads no crash reports, so crash.log stays on"
+	}
+	return ""
 }

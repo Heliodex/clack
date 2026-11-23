@@ -9,9 +9,11 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/some-du6e/clack/internal/applog"
+	"github.com/some-du6e/clack/internal/logtag"
 	"github.com/some-du6e/clack/internal/richtext"
 	"github.com/some-du6e/clack/internal/slack"
 	"github.com/some-du6e/clack/internal/store"
@@ -20,16 +22,25 @@ import (
 // App wires the Slack client, the store and the realtime connection.
 // All methods are safe for concurrent use.
 type App struct {
-	C   *slack.Client
-	S   *store.Store
-	RTM *slack.RTM
+	// botProfileTeams: bot id -> its messages' bot_profile.team_id (botHomeTeam)
+	botProfileTeams sync.Map
+	C               *slack.Client
+	S               *store.Store
+	RTM             *slack.RTM
 
 	usersAsked usersAsked // ids users/info was asked for (lazy_users.go)
+	usersOut   usersOut   // the members users/info has out (members.go)
+
+	fetchedHook atomic.Pointer[func(ch string, tss []string)] // told of the messages fetches by id brought (read_changes.go)
 
 	prio      prioState  // the VIP unreads section's open conversation (prefs_a.go)
 	topMem    topMembers // the channels' first members (membershipOrdered, code_card.go)
 	acs       acState    // the composer autocomplete's frecency, model and history (autocomplete.go)
 	ready     chan struct{}
+	warm      warmState     // the warm boot: boot data, DataReady, the header cache (warmboot.go)
+	recent    recentSnap    // RecentSnapshot's (snapshot_recent.go)
+	sbPeople  sidebarPeople // the sidebar's DM people at the last snapshot (members.go)
+	bdPeople  sidebarPeople // the unread IMs' partners the DM badges read (members.go readBadgePeople)
 	bootErr   error
 	mu        sync.Mutex
 	connected bool
@@ -39,6 +50,24 @@ type App struct {
 
 	subMu sync.Mutex
 	subs  map[*sub]struct{}
+	evSeq uint64 // the last event's EmitSeq (subMu)
+
+	// released: Release ran (perapp.go); the App is done
+	released atomic.Bool
+
+	docs docState // what message Docs read, as the last events left it (msg_refs.go)
+
+	thrUnread threadsMarkedUnread // ThreadsMarkedUnread (message_menu.go)
+	// the reply bars' unread thread activity per channel
+	// (channel_thread_activity.go), under chActMu
+	chActMu  sync.Mutex
+	chActs   map[string]*chActList
+	chActSeq uint64
+	chActGen uint64 // slow reconnects (threadActivityStale)
+
+	msgLog msgChanges // each message's latest change, for the views that keep copies of them (msg_changes.go)
+	// refetchQ is RefetchMessages' rounds (read_changes.go)
+	refetchQ refetchQueue
 
 	// prefsMu orders every change to the raw prefs: a change copies them,
 	// sets its keys and installs the copy, and two at once lost one of
@@ -47,8 +76,13 @@ type App struct {
 
 	presSeen     map[string]time.Time
 	presWaiters  []chan struct{}
+	presSubs     map[string]int // Slack's presence manager's counts (presence_subs.go)
+	presSubTimer *time.Timer
 	countsTimer  *time.Timer
+	countsReread bool           // refreshCounts' next read is the one after a merged answer (it doesn't ask again)
 	actBadges    map[string]int // client.counts activity_v2 (activity_badges.go)
+	actBadgesAt  uint64         // the store journal's position at their last change (setActivityBadgesSince)
+	classic      classicBadges  // channel_badges and the alerts' counts (classic_badges.go)
 	savedOverdue int            // saved.list counts.uncompleted_overdue_count (app_badge.go)
 	cmdCache     []slack.Command
 	cmdAt        time.Time
@@ -59,11 +93,24 @@ type App struct {
 	streams openStreams // chat streams seen in progress (events.go emitStreamDone)
 
 	saves sync.WaitGroup // background disk saves (loadEmoji's meta.json)
+	side  sideReads      // History's side reads (history_side.go)
 
 	// bg scopes all background work (realtime, prefetch, resolvers); it is
 	// cancelled when the session ends.
 	bg     context.Context
 	stopBG context.CancelFunc
+	// the activity events' work, off the event pump (activity_later.go)
+	actLaterMu sync.Mutex
+	actLaterQ  []func(context.Context)
+	actLaterOn bool
+	// the other socket events' lookups, off the event pump (pump_later.go)
+	pumpQ laterQueue
+	// convQs order the events held for their conversation's lookup, one
+	// queue per conversation, and convHold counts them (pump_later.go
+	// holdForConv)
+	convHoldMu sync.Mutex
+	convQs     map[string]*laterQueue
+	convHold   map[string]int
 
 	pending   map[string]*pendingSend // client_msg_id -> optimistic send
 	fileEvs   *fileEvents             // file_created seen / awaited (upload_send.go)
@@ -91,6 +138,7 @@ type App struct {
 	secCol     sectionCollapseState // the channel_sections collapse write's debounce (section_collapse.go)
 	drafts     draftCache           // the viewer's server drafts (drafts.go), memory only
 	dnd        dndState             // the viewer's Do Not Disturb (dnd.go)
+	mdnd       memberDNDState       // other members' Do Not Disturb (dnd_members.go)
 	mega       megaphoneState       // megaphone spaces, global and per channel (megaphone.go)
 	ssugg      searchSuggState      // the window's last search's filter suggestions (search_suggest.go)
 	selected   string               // the open conversation (SetSelected, preview.go)
@@ -120,6 +168,10 @@ type App struct {
 	pollSeen  map[string]string  // conversation -> counts latest|updated at the last poll
 	watchCh   string             // conversation last opened (History), refreshed every poll
 	watchTh   []watchedThread    // threads last opened (Replies), newest first
+	// msgThread is the thread_ts of messages looked up by ts ("ch/ts" to
+	// the message's thread_ts, "" for none): jumpToMessage's lookups and a
+	// reply's ts a thread was fetched with (reply_thread.go)
+	msgThread map[string]string
 	// accessed: when each conversation ("ch/thread_ts" for a thread) was
 	// last read, and loaded when its newest page was last fetched, for
 	// Slack's message cache budget (evict.go)
@@ -127,11 +179,21 @@ type App struct {
 
 	// tempMuteTimer is kickOffTempMuteTimer's timer (temp_mute.go).
 	tempMuteTimer *time.Timer
+
+	// memberMC is each conversation's last users/counts answer whole;
+	// memberStale the counts a join or a leave made stale and countThr
+	// their refetch throttles (membership_counts.go)
+	memberMC    map[string]MemberCounts
+	memberStale map[string]bool
+	countThr    map[string]*countThrottle
 }
 
 type watchedThread struct {
 	ch, ts string
 	at     time.Time
+	// first and last: the replies its pane has on screen (NoteThreadView),
+	// what a poll reads again
+	first, last string
 }
 
 type call struct {
@@ -142,13 +204,15 @@ type call struct {
 // New builds the service. Call Boot before using it.
 func New(c *slack.Client, s *store.Store) *App {
 	a := &App{C: c, S: s, ready: make(chan struct{}), inflight: map[string]*call{}, subs: map[*sub]struct{}{},
-		presSeen: map[string]time.Time{}, files: newFileCache(fileCacheBytes), pending: map[string]*pendingSend{},
+		presSeen: map[string]time.Time{}, presSubs: map[string]int{}, files: newFileCache(fileCacheBytes), pending: map[string]*pendingSend{},
 		saved: map[string]bool{}, starred: map[string]bool{}, memberN: map[string]int{}, memberG: map[string]int{}, memberA: map[string]int{}}
 	if s.SelfID() == "" {
 		s.Lock()
 		s.Self.ID = c.Creds.UserID
 		s.Unlock()
 	}
+	a.warm.dataReady, a.warm.done = make(chan struct{}), make(chan struct{})
+	a.warm.restReady = make(chan struct{})
 	a.bg, a.stopBG = context.WithCancel(context.Background())
 	c.OnAuthFailed(a.onAuthFailed)
 	a.RTM = c.NewRTM()
@@ -156,18 +220,36 @@ func New(c *slack.Client, s *store.Store) *App {
 		a.mu.Lock()
 		a.connected = up
 		a.mu.Unlock()
-		a.emit(Event{Type: "connection", Connected: up})
+		// Merging msg-latency: its OnState block (socketConnected(fast)
+		// and firstUp before the emit, socketDown on a drop) replaces this
+		// emit; keep its block and give its emit Fast: up &&
+		// a.RTM.LastConnectFast(). Without Fast every reconnect reloads
+		// the Threads view (TestThreadsFastReconnectLikeSlack); without
+		// its block slow connects miss its catch-up.
+		if up && !a.RTM.LastConnectFast() {
+			// Slack's onConnected "Resetting reachedEnd": every window's
+			// end goes stale before the lists hear of the connection, and
+			// the open one is read forward from it (reached_end.go)
+			a.resetReachedEnd()
+			a.threadActivityStale() // the reply bars' lists are fetched again (channel_thread_activity.go)
+		}
+		a.emit(Event{Type: "connection", Connected: up, Fast: up && a.RTM.LastConnectFast()})
 		a.codeChannelsConnection(up) // the stale code channel closer's timers (codechannel_close.go)
 		if up {
 			a.socketConnected(a.RTM.LastConnectFast()) // the refetchers' slow reconnects (channel_pins.go)
-			go a.refreshCounts(a.bg)
+			go a.refreshCountsAfterGap(a.bg)           // what the socket missed (codechannel_close.go)
 		}
 	}
 	a.RTM.OnHello = a.onHello
+	a.RTM.OnDrop = a.onDroppedEvent // a dropped message's ts still goes into maxTs (maxts_heard.go)
 	s.SetMembersOnline(a.membersOnline)
 	appsByStore.Store(s, a)
 	store.ExperimentGroup = experimentForStore
 	a.followEmojiSet() // the defaults' set until the account's groups are in
+	// what of the prefs conversions read as they start; every install
+	// after notes what it moved, and the next prefs event converts again
+	// what reads it (msg_refs.go)
+	a.docs.prefs, a.docs.docPrefs = a.namePrefsKey(), a.docPrefsKey()
 	return a
 }
 
@@ -214,6 +296,7 @@ func (a *App) Realtime() bool {
 }
 
 func (a *App) startRealtime() {
+	a.ClientOnline() // starts the watcher that reconnects on wake and network changes (online.go)
 	a.rtMu.Lock()
 	defer a.rtMu.Unlock()
 	if !a.rtWant || !a.rtBooted || a.rtStop != nil || a.bg.Err() != nil {
@@ -234,7 +317,7 @@ func (a *App) startRealtime() {
 			a.emit(Event{Type: "connection", Connected: false})
 		}
 		a.rtMu.Lock()
-		if a.rtDone == done { // gave up or the session ended: allow a restart
+		if a.rtDone == done { // the session ended: allow a restart
 			a.rtStop, a.rtDone = nil, nil
 		}
 		a.rtMu.Unlock()
@@ -293,7 +376,7 @@ const maxPollFetches = 6
 // conversation and of cached ones whose counts changed, and the threads
 // opened in the last 15 minutes; then tells the UI ("poll").
 func (a *App) pollOnce(ctx context.Context) {
-	a.refreshCounts(ctx)
+	a.refreshCountsAfterGap(ctx) // no socket: nothing was heard (codechannel_close.go)
 	if ctx.Err() != nil || a.C.SignedOut() {
 		return
 	}
@@ -328,15 +411,31 @@ func (a *App) pollOnce(ctx context.Context) {
 	}
 	for _, ch := range fetch {
 		if err := a.loadLatest(ctx, ch); err != nil {
-			log.Printf("poll: history %s: %v", ch, err)
+			log.Printf("poll: history %s: %v", logtag.ID(ch), err)
 		}
 	}
 	for _, t := range threads {
-		if err := a.fetchThread(ctx, t.ch, t.ts); err != nil {
-			log.Printf("poll: thread %s: %v", t.ch, err)
+		if err := a.pollThread(ctx, t.ch, t.ts, t.first, t.last); err != nil { // its pane's rows, the page past its end (thread_pages.go)
+			log.Printf("poll: thread %s %s: %v", logtag.ID(t.ch), logtag.ID(t.ts), err)
 		}
 	}
 	a.emit(Event{Type: "poll"})
+}
+
+// watching reports whether ch (or its thread threadTS) is what the UI
+// opened last (watch): the conversation on screen.
+func (a *App) watching(ch, threadTS string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if threadTS == "" {
+		return ch != "" && ch == a.watchCh
+	}
+	for _, t := range a.watchTh {
+		if t.ch == ch && t.ts == threadTS {
+			return true
+		}
+	}
+	return false
 }
 
 // watch remembers what the UI opened, for pollOnce.
@@ -349,7 +448,24 @@ func (a *App) watch(ch, threadTS string) {
 	}
 	th := []watchedThread{{ch: ch, ts: threadTS, at: time.Now()}}
 	for _, t := range a.watchTh {
-		if (t.ch != ch || t.ts != threadTS) && len(th) < 2 {
+		switch {
+		case t.ch == ch && t.ts == threadTS:
+			th[0].first, th[0].last = t.first, t.last // its pane's rows, as noted
+		case len(th) < 2:
+			th = append(th, t)
+		}
+	}
+	a.watchTh = th
+}
+
+// unwatch stops watching thread ch/threadTS: a reply's ts, whose
+// parent's thread is the one opened (reply_thread.go).
+func (a *App) unwatch(ch, threadTS string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	th := a.watchTh[:0]
+	for _, t := range a.watchTh {
+		if t.ch != ch || t.ts != threadTS {
 			th = append(th, t)
 		}
 	}
@@ -362,6 +478,9 @@ func (a *App) watch(ch, threadTS string) {
 func (a *App) onAuthFailed(code string) {
 	log.Printf("core: session ended (%s); stopping all Slack traffic", code)
 	a.stopBG()
+	// the warm boot's files only serve this session's next start (and
+	// SaveWarm writes nothing once the session ended)
+	a.S.RemoveWarmFiles()
 	a.mu.Lock()
 	if a.countsTimer != nil {
 		a.countsTimer.Stop()
@@ -375,8 +494,10 @@ func (a *App) onAuthFailed(code string) {
 // timers). The App must not be used afterwards. For tests and benchmarks
 // that start many sessions in one process; the UI simply exits.
 func (a *App) Shutdown() {
+	defer a.side.wait() // History's side reads, which the stop below cancels
 	a.StopTraffic()
-	a.saves.Wait() // a metadata save still writing (loadEmoji)
+	a.saves.Wait()   // a metadata save still writing (loadEmoji)
+	a.warm.wg.Wait() // the warm boot's files, if they were writing
 }
 
 // StopTraffic is Shutdown without waiting for background disk saves (the
@@ -414,23 +535,68 @@ const SubscriberBuffer = 1024
 func (a *App) Subscribe() (<-chan Event, func()) {
 	s := &sub{ch: make(chan Event, SubscriberBuffer)}
 	a.subMu.Lock()
+	if a.released.Load() { // Release closed the others: nothing would close it
+		a.subMu.Unlock()
+		close(s.ch)
+		return s.ch, func() {}
+	}
 	a.subs[s] = struct{}{}
 	a.subMu.Unlock()
 	var once sync.Once
 	return s.ch, func() {
 		once.Do(func() {
 			a.subMu.Lock()
+			_, live := a.subs[s] // Release closed it, if not
 			delete(a.subs, s)
 			a.subMu.Unlock()
-			close(s.ch)
+			if live {
+				close(s.ch)
+			}
 		})
 	}
 }
 
-func (a *App) emit(ev Event) {
+// EmitSeq is the EmitSeq of the last event emitted so far: the last one
+// that went out (emitIf numbers an event once its check has passed, so a
+// refused one takes no number). A load's need is this, read when the load
+// returns: the mirror always reaches it, as every number up to it went
+// out (to a subscriber that fell behind as a resync, which claims what was
+// emitted before it).
+func (a *App) EmitSeq() uint64 {
+	a.subMu.Lock()
+	defer a.subMu.Unlock()
+	return a.evSeq
+}
+
+// emit sends ev to every subscriber and returns it as they get it (with
+// its EmitSeq, and a message change's Seq).
+func (a *App) emit(ev Event) Event {
+	ev, _ = a.emitIf(ev, nil)
+	return ev
+}
+
+// emitIf is emit when ok, asked under the subscribers' lock (nil: always),
+// so no event emitted after the check goes out before ev; it reports
+// whether ev went out (read_changes.go announceHeld), and returns it as
+// the subscribers got it. A refused event takes no EmitSeq: numbered
+// before its check, it left App.EmitSeq past every event sent, a need no
+// event the mirror handles could meet.
+func (a *App) emitIf(ev Event, ok func() bool) (Event, bool) {
+	a.noteDocChange(&ev) // what ev changed of what message Docs read (msg_refs.go)
+	if !snapshotQuietEvents[ev.Type] {
+		a.InvalidateSnapshot() // snapshot_recent.go
+	}
 	a.pinsTabSee(ev) // the Pins tab's message copies (channel_pins.go)
 	a.subMu.Lock()
 	defer a.subMu.Unlock()
+	if ok != nil && !ok() {
+		return ev, false
+	}
+	a.noteMsgChange(&ev) // stamps ev.Seq, in the subscribers' order (msg_changes.go)
+	// numbered under the lock that orders the sends, once it goes out:
+	// every subscriber gets the events in EmitSeq order
+	a.evSeq++
+	ev.EmitSeq = a.evSeq
 	for s := range a.subs {
 		if s.lagged {
 			select {
@@ -446,6 +612,7 @@ func (a *App) emit(ev Event) {
 			s.lagged = true
 		}
 	}
+	return ev, true
 }
 
 // once deduplicates concurrent identical fetches (e.g. prefetch + open).
@@ -473,31 +640,89 @@ func (a *App) once(key string, f func() error) error {
 // realtime connection and background prefetch. It logs timings only.
 func (a *App) Boot(ctx context.Context) error {
 	defer close(a.ready)
+	defer a.markDataReady() // a cold start's data is in (or Boot failed: what core holds is all there is)
 	t0 := time.Now()
 	// meta.json (the user directory, 65k emoji, usergroups) decodes
-	// alongside the calls instead of before them; the steps that depend
-	// on it wait for cacheDone.
-	cacheDone := make(chan struct{})
+	// alongside the calls instead of before them, in two parts
+	// (store.LoadCacheBase): what the first frame reads (the users, prefs,
+	// names, bots, experiments; cacheBase), then the custom emoji and the
+	// user groups (cacheDone), after the window's first real frame when
+	// the UI asked for that (DeferCacheRest), as Slack loads custom emoji
+	// after its first render. The steps that depend on it wait for the
+	// part they read.
+	cacheBase, cacheDone := make(chan struct{}), make(chan struct{})
 	var tCache time.Duration
 	go func() {
 		s := time.Now()
-		a.S.LoadCache()
-		a.installCachedExperiments() // Slack's persisted experiments store (experiments.go)
+		store.SetCacheLoadLog(func(line string) { applog.Debugf("%s", line) })
+		rest := a.S.LoadCacheBase()
+		a.notePrefsInstalled()           // the cached prefs (msg_refs.go)
+		a.installCachedExperiments()     // Slack's persisted experiments store (experiments.go)
+		a.installCachedEnterprisePrefs() // Slack's persisted enterprisePrefs store (enterprise_prefs.go)
+		a.installCachedFeatures()        // Slack's persisted featureAccess store, then its blocking boot read (chposting.go)
+		a.startFeatures()
+		a.loadCodeChannelState() // the closed code channels, before the first sidebar (codechannel_close.go)
 		tCache = time.Since(s)
+		close(cacheBase)
+		// The unknown member fetcher and the channel and bot name resolver
+		// start once the persisted store is in, as Slack's first lookup
+		// comes only after it loaded (renderApp waits for dataSetupStore).
+		// Started before, an early bot answer was replaced by meta.json's
+		// bots (and never asked for again: noteMissing records a bot once
+		// a session), and members meta.json holds were asked for. What
+		// lookups missed until now waits in the store's queues. From here
+		// they run from the first lookup, as Slack's UnknownFetchManagers
+		// do (client-boot 0mwJ, made in DOS4 H for members: isEnabled is on
+		// everywhere but Slack's own test runners), not once every call
+		// below has answered: a warm start draws the restored conversation
+		// from the boot data while they're out, and a DM's partner the
+		// metadata cache doesn't hold stayed BaseMissingMember's bar until
+		// boot's last call (a slow users.conversations, a rate-limited
+		// step), or for good when boot failed.
+		go a.resolveLoop(a.bg) // unresolved channel/bot names
+		go a.memberLoop(a.bg)  // members lookups missed (members.go)
+		// the custom emoji and the user groups: after the window's first real
+		// frame when the UI asked (waitCacheRest), then the steps reading
+		// them (the emoji step) go on
+		if rest != nil {
+			a.waitCacheRest(ctx)
+			rest()
+		}
 		close(cacheDone)
 	}()
+	// The warm boot: boot_data.json and headers.json load alongside, and
+	// once meta.json's first part is in too (the users, prefs and names:
+	// LoadCacheBase) the cached sidebar is installed and DataReady closes,
+	// long before the calls below answer (warmboot.go).
+	go a.loadWarm(cacheBase)
 	var (
 		wg       sync.WaitGroup
 		tmu      sync.Mutex
 		timings  []string
 		convs    []slack.Conversation
-		counts   *slack.Counts
 		sections []slack.Section
-		dms      []slack.SidebarDM
-		errDMs   error
 		errConvs error
-		errSecs  error
+		raced    struct {
+			sync.Mutex
+			counts, sections bool
+		}
 	)
+	// Each sidebar answer is installed when it comes, as Slack dispatches
+	// every boot API's answer into its store on arrival, after the boot
+	// data (a warm start's disk reads are far quicker than the calls), and
+	// merged with what this session changed after the calls went out. The
+	// window is usable from the boot data meanwhile, so a mark, a leave, a
+	// DM opened or closed or a section move made then is newer than the
+	// answer that lands after it, and it stays (store/journal.go). On a
+	// warm start each install is announced, so the UI follows it the way
+	// Slack's components re-render on each dispatch.
+	since := a.S.Seq()
+	installed := func(ev string) {
+		if a.Warm() {
+			a.emit(Event{Type: ev})
+		}
+	}
+	countsIn := make(chan struct{}) // client.counts installed (or failed): sidebar.dms' reopen marks read it
 	step := func(name string, f func() error) {
 		wg.Add(1)
 		go func() {
@@ -515,31 +740,64 @@ func (a *App) Boot(ctx context.Context) error {
 		}()
 	}
 	var tDMUsers time.Duration
+	dmsAnswered := make(chan struct{}) // sidebar.dms answered (or failed), before its install waits for the counts
+	var dmsOpen map[string]bool        // its open flags (nil: it failed)
 	step("conversations", func() error {
 		convs, errConvs = a.C.Conversations(ctx)
 		if errConvs != nil {
 			return errConvs
 		}
-		// the DM rows' people, straight away (not after every other step)
-		ids := []string{a.C.Creds.UserID}
-		for _, c := range convs {
-			if c.IsIM {
-				ids = append(ids, c.User)
-			}
+		<-a.warm.done
+		a.installConvs(convs, since)
+		installed("sidebar_changed")
+		// the DM rows' people, straight away (not after every other step):
+		// the sidebar's DMs, not every DM users.conversations lists (closed
+		// ones aren't rows; their partners are read when something draws
+		// them: members.go). A warm start knows which are open from the
+		// boot data at once; a cold start waits for sidebar.dms' answer,
+		// not for client.counts its install waits on (bootDMPeople).
+		open := map[string]bool(nil) // core's own (dmOpen)
+		if !a.SidebarDMsKnown() {
+			<-dmsAnswered
+			open = dmsOpen // nil when it failed: every DM is a row then
 		}
-		<-cacheDone
+		ids := a.bootDMPeople(convs, open)
+		<-cacheBase // the cached users
 		tu := time.Now()
 		a.EnsureUsers(ctx, ids)
 		tDMUsers = time.Since(tu)
 		return nil
 	})
-	step("counts", func() (err error) {
-		counts, err = a.C.Counts(ctx)
-		return err
+	step("counts", func() error {
+		defer close(countsIn)
+		c, err := a.C.Counts(ctx)
+		if err != nil {
+			return err
+		}
+		<-a.warm.done
+		if a.installCounts(c, since) {
+			raced.Lock()
+			raced.counts = true
+			raced.Unlock()
+		}
+		installed("counts")
+		return nil
 	})
-	step("sections", func() (err error) {
-		sections, errSecs = a.C.SectionsAll(ctx)
-		return errSecs
+	step("sections", func() error {
+		secs, err := a.C.SectionsAll(ctx)
+		if err != nil {
+			return err // a failed call keeps the boot data's sections
+		}
+		sections = secs
+		<-a.warm.done
+		if a.S.SetSectionsSince(secs, since) {
+			installed("sidebar_changed")
+		} else { // a section write since is newer
+			raced.Lock()
+			raced.sections = true
+			raced.Unlock()
+		}
+		return nil
 	})
 	step("experiments", func() error { // every experiment check (experiments.go)
 		g, err := a.C.ExperimentAssignments(ctx)
@@ -549,8 +807,24 @@ func (a *App) Boot(ctx context.Context) error {
 		return err
 	})
 	step("sidebar.dms", func() error { // which DMs are open (users.conversations has no is_open)
-		dms, errDMs = a.C.SidebarDMs(ctx)
-		return errDMs
+		dms, err := a.C.SidebarDMs(ctx)
+		if err == nil {
+			dmsOpen = make(map[string]bool, len(dms))
+			for _, d := range dms {
+				if d.IsOpen {
+					dmsOpen[d.ID] = true
+				}
+			}
+		}
+		close(dmsAnswered) // the DM rows' people don't wait for the counts below
+		<-countsIn         // closed DMs reopen on messages newer than now (reopenMark reads the counts)
+		if err != nil {
+			return err // a failed call keeps the boot data's
+		}
+		<-a.warm.done
+		a.setSidebarDMsSince(dms, since)
+		installed("sidebar_changed")
+		return nil
 	})
 	loadPrefs := func() error {
 		raw, err := a.C.Prefs(ctx)
@@ -558,7 +832,9 @@ func (a *App) Boot(ctx context.Context) error {
 			a.installPrefs(raw)
 			// set_tz_automatically keeps tz in step (timezone.go)
 			go func() { _, _ = a.MaybeUpdateTimezone(a.bg) }()
-			if a.S.HasCachedPrefs() { // the first frame drew the cached copy
+			// the first frame drew the cached copy; or, without one, what
+			// was converted before this install read the defaults
+			if a.S.HasCachedPrefs() || a.prefsMoved() {
 				p := a.Prefs()
 				a.emit(Event{Type: "prefs", Prefs: &p})
 			}
@@ -602,7 +878,7 @@ func (a *App) Boot(ctx context.Context) error {
 	// self, then the rail's workspace icon (which on Grid depends on the
 	// viewer's workspaces): in the batch, so the icon doesn't change later
 	step("self", func() error {
-		<-cacheDone
+		<-cacheBase // the cached users
 		a.EnsureUsers(ctx, []string{a.C.Creds.UserID})
 		a.refreshTeamIcon(ctx)
 		return nil
@@ -613,7 +889,7 @@ func (a *App) Boot(ctx context.Context) error {
 	// messages draw them as images from their first frame.
 	step("emoji", func() error {
 		<-cacheDone
-		if a.S.CustomEmoji.Len() == 0 {
+		if a.S.CustomEmoji.Len() == 0 || a.S.EmojiPartial() { // none, or the boot data's few only
 			return a.loadEmoji(ctx)
 		}
 		if a.S.EmojiAge() > EmojiMaxAge {
@@ -625,23 +901,13 @@ func (a *App) Boot(ctx context.Context) error {
 	// client.extras: the message menu's Report to Slack (message_menu.go)
 	a.later(5*time.Second, func() { _ = a.LoadClientExtras(a.bg) })
 	wg.Wait()
+	<-a.warm.done
+	defer a.warmDone() // Boot's answers (or a failed Boot's store) replaced the boot data's sidebar
 	if errConvs != nil {
 		a.bootErr = errConvs
 		return errConvs
 	}
-	for _, c := range convs {
-		a.S.PutConv(c)
-	}
-	if counts != nil {
-		a.S.SetCounts(counts)
-		a.setActivityBadges(counts.ActivityV2)
-	}
-	if errDMs == nil {
-		a.setSidebarDMs(dms) // after counts: closed DMs reopen on messages newer than now
-	}
-	a.S.Lock()
-	a.S.Sections = sections
-	a.S.Unlock()
+	a.reconcileClosedCodeChannels(since) // the saved closed code channels against what boot fetched (codechannel_close.go)
 	if u, ok := a.S.User(a.C.Creds.UserID); ok {
 		a.S.Lock()
 		a.S.Self = *u
@@ -652,6 +918,17 @@ func (a *App) Boot(ctx context.Context) error {
 		time.Since(t0).Round(time.Millisecond), tCache.Round(time.Millisecond), strings.Join(timings, " "),
 		tDMUsers.Round(time.Millisecond), len(convs), len(sections), a.S.CustomEmoji.Len())
 	applog.Mark("core-ready", fmt.Sprintf("%d convs, %d sections", len(convs), len(sections)))
+	a.setBootOK() // what core holds is worth keeping for the next warm boot
+	// An answer that kept a change made here while it was out is older
+	// than Slack's state now: read that list once more, merged the same way.
+	raced.Lock()
+	if raced.counts {
+		a.refreshCountsSoon()
+	}
+	if raced.sections {
+		go a.refreshSections(a.bg)
+	}
+	raced.Unlock()
 	a.rtMu.Lock()
 	a.rtBooted = true
 	a.rtMu.Unlock()
@@ -661,8 +938,6 @@ func (a *App) Boot(ctx context.Context) error {
 	go a.codeChannelCloserLoop(a.bg) // code_channels_auto_close (codechannel_close.go)
 	go a.pump()
 	go a.prefetch(a.bg)
-	go a.resolveLoop(a.bg) // unresolved channel/bot names
-	go a.memberLoop(a.bg)  // members lookups missed (members.go)
 	go a.membersLoop(a.bg) // the members cache's pass (members.go)
 	if a.C.Creds.EnterpriseID != "" {
 		go func() { _ = a.LoadEnterprisePrefs(a.bg) }() // enterprise_prefs.go
@@ -672,9 +947,24 @@ func (a *App) Boot(ctx context.Context) error {
 	// recent searches and places (maybeLoadRecentsPrefs, search_recents.go)
 	go a.MaybeLoadRecents(a.bg)
 	// fetchedDeferredMessagingClientData's maybeFetchCollections (boot-
-	// render): the file collections, under custom_file_sections, so the
+	// render): the file collections, so the
 	// canvas and list headers' section buttons know them
 	go func() { _ = a.FetchFileCollections(a.bg) }()
+	// The warm boot's files from this session's fresh state, once
+	// startup's work is done, then with the metadata cache every 5
+	// minutes, and at Close.
+	a.warm.wg.Add(1) // Shutdown waits for it; Close doesn't (it saves itself)
+	go func() {
+		defer a.warm.wg.Done()
+		t := time.NewTimer(20 * time.Second)
+		defer t.Stop()
+		select {
+		case <-a.bg.Done():
+			return
+		case <-t.C:
+		}
+		a.SaveWarm()
+	}()
 	go func() {
 		t := time.NewTicker(5 * time.Minute)
 		defer t.Stop()
@@ -684,16 +974,23 @@ func (a *App) Boot(ctx context.Context) error {
 				return
 			case <-t.C:
 			}
+			a.SaveWarm()
 			_ = a.S.SaveCache()
 		}
 	}()
 	return nil
 }
 
-// Close saves the metadata cache (after any save still writing).
+// Close saves the warm boot's files and the metadata cache (after any
+// save still writing).
 func (a *App) Close() error {
+	a.side.wait() // History's side reads (StopTraffic, before it, cancelled them)
 	a.saves.Wait()
-	return a.S.SaveCache()
+	a.checkpointClosedCodeChannels() // the closed code channels' watermarks (codechannel_close.go)
+	a.SaveWarm()
+	err := a.S.SaveCache()
+	a.Release() // done for good: its process-wide state goes too (perapp.go)
+	return err
 }
 
 func (a *App) loadEmoji(ctx context.Context) error {
@@ -753,28 +1050,51 @@ func (a *App) loadUsergroups(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	a.S.SetUsergroups(gs)
+	if a.S.SetUsergroups(gs) {
+		// meta.json keeps them now, as loadEmoji's list: they load 5 s
+		// after boot, and only the 5 minute save or Quit's would write
+		// them (the Dock's Quit and a kill skip that)
+		a.saves.Add(1)
+		go func() {
+			defer a.saves.Done()
+			_ = a.S.SaveCache()
+		}()
+	}
 	// updateUserGroups: the viewer's groups (usergroups.membership), what
 	// a group mention's highlight follows (UserGroup fg3x isUserInGroup)
-	if mine, err := a.C.UsergroupMembership(ctx); err == nil {
-		a.S.SetMyUsergroups(mine)
-		a.emit(Event{Type: "names"}) // the visible messages re-read their mentions
+	if mine, err := a.C.UsergroupMembership(ctx); err == nil && a.S.SetMyUsergroups(mine) {
+		// the visible messages re-read their group mentions. Only when the
+		// viewer's groups moved: a names{} converts every loaded message
+		// again, and with no groups every Usergroups call (the composer's
+		// first "@", a directory search) loaded them again
+		a.emit(Event{Type: "names"})
 	}
 	return nil
 }
 
-// EnsureUsers fetches unknown users (edge cache, parallel batches of 100).
+// EnsureUsers fetches unknown users (edge cache, parallel batches of 100)
+// and returns once they're in. One another request has out (the unknown
+// member fetcher's, another EnsureUsers') isn't asked for again: this
+// waits for that answer (usersOut).
 func (a *App) EnsureUsers(ctx context.Context, ids []string) {
 	miss := a.S.MissingUsers(ids)
 	if len(miss) == 0 {
 		return
 	}
-	a.usersAsked.Add(int64(len(miss)))
-	us, err := a.C.UsersInfoParallel(ctx, miss)
-	if err != nil {
-		log.Printf("users/info: %v", err)
-	}
-	a.S.PutUsers(us)
+	ask, wait, done := a.usersOut.claim(miss)
+	func() {
+		defer a.usersOut.release(ask, done) // before the wait: two requests never wait on each other
+		if len(ask) == 0 {
+			return
+		}
+		a.usersAsked.Add(int64(len(ask)))
+		us, err := a.C.UsersInfoParallel(ctx, ask)
+		if err != nil {
+			log.Printf("users/info: %v", err)
+		}
+		a.S.PutUsers(us)
+	}()
+	waitUsers(ctx, wait)
 }
 
 // prefetch warms the history of unread conversations so opening them is
@@ -838,7 +1158,9 @@ func (a *App) loadLatest(ctx context.Context, ch string) error {
 // refetch a channel History loaded meanwhile, since its page (read from
 // Slack before a send's echo, say) would replace the newer cached one.
 func (a *App) loadLatestIfMissing(ctx context.Context, ch string) error {
-	return a.once("h:"+ch, func() error {
+	// onceCtx: a caller joining another's read waits only while its own
+	// ctx lasts (core's background readers end with the session)
+	return a.onceCtx(ctx, "h:"+ch, func() error {
 		if a.S.Timeline(ch) != nil {
 			return nil
 		}
@@ -851,14 +1173,23 @@ func (a *App) fetchLatest(ctx context.Context, ch string) error {
 	// message cache budget: Slack resets a quiet conversation's history
 	// only an hour after it was last used (evict.go)
 	a.noteLoaded(ch)
-	pins := a.S.PinSeq()
+	pins, subs, live, gen := a.S.PinSeq(), a.S.SubSeq(), a.S.LiveSeq(), a.S.EndGen()
 	p, err := a.C.History(ctx, ch, slack.HistoryOpts{Limit: 50})
 	if err != nil {
 		return err
 	}
-	// its people are asked for as rows draw them (lazy_users.go)
-	a.S.SetLatest(ch, p.Messages, p.HasMore)
+	// its people are asked for as rows draw them (lazy_users.go); the
+	// reactions the socket brought while the request was out stay, and a
+	// revision the store held another of reaches every copy and the views
+	// (store/read_revisions.go, read_changes.go)
+	// the viewer's sends the window holds and the page doesn't stay (one
+	// confirmed after the page was read, a pending or failed copy), and a
+	// slow connect while the page was out leaves the end stale
+	// (store/reached_end.go SetLatestReadAt)
+	a.S.SetLatestReadAt(ch, p.Messages, p.HasMore, live, gen, a.sendsIn(ch))
 	a.S.SyncPins(ch, pins, p.Messages) // a pin event newer than the answer (store/pins.go)
+	a.S.SyncSubs(ch, subs, p.Messages) // the roots' thread subscriptions (store/thread_subs.go)
+	a.announceReads()                  // after the pins and subscriptions: the copies as they are now
 	for i := range p.Messages {
 		if needsFileInfo(&p.Messages[i]) {
 			go a.fillFiles(ch, p.Messages[i].TS)
@@ -870,9 +1201,25 @@ func (a *App) fetchLatest(ctx context.Context, ch string) error {
 // ---- counts ----
 
 func (a *App) refreshCounts(ctx context.Context) {
+	since := a.S.Seq()
+	chSince := a.chActMark()
 	if c, err := a.C.Counts(ctx); err == nil {
-		a.S.SetCounts(c)
-		a.setActivityBadges(c.ActivityV2)
+		// a mark or message while it was out stays (store/journal.go); an
+		// answer merged with one is partly older than Slack is now, so the
+		// counts are read once more (not again after that read: a busy
+		// channel doesn't keep it asking)
+		merged := a.installCounts(c, since)
+		if c.Threads.UnreadCountByChannel != nil {
+			a.pruneThreadActivity(chSince) // a channel with no unread threads has no reply bar marks (channel_thread_activity.go)
+		}
+		a.readBadgePeople() // an IM the answer made unread: its member (members.go)
+		a.mu.Lock()
+		reread := merged && !a.countsReread
+		a.countsReread = reread
+		a.mu.Unlock()
+		if reread {
+			a.refreshCountsSoon()
+		}
 		a.emit(Event{Type: "counts"})
 		if a.reopenActive() { // a closed DM got a new message
 			a.emit(Event{Type: "sidebar_changed"})
@@ -930,9 +1277,13 @@ func (a *App) ThreadsState() ThreadsState {
 
 // ---- snapshot ----
 
-// Snapshot returns the sidebar state. It blocks until Boot finished.
+// Snapshot returns the sidebar state. It blocks until Boot finished, so
+// it is for goroutines: the UI goroutine reads the model its backend
+// applied, RecentSnapshot or SnapshotNow, which never wait. A wait longer
+// than bootWaitLog is logged with its caller (warmboot.go), so a path that
+// still waits on the UI goroutine names itself.
 func (a *App) Snapshot() Snapshot {
-	<-a.ready
+	a.waitBoot("Snapshot")
 	return a.snapshotNow()
 }
 
@@ -944,6 +1295,8 @@ func (a *App) SnapshotNow() Snapshot { return a.snapshotNow() }
 
 // snapshotNow is Snapshot from what the store holds now.
 func (a *App) snapshotNow() Snapshot {
+	a.recent.builds.Add(1)
+	seq := a.recent.seq.Add(1)
 	a.S.RLock()
 	cs := make([]*slack.Conversation, 0, len(a.S.Convs))
 	for _, c := range a.S.Convs {
@@ -956,14 +1309,12 @@ func (a *App) snapshotNow() Snapshot {
 	if c, ok := a.selectedExt(); ok { // a previewed channel's row (preview.go)
 		cs = append(cs, c)
 	}
+	// every DM's partner as the store holds it (getRawMemberById): no hit,
+	// nothing asked for. Only the DMs the sections list read theirs
+	// through getMemberById, below.
 	convs := make([]Conv, 0, len(cs))
-	ids := []string{selfID}
 	for _, c := range cs {
-		v := a.conv(c)
-		convs = append(convs, v)
-		if v.User != "" {
-			ids = append(ids, v.User)
-		}
+		convs = append(convs, a.convOf(c, false))
 	}
 	sort.Slice(convs, func(i, j int) bool { return convs[i].Name < convs[j].Name })
 	a.mu.Lock()
@@ -972,11 +1323,13 @@ func (a *App) snapshotNow() Snapshot {
 	self, _ := a.User(selfID)
 	secs, counts := a.sections(convs), a.Counts()
 	convs = sidebarFileConvs(convs, secs)
+	a.readBadgePeople() // getMemberById for the unread IMs the DM badges read (members.go)
+	users := a.sidebarUsers(convs, secs, selfID)
 	return Snapshot{
 		Self: self, Team: team, Convs: convs, Sections: secs, Counts: counts,
-		Threads: a.ThreadsState(), Users: a.users(ids), Connected: connected, Prefs: prefs,
+		Threads: a.ThreadsState(), Users: users, Connected: connected, Prefs: prefs,
 		EmojiCount: a.S.CustomEmoji.Len(), EnterpriseID: a.C.Creds.EnterpriseID, Rail: a.Rail(),
-		FilterNames: a.filterNames(convs, secs, counts),
+		FilterNames: a.filterNames(convs, secs, counts), Seq: seq,
 	}
 }
 
@@ -1016,9 +1369,10 @@ func sidebarFileConvs(convs []Conv, secs []Section) []Conv {
 	return out
 }
 
-// BootErr is the error Boot returned, if any.
+// BootErr is the error Boot returned, if any. It waits for Boot, like
+// Snapshot.
 func (a *App) BootErr() error {
-	<-a.ready
+	a.waitBoot("BootErr")
 	return a.bootErr
 }
 
@@ -1033,7 +1387,7 @@ func avatarURL(u *slack.User, size int, viewerTeam string) string {
 func (a *App) userOf(u *slack.User) User {
 	viewer := firstNonEmpty(a.C.Creds.Team, a.S.TeamID)
 	v := User{
-		ID: u.ID, Name: store.DisplayName(u), RealName: strings.TrimSpace(u.Profile.RealName), Handle: u.Name,
+		ID: u.ID, Name: store.DisplayName(u), RealName: strings.TrimSpace(firstNonEmpty(u.Profile.RealName, u.RealName)), Handle: u.Name,
 		DisplaySet: strings.TrimSpace(u.Profile.DisplayName) != "",
 		Avatar:     avatarURL(u, 72, viewer), Avatar192: avatarURL(u, 192, viewer), Avatar512: avatarURL(u, 512, viewer),
 		Title: u.Profile.Title, Pronouns: u.Profile.Pronouns, Email: u.Profile.Email, StatusText: u.Profile.StatusText,
@@ -1053,17 +1407,19 @@ func (a *App) userOf(u *slack.User) User {
 	if v.RealName == "​" {
 		v.RealName = ""
 	}
+	// the status emoji through its status_emoji_display_info entry (by
+	// emoji_name, not the list's first: status_emoji.go)
+	v.StatusEmojiInfo = parseStatusEmojiInfo(u.Profile.StatusEmojiDisplay)
 	if v.StatusEmoji != "" {
-		v.StatusEmojiURL, _, _ = a.S.Emoji(strings.Trim(v.StatusEmoji, ":"))
-		if len(u.Profile.StatusEmojiDisplay) > 2 {
-			var di []struct {
-				DisplayURL string `json:"display_url"`
-			}
-			if json.Unmarshal(u.Profile.StatusEmojiDisplay, &di) == nil && len(di) > 0 && di[0].DisplayURL != "" {
-				v.StatusEmojiURL = di[0].DisplayURL
-			}
+		// StatusEmoji stays the profile's own code; the picture is the
+		// display form's (a display_alias, a custom display_url)
+		code, pic := EmojiDisplayInfo(v.StatusEmoji, v.StatusEmojiInfo)
+		if pic == "" {
+			pic, _, _ = a.S.Emoji(strings.Trim(code, ":"))
 		}
+		v.StatusEmojiURL = pic
 	}
+	v.DND = a.MemberInDND(u.ID, time.Now())
 	a.S.RLock()
 	v.Presence = a.S.Presence[u.ID]
 	a.S.RUnlock()
@@ -1112,6 +1468,17 @@ func (a *App) User(id string) (User, bool) {
 	return a.userOf(u), true
 }
 
+// RawUser is User as getRawMemberById reads it: the member if the store
+// holds it, with no hit recorded and nothing asked for. For logic over
+// people nothing draws (a closed DM's partner in a list of every DM).
+func (a *App) RawUser(id string) (User, bool) {
+	u, ok := a.S.RawUser(id)
+	if !ok {
+		return User{}, false
+	}
+	return a.userOf(u), true
+}
+
 // MemberAvatar is getProfileImageForMember: member id's picture for a
 // size px slot ("" while the member isn't known: the lookup asks for it,
 // and "names" follows).
@@ -1151,13 +1518,25 @@ func (a *App) users(ids []string) map[string]User {
 // Users returns the known users among ids.
 func (a *App) Users(ids []string) map[string]User { return a.users(ids) }
 
-func (a *App) conv(c *slack.Conversation) Conv {
+func (a *App) conv(c *slack.Conversation) Conv { return a.convOf(c, true) }
+
+// convOf is conv. With lookup false an IM's partner is read as the store
+// holds it (getRawMemberById: no hit, a miss asks for nothing), as the
+// sidebar's snapshot reads the DMs it doesn't list.
+func (a *App) convOf(c *slack.Conversation, lookup bool) Conv {
 	v := Conv{ID: c.ID, Name: c.Name, User: c.User, NumMembers: c.NumMembers, IsArchived: c.IsArchived,
 		IsGeneral: c.IsGeneral, IsShared: c.IsExtShared, Created: c.Created, Creator: c.Creator, Priority: c.Priority}
 	switch {
 	case c.IsIM:
 		v.Kind = "im"
-		v.Name = a.S.UserName(c.User)
+		if lookup {
+			v.Name = a.S.UserName(c.User)
+		} else {
+			v.Name = a.rawUserName(c.User)
+		}
+		u, _ := a.S.RawUser(c.User)
+		v.NoDMsBadge, v.NoDMsCount = dmBadgeSkips(c.User, u) // rail.go
+		v.BotDM = isBotDM(c.User, u)
 	case c.IsMPIM:
 		v.Kind = "mpim"
 		v.Members = c.Members
@@ -1248,7 +1627,12 @@ var systemSubtypes = map[string]bool{
 }
 
 // message converts a Slack message for the UI.
-func (a *App) message(ch string, m *slack.Message) Message {
+func (a *App) message(ch string, m *slack.Message) Message { return a.messageWith(ch, m, false) }
+
+// messageWith is message; with peek its member reads don't count as a
+// view's (StoredMessage: a message converted again because a name in it
+// changed, not because anything draws it).
+func (a *App) messageWith(ch string, m *slack.Message, peek bool) Message {
 	v := Message{
 		TS: m.TS, Channel: firstNonEmpty(ch, m.Channel), User: m.User, BotID: m.BotID, Subtype: m.Subtype, Text: m.Text,
 		Edited: m.Edited != nil, ThreadTS: m.ThreadTS, ReplyCount: m.ReplyCount, ReplyUsers: m.ReplyUsers,
@@ -1256,16 +1640,21 @@ func (a *App) message(ch string, m *slack.Message) Message {
 		Broadcast: m.Subtype == "thread_broadcast" || m.ReplyBroadcast, System: systemSubtypes[m.Subtype],
 		Tombstone: m.Subtype == "tombstone",
 	}
+	v.NewerReplies = a.newerReplies(ch, m) // broadcast_footer.go
 	if m.Edited != nil {
 		v.EditedTS, v.EditedBy = m.Edited.TS, m.Edited.User
 	}
 	v.Inviter, v.Topic, v.Purpose, v.OldName, v.NewName = m.Inviter, m.Topic, m.Purpose, m.OldName, m.NewName
 	v.ReplyUserIcons = m.ReplyUserIcons
+	v.NoteFiles, v.Upload = a.noteFiles(m, false), m.Upload // note_files.go
 	v.ClientMsgID = m.ClientMsgID
 	v.Blocks, v.Attachments, v.Metadata = m.Blocks, m.RawAttachments, m.Metadata
 	v.StreamingState = m.StreamingState
 	v.WorkflowID, v.TriggerID = m.WorkflowID, m.TriggerID
 	v.AgentSession, v.AssistantThread = m.AgentSession, m.AssistantAppThread
+	if c := m.AIContext; c != nil && c.ResultStatus == "stopped_by_user" { // vshb getMessageLabelValues
+		v.Stopped, v.StoppedBy = true, c.StoppedByUserID
+	}
 	v.FunctionExecutionID = m.FunctionExecutionID
 	v.Locked, v.LockedByTeam = m.IsLocked, m.LockedByTeamID
 	if dc := m.DocumentComment; dc != nil {
@@ -1273,20 +1662,37 @@ func (a *App) message(ch string, m *slack.Message) Message {
 		c.Authors = append([]string(nil), dc.Authors...)
 		v.DocumentComment = &c
 	}
+	if dm := m.DocumentMention; dm != nil {
+		c := *dm
+		c.MentioningUserIDs = append([]string(nil), dm.MentioningUserIDs...)
+		v.DocumentMention = &c
+		if dm.FileID != "" {
+			// maybePrefetchCanvasFromNotification (boot-render): the
+			// mention's canvas is asked for (files.info), so a jump to the
+			// mention opens it and Activity names it (canvas_channel.go)
+			a.S.CanvasRef(dm.FileID)
+		}
+	}
 	if v.Attachments == nil && len(m.Attachments) > 0 { // built in memory (not decoded from Slack)
 		v.Attachments, _ = json.Marshal(m.Attachments)
 	}
 	if bp := m.BotProfile; bp != nil {
+		a.noteBotProfileTeam(bp.ID, bp.TeamID)
 		v.BotProfile = &BotProfile{ID: bp.ID, Name: bp.Name, AppID: bp.AppID, UserID: bp.UserID, TeamID: bp.TeamID,
-			Icon: firstNonEmpty(bp.Icons.Image72, bp.Icons.Image48, bp.Icons.Image36), Deleted: bp.Deleted}
+			Icon: firstNonEmpty(bp.Icons.Image72, bp.Icons.Image48, bp.Icons.Image36), Deleted: bp.Deleted, Workflow: bp.IsWorkflowBot}
 	}
 	v.Pending, v.Failed = a.pendingState(m)
+	v.Ephemeral = m.IsEphemeral
+	v.NoDisplay, v.NoNotifications = m.NoDisplay, m.NoNotifications
 	if m.PinnedInfo != nil {
 		// getMessagePinnedInfo (client-boot): the label's pinnedBy is pinned_info.pinned_by
 		v.PinnedBy = m.PinnedInfo.PinnedBy
 		v.Pinned = true
 	}
-	v.FollowingThread, v.ThreadLastRead, v.ReplyUsersN = m.Subscribed, m.LastRead, m.ReplyUsersN
+	// the thread's subscription, whichever copy of the root this is
+	// (store/thread_subs.go: Slack's threadSub before the root's own)
+	sub := a.S.ThreadSubOf(v.Channel, m)
+	v.FollowingThread, v.ThreadLastRead, v.ReplyUsersN = sub.Subscribed, sub.LastRead, m.ReplyUsersN
 	a.mu.Lock()
 	v.Saved = a.saved[v.Channel+"/"+m.TS]
 	a.mu.Unlock()
@@ -1305,7 +1711,19 @@ func (a *App) message(ch string, m *slack.Message) Message {
 		v.Reactions = append(v.Reactions, rv)
 	}
 	v.Reactions = a.overlayReactions(ch, m.TS, v.Reactions)
-	v.Doc = richtext.FromMessageIn(msgNames{a.S}, m, ch) // mentions ask as they draw (lazy_users.go); in ch, a slug to one of ch's tabs is the tab alone
+	// mentions ask as they draw (lazy_users.go); in ch, a slug to one of
+	// ch's tabs is the tab alone; Refs: what it read (msg_refs.go)
+	rn := refNames{msgNames: msgNames{a.S}, app: a, peek: peek}
+	v.Doc = richtext.FromMessageIn(&rn, m, ch)
+	v.Refs = rn.refs
+	// what senderOf and the reactions read besides: the sending bot's
+	// name, the reactions' emoji
+	if m.User == "" && m.BotID != "" {
+		addRef(&v.Refs.Bots, m.BotID)
+	}
+	for _, re := range m.Reactions {
+		addRef(&v.Refs.Emoji, re.Name)
+	}
 	return v
 }
 
@@ -1342,6 +1760,10 @@ func (a *App) Mrkdwn(text string) []richtext.Block { return richtext.FromMrkdwn(
 
 // Emoji resolves an emoji name (custom or standard) to an image URL.
 func (a *App) Emoji(name string) (url, text string, ok bool) { return a.S.Emoji(name) }
+
+// EmojiVersion changes whenever the custom emoji map does (emoji.list,
+// emoji_changed): a surface that converted emoji earlier converts again.
+func (a *App) EmojiVersion() uint64 { return a.S.CustomEmoji.Version() }
 
 // CustomEmoji returns the workspace's custom emoji: name -> URL or
 // "alias:other". The map must not be modified.
@@ -1735,7 +2157,9 @@ func (a *App) isAppDM(ch string) bool {
 	case "USLACKBOT", "USLACK":
 		return true
 	}
-	u, ok := a.S.User(c.User)
+	// raw: lJBI decides from imAndMpimMembers, which the snapshot reads
+	// through getMemberById for the DMs it lists (sidebarUsers)
+	u, ok := a.S.RawUser(c.User)
 	return ok && (u.IsBot || u.IsAppUser || u.Profile.BotID != "" || u.Profile.APIAppID != "")
 }
 
@@ -1773,6 +2197,9 @@ func (a *App) presenceIDs(add []string) []string {
 	a.S.RUnlock()
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	for id := range a.presSubs { // members someone subscribed to (presence_subs.go)
+		base[id] = true
+	}
 	now := time.Now()
 	for _, id := range add {
 		if strings.HasPrefix(id, "U") || strings.HasPrefix(id, "W") {

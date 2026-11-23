@@ -149,6 +149,7 @@ func (a *App) CanvasComments(ctx context.Context, fileID, filter, cursor string)
 			NextCursor string `json:"next_cursor"`
 		} `json:"response_metadata"`
 	}
+	subs := a.S.SubSeq()
 	if err := a.C.Call(ctx, "conversations.history", p, &r); err != nil {
 		var se *slack.Error
 		if errors.As(err, &se) && se.Code == "channel_not_found" { // (0,O.uI)(e,"channel_not_found"): no threads
@@ -156,6 +157,7 @@ func (a *App) CanvasComments(ctx context.Context, fileID, filter, cursor string)
 		}
 		return CanvasCommentsPage{}, err
 	}
+	a.S.SyncSubs(ch, subs, r.Messages) // the comment threads' subscriptions (store/thread_subs.go)
 	out := CanvasCommentsPage{Replies: map[string][]Message{}, Cursor: r.Meta.NextCursor, HasMore: r.HasMore}
 	seen := map[string]bool{}
 	for i := range r.Messages {
@@ -192,7 +194,7 @@ func (a *App) SetCommentResolved(ctx context.Context, ch, ts string, resolve boo
 	}
 	if r.Message != nil && r.Message.TS == ts {
 		upd := *r.Message
-		if m, ok := a.S.Mutate(ch, ts, func(x *slack.Message) {
+		if m, ok := a.S.MutateNoted(ch, ts, func(x *slack.Message) { // a read out now keeps it
 			keep := *x
 			*x = upd
 			if x.Reactions == nil {
@@ -205,7 +207,7 @@ func (a *App) SetCommentResolved(ctx context.Context, ch, ts string, resolve boo
 		a.emitUpdate(ch, &upd)
 		return nil
 	}
-	if m, ok := a.S.Mutate(ch, ts, func(x *slack.Message) { // no message in the answer: flip the flag
+	if m, ok := a.S.MutateNoted(ch, ts, func(x *slack.Message) { // no message in the answer: flip the flag
 		if x.DocumentComment == nil {
 			x.DocumentComment = &slack.MessageDocumentComment{}
 		}

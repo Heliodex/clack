@@ -8,6 +8,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/url"
 	"sort"
@@ -16,6 +17,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/some-du6e/clack/internal/logtag"
+	"github.com/some-du6e/clack/internal/richtext"
 	"github.com/some-du6e/clack/internal/slack"
 	"github.com/some-du6e/clack/internal/store"
 )
@@ -36,10 +39,20 @@ type File struct {
 	Channels         []string // channels, groups and DMs it is shared in
 	Mode             string   // hosted | external | quip | list | tombstone | …
 	IsCanvas, IsList bool
-	IsImage          bool
+	// IsImage is Slack's fileIsImage (slack.FileIsImage): image/* with
+	// thumbs, so an image Slack made no thumbs for is a plain file.
+	IsImage bool
+	// IsVideo is Slack's fileIsPlayableVideo (slack.FileIsPlayableVideo):
+	// a video/* file that won't play (an mkv with no mp4 yet) is a plain
+	// file. MP4 is its transcode, the media viewer's source with URL.
+	IsVideo bool
+	MP4     string
 	// LastRead is when the viewer last opened it (last_read: milliseconds
 	// or seconds, 0 never), for the collections' Last viewed sort.
 	LastRead int64
+	// TitleBlocks is a canvas's title_blocks: its title as rich text,
+	// emoji included (richtext.CanvasTitle).
+	TitleBlocks json.RawMessage
 }
 
 type FilePage struct {
@@ -62,6 +75,13 @@ type FilesOpts struct {
 	// last_engaged, or score with a query), "timestamp" (Last updated)
 	// or "score" (Most relevant).
 	Sort string
+	// The browser's advanced filters (useUnifiedFilesFilters'
+	// advancedFilters, which the Filters modal sets): From are people
+	// (from:<@U…>), In conversations or people (in:<#C…|name>, in:<#G…>
+	// for a group DM, in:<@U…> for a person or a DM), After and Before
+	// exclusive YYYY-MM-DD dates (after:, before:).
+	From, In      []string
+	After, Before string
 }
 
 // Huddle is an active or past huddle.
@@ -159,6 +179,18 @@ type UsergroupOpts struct {
 	ExcludeDisabled bool
 	// Team is the Workspaces filter (search_only_team).
 	Team string
+	// Cursor is the previous page's UsergroupPage.Next ("" the first page).
+	Cursor string
+}
+
+// UsergroupPage is a page of the user group directory.
+type UsergroupPage struct {
+	Groups []Usergroup
+	// Total is num_found: every group the directory has for the query
+	// and filters (Slack pages until it has that many).
+	Total int
+	// Next is next_cursor_mark, the next page's Cursor ("" when done).
+	Next string
 }
 
 // Tab is one entry of a channel's tab bar, in server order. The UI adds
@@ -166,10 +198,20 @@ type UsergroupOpts struct {
 type Tab struct {
 	ID, Type     string // Type: canvas | list | folder | bookmarks | files | workflows | channel_canvas | …
 	Label, Title string // Title: what to show (file title, "Bookmarks", "Deleted file", …)
-	FileID       string // canvas / list tabs
-	Deleted      bool   // the tab's file is gone
-	Unread       bool   // a canvas the viewer never opened (no last_read): Slack's blue tab dot
-	Bookmarks    []Bookmark
+	// TitleSpans is an unlabeled canvas tab's title as Slack draws it:
+	// the file's title_blocks (useTabLabel's file Name → QuipTitleParsedId),
+	// where a channel element reads #name, not the title string's raw
+	// <#C…> token. Title is then their plain text. Nil without title_blocks.
+	TitleSpans []richtext.Span
+	// FileTitle is the tab file's title string (files.info title, else its
+	// name), set even when the tab has a label of its own. Slack's
+	// SmallFileEntity reads a leading :emoji: from it for an unlabeled
+	// tab's icon (getFileTitle).
+	FileTitle string
+	FileID    string // canvas / list tabs
+	Deleted   bool   // the tab's file is gone
+	Unread    bool   // a canvas the viewer never opened (no last_read): Slack's blue tab dot
+	Bookmarks []Bookmark
 	// DefaultView is a list tab's data.lists_channel_tab_default_refine_view_id
 	// (Slack's listsChannelTabDefaultRefineViewId), ViewName that view's
 	// name in the list's list_metadata.views (getListViewById), "" when
@@ -181,6 +223,13 @@ type Tab struct {
 	// AppID is a tab's data.app_id (an agent's own tab: the Channel
 	// Expert's knowledge folder).
 	AppID string
+	// TitleUnknown: the tab's file read (files.info) failed, so Title,
+	// TitleSpans, FileTitle, Deleted, Unread and ViewName are the
+	// defaults; BookmarksUnknown: a folder tab's bookmarks.list failed, so
+	// Bookmarks is empty. A caller holding an earlier read keeps that part
+	// of it (ui backend.opened).
+	TitleUnknown     bool `json:",omitempty"`
+	BookmarksUnknown bool `json:",omitempty"`
 }
 
 // MemberCounts is edge users/counts. Slack's channel header shows People.
@@ -267,18 +316,28 @@ type browseFileRaw struct {
 	Thumb360H  int             `json:"thumb_360_h"`
 	ThumbPDF   string          `json:"thumb_pdf"`
 	ThumbVideo string          `json:"thumb_video"`
+	MP4        string          `json:"mp4"`
+	Subtype    string          `json:"subtype"`
+	IsExternal bool            `json:"is_external"`
+	ExtType    string          `json:"external_type"`
 	Channels   []string        `json:"channels"`
 	Groups     []string        `json:"groups"`
 	IMs        []string        `json:"ims"`
 	Mode       string          `json:"mode"`
 	IsDeleted  bool            `json:"is_deleted"`
 	FileAccess string          `json:"file_access"`
+	// a canvas's title as rich text (its :emoji: as emoji elements)
+	TitleBlocks json.RawMessage `json:"title_blocks"`
+	// fileIsImage's other thumbs and its Salesforce case (slack.FileIsImage)
+	Thumb360GIF      string `json:"thumb_360_gif"`
+	Thumb800         string `json:"thumb_800"`
+	IsSalesforceFile bool   `json:"is_salesforce_file"`
 }
 
 func (r *browseFileRaw) file() File {
 	f := File{ID: r.ID, Name: stripHighlight.Replace(r.Name), Title: stripHighlight.Replace(r.Title),
 		Filetype: r.Filetype, PrettyType: r.PrettyType, Mime: r.Mimetype, User: r.User,
-		Thumb: firstNonEmpty(r.Thumb360, r.ThumbPDF, r.ThumbVideo), URL: r.URLPrivate, Permalink: r.Permalink,
+		Thumb: firstNonEmpty(r.Thumb360, r.Thumb360GIF, r.ThumbPDF, r.ThumbVideo), URL: r.URLPrivate, Permalink: r.Permalink,
 		ThumbW: r.Thumb360W, ThumbH: r.Thumb360H, Size: r.Size, Created: r.Created, Modified: r.Updated, Mode: r.Mode,
 		Timestamp: r.Timestamp}
 	if f.Created == 0 {
@@ -290,10 +349,22 @@ func (r *browseFileRaw) file() File {
 	f.Channels = append(append(append(f.Channels, r.Channels...), r.Groups...), r.IMs...)
 	f.IsCanvas = r.Filetype == "quip" || r.Filetype == "canvas" || r.Mode == "quip" || strings.EqualFold(r.PrettyType, "canvas")
 	f.IsList = !f.IsCanvas && (r.Filetype == "list" || r.Mode == "list" || strings.EqualFold(r.PrettyType, "list"))
-	f.IsImage = strings.HasPrefix(r.Mimetype, "image/")
+	// fileIsImage: an image/* file Slack made no thumbs for (a very tall
+	// screenshot) is a plain file here, as in Slack's Files browser and
+	// channel Files tab (getMainFileAction "download", not the viewer)
+	f.IsImage = slack.FileIsImage(&slack.File{Mimetype: r.Mimetype, Filetype: r.Filetype, Thumb360: r.Thumb360,
+		Thumb360GIF: r.Thumb360GIF, Thumb800: r.Thumb800, IsSalesforceFile: r.IsSalesforceFile})
+	f.IsVideo = slack.FileIsPlayableVideo(&slack.File{Mimetype: r.Mimetype, Filetype: r.Filetype, MP4: r.MP4, Subtype: r.Subtype,
+		Mode: r.Mode, IsExternal: r.IsExternal, ExternalType: r.ExtType})
+	if f.IsVideo {
+		f.MP4 = r.MP4
+	}
 	var lr json.Number
 	if len(r.LastRead) > 0 && json.Unmarshal(r.LastRead, &lr) == nil {
 		f.LastRead, _ = lr.Int64()
+	}
+	if f.IsCanvas {
+		f.TitleBlocks = r.TitleBlocks
 	}
 	return f
 }
@@ -309,44 +380,52 @@ func (a *App) filePage(ctx context.Context, raws []browseFileRaw) []File {
 	return out
 }
 
-// filesParams builds search.modules.files params for the Files browser.
-func filesParams(o FilesOpts, self string) url.Values {
+// filesQuery is the browser's request query (client-boot nzlP
+// querySuggestionFromQueryAndFilter, then toString().trim();
+// files_query.go): the typed query's tokens first, those of a filter's
+// kind only when the filter holds them, then the filters' tokens in
+// Slack's order: from:, in:, before:, after:, the type: tokens, creator:.
+// lk resolves the typed tokens and the in: values (nil: none resolve).
+func filesQuery(ctx context.Context, o FilesOpts, self string, lk filesLookup) string {
+	var types []string
+	switch {
+	case o.Kind == "canvases":
+		types = []string{"quip"}
+	case o.Kind == "lists":
+		types = []string{"lists"}
+	case len(o.Types) > 0:
+		types = o.Types
+	case o.Mine || o.SharedWithMe:
+		types = strings.Fields(strings.ReplaceAll(fileTypesOwned, "type:", ""))
+	default:
+		types = strings.Fields(strings.ReplaceAll(fileTypesAll, "type:", ""))
+	}
+	var creator []string
+	if o.Mine {
+		creator = []string{self}
+	}
+	return filesQueryTokens(ctx, o.Query, o, types, creator, lk)
+}
+
+// filesParams builds search.modules.files params for the Files browser
+// (the query as filesQuery; ctx stops a long query's tokenizing).
+func filesParams(ctx context.Context, o FilesOpts, self string, lk filesLookup) url.Values {
 	page := o.Page
 	if page < 1 {
 		page = 1
 	}
-	types := fileTypesAll
-	switch {
-	case o.Kind == "canvases":
-		types = "type:quip"
-	case o.Kind == "lists":
-		types = "type:lists"
-	case len(o.Types) > 0:
-		ts := make([]string, 0, len(o.Types))
-		for _, t := range o.Types {
-			ts = append(ts, "type:"+t)
-		}
-		types = strings.Join(ts, " ")
-	case o.Mine || o.SharedWithMe:
-		types = fileTypesOwned
-	}
-	parts := []string{types}
 	sortBy := "last_engaged"
 	q := strings.TrimSpace(o.Query)
 	if q != "" || o.SharedWithMe {
 		sortBy = "score"
 	}
 	if o.Mine {
-		parts = append(parts, "creator:<@"+self+">")
 		sortBy = "timestamp"
 	}
 	if o.Sort != "" {
 		sortBy = o.Sort
 	}
-	if q != "" {
-		parts = append(parts, q)
-	}
-	p := url.Values{"module": {"files"}, "query": {strings.Join(parts, " ")}, "page": {strconv.Itoa(page)},
+	p := url.Values{"module": {"files"}, "query": {filesQuery(ctx, o, self, lk)}, "page": {strconv.Itoa(page)},
 		"count": {"50"}, "sort": {sortBy}, "search_context": {"desktop_files_browser"},
 		"include_files_shares": {"1"}, "extracts": {"1"}, "highlight": {"1"}, "max_extract_len": {"200"},
 		"extra_message_data": {"1"}, "no_user_profile": {"1"}, "file_title_only": {"false"},
@@ -364,7 +443,10 @@ func filesParams(o FilesOpts, self string) url.Values {
 // unified files view calls it).
 func (a *App) Files(ctx context.Context, o FilesOpts) (FilePage, error) {
 	t0 := time.Now()
-	p := filesParams(o, a.S.SelfID())
+	p := filesParams(ctx, o, a.S.SelfID(), newFilesLookup(a))
+	if err := ctx.Err(); err != nil { // the query's tokenizing stopped short
+		return FilePage{}, err
+	}
 	var res struct {
 		Pagination searchPagination `json:"pagination"`
 		Items      []browseFileRaw  `json:"items"`
@@ -584,7 +666,7 @@ func (a *App) Sent(ctx context.Context, cursor string, page int) (SentPage, erro
 		refs = append(refs, sentRef{ch, ts})
 		want[ch] = append(want[ch], ts)
 	}
-	got := a.hydrate(ctx, want)
+	got, _ := a.hydrateKeep(ctx, want, false) // no live reads: nothing kept (store/fetched.go)
 	out := SentPage{Next: res.Pagination.NextCursor, Page: res.Pagination.Page, Total: res.Pagination.Total}
 	if out.Page == 0 {
 		out.Page = page
@@ -807,8 +889,26 @@ func (a *App) BrowsePeople(ctx context.Context, o PeopleBrowseOpts) (PeoplePage,
 	return out, nil
 }
 
-// SearchUsergroups is the user group directory (usergroups.search).
-func (a *App) SearchUsergroups(ctx context.Context, o UsergroupOpts) ([]Usergroup, error) {
+// SearchUsergroups is one page of the user group directory, as Slack's
+// BrowseUserGroupsView fetches it (useBrowser's fetchUserGroups, client-boot
+// wBUp N; build a09b625d90aa, 2026-11-22): 50 groups a page, the next page
+// from the previous one's next_cursor_mark, the whole directory's size in
+// num_found.
+//
+//   - On a grid (isEnterprise, THpq: an enterprise id) userGroupsForSearcher
+//     (wBUp _) asks usergroups.search {keyword, sort, sort_dir,
+//     search_only_team?, include_hidden: false, include_disabled: !the
+//     "Exclude deactivated" filter, cursor_mark?, count: 50}.
+//   - Elsewhere fetchPaginatedUserGroupsWithQuery (D8Wa TC) asks
+//     search.team {query: {and: [is group, external false, a
+//     fuzzy_with_email clause per word]}, count: 50, sort, sort_dir,
+//     include_users: false, include_deleted: 1 unless deactivated groups
+//     are left out, cursor_mark?, org_wide_aware: true, search_only_team?}
+//     and reads its items.
+//
+// Both answers' groups go to the store (bulkAddGroups, d92s A), so a row's
+// User Group pane finds a group the boot list doesn't have (a disabled one).
+func (a *App) SearchUsergroups(ctx context.Context, o UsergroupOpts) (UsergroupPage, error) {
 	sortBy := o.Sort
 	switch sortBy {
 	case "date_create", "member_count":
@@ -819,30 +919,130 @@ func (a *App) SearchUsergroups(ctx context.Context, o UsergroupOpts) ([]Usergrou
 	if count <= 0 {
 		count = 50
 	}
-	p := url.Values{"keyword": {strings.TrimPrefix(strings.TrimSpace(o.Query), "@")}, "sort": {sortBy},
-		"sort_dir": {browseSortDir(o.Desc)}, "include_hidden": {"false"}, "include_disabled": {strconv.FormatBool(!o.ExcludeDisabled)},
-		"count": {strconv.Itoa(count)}}
-	if o.Team != "" {
-		p.Set("search_only_team", o.Team)
-	}
 	var res struct {
-		Usergroups []struct {
-			ID          string          `json:"id"`
-			Handle      string          `json:"handle"`
-			Name        string          `json:"name"`
-			Description string          `json:"description"`
-			UserCount   json.RawMessage `json:"user_count"`
-		} `json:"usergroups"`
+		Usergroups []usergroupRaw `json:"usergroups"`
+		Items      []usergroupRaw `json:"items"`
+		NumFound   int            `json:"num_found"`
+		NextCursor string         `json:"next_cursor_mark"`
 	}
-	if err := a.C.Call(ctx, "usergroups.search", p, &res); err != nil {
-		return nil, err
+	if a.C.Creds.EnterpriseID != "" {
+		p := url.Values{"keyword": {strings.TrimPrefix(strings.TrimSpace(o.Query), "@")}, "sort": {sortBy},
+			"sort_dir": {browseSortDir(o.Desc)}, "include_hidden": {"false"}, "include_disabled": {strconv.FormatBool(!o.ExcludeDisabled)},
+			"count": {strconv.Itoa(count)}}
+		if o.Team != "" {
+			p.Set("search_only_team", o.Team)
+		}
+		if o.Cursor != "" {
+			p.Set("cursor_mark", o.Cursor)
+		}
+		if err := a.C.Call(ctx, "usergroups.search", p, &res); err != nil {
+			return UsergroupPage{}, err
+		}
+	} else {
+		// getSortParams: the directory's date sorts are "date" here
+		if sortBy == "date_create" {
+			sortBy = "date"
+		}
+		clauses := []map[string]any{{"type": "is", "value": "group"}, {"type": "external", "value": false}}
+		for _, w := range strings.Split(o.Query, " ") {
+			if w != "" {
+				clauses = append(clauses, map[string]any{"type": "fuzzy_with_email", "value": w})
+			}
+		}
+		q, _ := json.Marshal(map[string]any{"type": "and", "clauses": clauses})
+		p := url.Values{"query": {string(q)}, "count": {strconv.Itoa(count)}, "sort": {sortBy}, "sort_dir": {browseSortDir(o.Desc)},
+			"include_users": {"false"}, "org_wide_aware": {"true"}}
+		if !o.ExcludeDisabled {
+			p.Set("include_deleted", "1")
+		}
+		if o.Cursor != "" {
+			p.Set("cursor_mark", o.Cursor)
+		}
+		if o.Team != "" {
+			p.Set("search_only_team", o.Team)
+		}
+		if err := a.C.Call(ctx, "search.team", p, &res); err != nil {
+			// fetchPaginatedUserGroupsWithQuery's catch: only a cancelled
+			// fetch fails; any other error is logged and answers an empty
+			// page ({items: [], num_found: 0}), the browser's "No results"
+			if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+				return UsergroupPage{}, err
+			}
+			log.Printf("user groups: search.team: %v", err)
+			return UsergroupPage{Groups: []Usergroup{}}, nil
+		}
+		res.Usergroups = res.Items
 	}
-	out := make([]Usergroup, 0, len(res.Usergroups))
-	for _, g := range res.Usergroups {
-		out = append(out, Usergroup{ID: g.ID, Handle: g.Handle, Name: g.Name, Description: g.Description,
-			UserCount: int(looseInt(g.UserCount))})
+	out := UsergroupPage{Groups: make([]Usergroup, 0, len(res.Usergroups)), Total: res.NumFound, Next: res.NextCursor}
+	if out.Total == 0 {
+		out.Total = len(res.Usergroups) // userGroupsForSearcher: num_found ?? the page's length
+	}
+	for _, r := range res.Usergroups {
+		if r.ID == "" {
+			continue
+		}
+		out.Groups = append(out.Groups, usergroupOf(a.S.MergeUsergroup(r.ID, r.over)))
 	}
 	return out, nil
+}
+
+// usergroupRaw is a group as usergroups.search, search.team and
+// usergroups.create carry it (user_count a number or a numeric string),
+// with the keys it had: upsertEntity merges an answer over the stored
+// group ({...stored, ...answer}), so a key an answer leaves out (off a
+// grid search.team's items may lack team_id, auto_type, is_section,
+// date_update) keeps the stored value.
+type usergroupRaw struct {
+	has         map[string]bool
+	ID          string          `json:"id"`
+	Handle      string          `json:"handle"`
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	UserCount   json.RawMessage `json:"user_count"`
+	DateDelete  int64           `json:"date_delete"`
+	DateUpdate  int64           `json:"date_update"`
+	TeamID      string          `json:"team_id"`
+	AutoType    string          `json:"auto_type"`
+	IsSection   bool            `json:"is_section"`
+}
+
+func (r *usergroupRaw) UnmarshalJSON(b []byte) error {
+	type plain usergroupRaw
+	var p plain
+	if err := json.Unmarshal(b, &p); err != nil {
+		return err
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(b, &keys); err != nil {
+		return err
+	}
+	*r = usergroupRaw(p)
+	r.has = make(map[string]bool, len(keys))
+	for k := range keys {
+		r.has[k] = true
+	}
+	return nil
+}
+
+// over writes the answer's keys over g (MergeUsergroup's set).
+func (r usergroupRaw) over(g *slack.Usergroup) {
+	for k, set := range map[string]func(){
+		"handle":      func() { g.Handle = r.Handle },
+		"name":        func() { g.Name = r.Name },
+		"description": func() { g.Description = r.Description },
+		"date_delete": func() { g.DateDelete = r.DateDelete },
+		"date_update": func() { g.DateUpdate = r.DateUpdate },
+		"team_id":     func() { g.TeamID = r.TeamID },
+		"auto_type":   func() { g.AutoType = r.AutoType },
+		"is_section":  func() { g.IsSection = r.IsSection },
+	} {
+		if r.has[k] {
+			set()
+		}
+	}
+	// upsertEntity's user_count is parseInt(user_count) || 0 whether or not
+	// the answer has the key
+	g.UserCount = int(looseInt(r.UserCount))
 }
 
 // ---- channel tab bar ----
@@ -922,7 +1122,10 @@ func (a *App) Tabs(ctx context.Context, ch string) ([]Tab, error) {
 			defer wg.Done()
 			bms, err := a.Bookmarks(ctx, ch)
 			if err != nil {
-				log.Printf("tabs %s: bookmarks.list: %v", ch, err)
+				log.Printf("tabs %s: bookmarks.list: %v", logtag.ID(ch), err)
+				for _, i := range folderTabs {
+					out[i].BookmarksUnknown = true
+				}
 				return
 			}
 			byParent := map[string][]Bookmark{}
@@ -945,34 +1148,52 @@ func (a *App) Tabs(ctx context.Context, ch string) ([]Tab, error) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			title, deleted, unread, views, err := a.tabFileTitle(ctx, t.FileID)
+			f, err := a.tabFileTitle(ctx, t.FileID)
 			if err != nil {
-				log.Printf("tabs %s: files.info %s: %v", ch, t.FileID, err)
+				log.Printf("tabs %s: files.info %s: %v", logtag.ID(ch), logtag.ID(t.FileID), err)
+				t.TitleUnknown = true
 				return
 			}
-			if deleted {
+			if !f.deleted {
+				t.FileTitle = f.title
+			}
+			if f.deleted {
 				t.Title, t.Deleted = "Deleted file", true
-			} else if title != "" && t.Label == "" {
-				t.Title = title // a tab's own label wins (RenameTabModal: "Clear text to default to file name")
+			} else if f.title != "" && t.Label == "" {
+				t.Title = f.title // a tab's own label wins (RenameTabModal: "Clear text to default to file name")
+				if t.Type == "canvas" {
+					if sp := a.tabTitleSpans(ctx, f.titleBlocks, f.title); len(sp) > 0 {
+						t.TitleSpans, t.Title = sp, richtext.PlainSpans(sp)
+					}
+				}
 			}
 			if t.Type == "list" && t.DefaultView != "" {
-				t.ViewName = views[t.DefaultView]
+				t.ViewName = f.views[t.DefaultView]
 			}
-			t.Unread = unread && !deleted && t.Type == "canvas"
+			t.Unread = f.unread && !f.deleted && t.Type == "canvas"
 		}(&out[i])
 	}
 	wg.Wait()
-	log.Printf("tabs %s: %d tabs (%d files) in %s", ch, len(out), len(fileTabs), time.Since(t0).Round(time.Millisecond))
+	log.Printf("tabs %s: %d tabs (%d files) in %s", logtag.ID(ch), len(out), len(fileTabs), time.Since(t0).Round(time.Millisecond))
 	return out, nil
 }
 
-// tabFileTitle returns a tab file's title, or deleted when it is gone, and
-// unread when the viewer never opened it (files.info has no last_read);
-// for a list, its views' names by id (list_metadata.views).
-func (a *App) tabFileTitle(ctx context.Context, fileID string) (title string, deleted, unread bool, views map[string]string, err error) {
+// tabFile is what a tab needs from its file's files.info.
+type tabFile struct {
+	title       string
+	deleted     bool              // the file is gone (not found, tombstone)
+	unread      bool              // the viewer never opened it (no last_read)
+	views       map[string]string // a list's views' names by id (list_metadata.views)
+	titleBlocks json.RawMessage   // a canvas's title_blocks
+}
+
+// tabFileTitle reads a tab file's title, title_blocks, deleted and unread
+// state and, for a list, its views' names.
+func (a *App) tabFileTitle(ctx context.Context, fileID string) (tabFile, error) {
 	var r struct {
 		File struct {
 			browseFileRaw
+			TitleBlocks  json.RawMessage `json:"title_blocks"`
 			ListMetadata struct {
 				Views []struct {
 					ID   string `json:"id"`
@@ -981,24 +1202,69 @@ func (a *App) tabFileTitle(ctx context.Context, fileID string) (title string, de
 			} `json:"list_metadata"`
 		} `json:"file"`
 	}
-	err = a.C.Call(ctx, "files.info", url.Values{"file": {fileID}}, &r)
+	err := a.C.Call(ctx, "files.info", url.Values{"file": {fileID}}, &r)
 	if isCode(err, "file_not_found", "file_deleted") {
-		return "", true, false, nil, nil
+		return tabFile{deleted: true}, nil
 	}
 	if err != nil {
-		return "", false, false, nil, err
+		return tabFile{}, err
 	}
 	if r.File.Mode == "tombstone" || r.File.IsDeleted {
-		return "", true, false, nil, nil
+		return tabFile{deleted: true}, nil
 	}
+	f := tabFile{title: firstNonEmpty(r.File.Title, r.File.Name), titleBlocks: r.File.TitleBlocks}
 	if vs := r.File.ListMetadata.Views; len(vs) > 0 {
-		views = make(map[string]string, len(vs))
+		f.views = make(map[string]string, len(vs))
 		for _, v := range vs {
-			views[v.ID] = v.Name
+			f.views[v.ID] = v.Name
 		}
 	}
 	lr := strings.TrimSpace(string(r.File.LastRead))
-	return firstNonEmpty(r.File.Title, r.File.Name), false, lr == "" || lr == "null" || lr == "0", views, nil
+	f.unread = lr == "" || lr == "null" || lr == "0"
+	return f, nil
+}
+
+// tabTitleSpans is an unlabeled canvas tab's label (useTabLabel, boot-shared
+// 83sY → the file's Name, client-boot c9YI → renderQuipTitle, GF/w
+// QuipTitleParsedId): its title_blocks' first block, as the canvas header
+// reads them (canvasInfo). Slack never parses the title string's <#C…>
+// tokens (that path is FormatTextWithEmoji, emoji only), so nil without
+// title_blocks. Channels and users the blocks mention that the store
+// doesn't know are looked up first: a channel element reads #name, or
+// BaseMissingChannel's "Private channel" when conversations.info says
+// channel_not_found (BaseMrkdwnChannel's isNonExistent).
+func (a *App) tabTitleSpans(ctx context.Context, blocks json.RawMessage, title string) []richtext.Span {
+	switch strings.TrimSpace(string(blocks)) {
+	case "", "null", "[]":
+		return nil
+	}
+	// an emoji the store can't name yet stays an Emoji span (the tab bar
+	// and the canvas header resolve it when they draw)
+	build := func() []richtext.Span { return richtext.TitleBlocks(a.S, title, blocks) }
+	sp := build()
+	var users []string
+	fetched := false
+	for _, s := range sp {
+		switch s.Kind {
+		case richtext.Channel:
+			if _, known := a.Conv(s.ID); !known && s.ID != "" && a.S.ChannelAccess(s.ID) == richtext.ChannelUnresolved {
+				a.ResolveConv(ctx, s.ID)
+				fetched = true
+			}
+		case richtext.User:
+			if s.ID != "" {
+				users = append(users, s.ID)
+			}
+		}
+	}
+	if len(a.S.MissingUsers(users)) > 0 {
+		a.EnsureUsers(ctx, users)
+		fetched = true
+	}
+	if fetched {
+		sp = build()
+	}
+	return sp
 }
 
 // RemoveTab deletes a tab from a channel's tab bar (conversations.removeTab;

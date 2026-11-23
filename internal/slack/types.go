@@ -10,6 +10,7 @@ type Message struct {
 	TS             string          `json:"ts"`
 	User           string          `json:"user,omitempty"`
 	BotID          string          `json:"bot_id,omitempty"`
+	AppID          string          `json:"app_id,omitempty"` // the app a bot message came from (getBotByMsg passes it to bots.info)
 	Username       string          `json:"username,omitempty"`
 	Text           string          `json:"text"`
 	ThreadTS       string          `json:"thread_ts,omitempty"`
@@ -21,6 +22,11 @@ type Message struct {
 	LatestReply    string          `json:"latest_reply,omitempty"`
 	Subscribed     bool            `json:"subscribed,omitempty"`
 	LastRead       string          `json:"last_read,omitempty"` // a followed thread's root (conversations.replies): the viewer's last read reply
+	// SubscribedSet: the copy had a "subscribed" field of its own (history
+	// and replies roots do; the socket's message_changed doesn't), which
+	// is what Slack's slurpThreadSubscriptions takes a thread's
+	// subscription from (store/thread_subs.go). Decoding sets it.
+	SubscribedSet  bool            `json:"-"`
 	Edited         *Edited         `json:"edited,omitempty"`
 	Reactions      []Reaction      `json:"reactions,omitempty"`
 	Files          []File          `json:"files,omitempty"`
@@ -34,14 +40,18 @@ type Message struct {
 	PinnedInfo     *PinnedInfo     `json:"pinned_info,omitempty"`
 	ClientMsgID    string          `json:"client_msg_id,omitempty"`
 	Hidden         bool            `json:"hidden,omitempty"`
-	IsEphemeral    bool            `json:"is_ephemeral,omitempty"` // Slack's addEphemeralMessage (local, never from history)
-	Root           *Message        `json:"root,omitempty"`         // thread_broadcast
-	ReplyBroadcast bool            `json:"reply_broadcast,omitempty"`
-	Upload         bool            `json:"upload,omitempty"`
-	DisplayAsBot   bool            `json:"display_as_bot,omitempty"`
-	Room           json.RawMessage `json:"room,omitempty"` // huddles
-	Channel        string          `json:"channel,omitempty"`
-	Inviter        string          `json:"inviter,omitempty"`
+	// NoDisplay and NoNotifications hold the message's desktop
+	// notification back (client-boot Fpyc's reasons 4 and 5).
+	NoDisplay       bool            `json:"no_display,omitempty"`
+	NoNotifications bool            `json:"no_notifications,omitempty"`
+	IsEphemeral     bool            `json:"is_ephemeral,omitempty"` // Slack's addEphemeralMessage (local, never from history)
+	Root            *Message        `json:"root,omitempty"`         // thread_broadcast
+	ReplyBroadcast  bool            `json:"reply_broadcast,omitempty"`
+	Upload          bool            `json:"upload,omitempty"`
+	DisplayAsBot    bool            `json:"display_as_bot,omitempty"`
+	Room            json.RawMessage `json:"room,omitempty"` // huddles
+	Channel         string          `json:"channel,omitempty"`
+	Inviter         string          `json:"inviter,omitempty"`
 	// System messages' own fields: channel_topic's topic, channel_purpose's
 	// purpose, channel_name's old_name and name (the new one).
 	Topic          string `json:"topic,omitempty"`
@@ -58,6 +68,10 @@ type Message struct {
 	// (assistant_app_thread: {title, …}); the thread pane's header reads
 	// its title (srGL renderThreadTitle, Aa1F AssistantThreadTitleLabel).
 	AssistantAppThread *MessageAssistantThread `json:"assistant_app_thread,omitempty"`
+	// AIContext is an agent's reply's ai_context: result_status
+	// "stopped_by_user" when the person stopped its stream (Slack's
+	// getMessageLabelValues isStopped, stopped_by_user_id).
+	AIContext *MessageAIContext `json:"ai_context,omitempty"`
 	// FunctionExecutionID marks a workflow step's message: its block
 	// actions carry it (Slack's blocks.actions function_execution_id).
 	FunctionExecutionID string `json:"function_execution_id,omitempty"`
@@ -73,6 +87,23 @@ type Message struct {
 	// getCanvasRootLastSeen, isDocumentCommentVisible; thrK most_recent_editor;
 	// v+tj authors).
 	DocumentComment *MessageDocumentComment `json:"document_comment,omitempty"`
+	// What getMsgSenderEntity (hVKV) reads for a sender besides user: a
+	// legacy file_comment's comment.user, a list_edit's
+	// list_edit.created_by, a channel_tab_added's tab_added_user_id and a
+	// folder_item_added's item_added_user_id.
+	Comment         *MessageComment  `json:"comment,omitempty"`
+	ListEdit        *MessageListEdit `json:"list_edit,omitempty"`
+	TabAddedUserID  string           `json:"tab_added_user_id,omitempty"`
+	ItemAddedUserID string           `json:"item_added_user_id,omitempty"`
+	// DocumentMention is a canvas mention (subtype document_mention, in
+	// the canvas's file channel): Slack's msg.document_mention {file_id,
+	// section_id, mentioning_user_ids}, which its jump to the message
+	// (lFpV openDocWithThreadTs) opens the canvas at, and Activity's
+	// header counts ("You were mentioned {mentionCount} times in {space}").
+	DocumentMention *MessageDocumentMention `json:"document_mention,omitempty"`
+	// SlackList is a list record's comment thread's message: its list and
+	// record (GMkG and wc0P read slack_list.list_record_id)
+	SlackList *MessageSlackList `json:"slack_list,omitempty"`
 	// UploadStatus is a placeholder's PendingFilesMetaTextWrapper text
 	// ("Waiting to upload…", "Uploading…", "Sending…") while the viewer's
 	// own files upload: Clack only, never on the wire.
@@ -90,6 +121,21 @@ type MessageDocumentComment struct {
 	IsVisible        bool        `json:"is_visible,omitempty"`
 	LastSeen         json.Number `json:"last_seen,omitempty"`
 	MostRecentEditor string      `json:"most_recent_editor,omitempty"`
+}
+
+// MessageSlackList is a list record's comment-thread message's
+// slack_list: the list and the record whose thread it is.
+type MessageSlackList struct {
+	ListID       string `json:"list_id,omitempty"`
+	ListRecordID string `json:"list_record_id,omitempty"`
+}
+
+// MessageDocumentMention is a canvas mention's document_mention: the
+// canvas, the section the mention sits in, and who mentioned the viewer.
+type MessageDocumentMention struct {
+	FileID            string   `json:"file_id,omitempty"`
+	SectionID         string   `json:"section_id,omitempty"`
+	MentioningUserIDs []string `json:"mentioning_user_ids,omitempty"`
 }
 
 // MessageAssistantThread is a message's assistant_app_thread.
@@ -205,6 +251,18 @@ type BotProfile struct {
 	IsWorkflowBot bool `json:"is_workflow_bot,omitempty"`
 }
 
+// MediaProgress is a file's media_progress: where the viewer stopped
+// watching it (offset_ms), and whether they watched it to its end.
+type MediaProgress struct {
+	OffsetMS     int  `json:"offset_ms"`
+	MediaWatched bool `json:"media_watched"`
+}
+
+// FileVideo is a file's video (only its outputs are read).
+type FileVideo struct {
+	Outputs json.RawMessage `json:"outputs,omitempty"`
+}
+
 type File struct {
 	ID                 string          `json:"id"`
 	Name               string          `json:"name"`
@@ -226,6 +284,7 @@ type File struct {
 	Thumb720           string          `json:"thumb_720"`
 	Thumb960           string          `json:"thumb_960"`
 	Thumb1024          string          `json:"thumb_1024"`
+	Thumb800           string          `json:"thumb_800,omitempty"` // HEIC/HEIF: fileIsImage takes it in thumb_360's place
 	ThumbVideo         string          `json:"thumb_video"`
 	ThumbPDF           string          `json:"thumb_pdf"`
 	ThumbPDFW          int             `json:"thumb_pdf_w"`
@@ -254,17 +313,55 @@ type File struct {
 	EditLink           string          `json:"edit_link,omitempty"`            // snippets and posts: the web editor
 	DurationMS         int             `json:"duration_ms"`
 	Transcription      json.RawMessage `json:"transcription,omitempty"`
-	MP4                string          `json:"mp4"`
-	HLS                string          `json:"hls"`
-	IsExternal         bool            `json:"is_external"`
-	ExternalType       string          `json:"external_type"`
-	AudioWaveSamples   []int           `json:"audio_wave_samples"`
-	Subtype            string          `json:"subtype"`
-	FileAccess         string          `json:"file_access,omitempty"`
+	// IsTranscriptionRegionSupported is whether the file's region can be
+	// transcribed (MediaTranscriptPopoverButton shows only then).
+	IsTranscriptionRegionSupported bool   `json:"is_transcription_region_supported,omitempty"`
+	MP4                            string `json:"mp4"`
+	HLS                            string `json:"hls"`
+	// A video's: the poster Slack draws (VideoControlsOverlay's
+	// thumb_video_ts ?? thumb_video), the HLS stream it prefers in
+	// Electron, its captions and its audio-only source (MediaViewerContent's
+	// audio ? aac : mp4), and how far the viewer watched it
+	// (media.progress.update): where a player starts (xnwb).
+	ThumbVideoTS  string         `json:"thumb_video_ts,omitempty"`
+	HLSEmbed      string         `json:"hls_embed,omitempty"`
+	VTT           string         `json:"vtt,omitempty"`
+	AAC           string         `json:"aac,omitempty"`
+	MediaProgress *MediaProgress `json:"media_progress,omitempty"`
+	// Video is the file's video, whose outputs only fileIsHosted reads: an
+	// external file with transcoded outputs plays as a hosted one.
+	Video            *FileVideo `json:"video,omitempty"`
+	IsExternal       bool       `json:"is_external"`
+	ExternalType     string     `json:"external_type"`
+	AudioWaveSamples []int      `json:"audio_wave_samples"`
+	Subtype          string     `json:"subtype"`
+	FileAccess       string     `json:"file_access,omitempty"`
+	// InitialComment is the file's initial_comment (an old file_share's
+	// comment object) as Slack sent it: Taut's mirror hands plugins
+	// Slack's own value, and a notification's meta line reads whether
+	// there is one (chooseFileMetaTemplate's !!initial_comment, Truthy:
+	// "uploaded and commented on this file").
+	InitialComment json.RawMessage `json:"initial_comment,omitempty"`
+	// BotID is the bot that posted the file (the email bot's forward,
+	// whose message Slackbot sends): getMsgSenderEntity's E.bot_id, and
+	// getFileEntityId's.
+	BotID string `json:"bot_id,omitempty"`
+	// What getFileStatus (SRWA) reads besides mode and file_access: a
+	// deleted file, one hidden by the free plan's storage limit, one DLP
+	// tombstoned. IsSkill marks a skill canvas, FolderType a folder's kind
+	// ("skill_set": a skill set).
+	IsDeleted       bool   `json:"is_deleted,omitempty"`
+	IsHiddenByLimit bool   `json:"is_hidden_by_limit,omitempty"`
+	IsTombstoned    bool   `json:"is_tombstoned,omitempty"`
+	IsSkill         bool   `json:"is_skill,omitempty"`
+	FolderType      string `json:"folder_type,omitempty"`
 	// MediaDisplayType is Slack's media_display_type ("unknown" while an
 	// upload is still being processed). Slack's web client doesn't draw by
 	// it; Clack only reads it to spot unprocessed uploads.
 	MediaDisplayType string `json:"media_display_type,omitempty"`
+	// IsSalesforceFile: Slack's fileIsImage takes a Salesforce image
+	// without thumbs (9NKl).
+	IsSalesforceFile bool `json:"is_salesforce_file,omitempty"`
 	// An animated GIF's animated thumbs (thumb_360_w/h and thumb_480_w/h
 	// are their sizes too; FileImageThumbnail plays them in messages) and
 	// its first frame as a still at the original's size (deanimate is
@@ -275,6 +372,32 @@ type File struct {
 	Deanimate    string `json:"deanimate,omitempty"`
 	DeanimateGIF string `json:"deanimate_gif,omitempty"`
 
+	// An email file (mode "email": an email Slack's email app or a
+	// forwarding address brought in; filetype "email", text/html). Read
+	// from Hack Club's (2026-11-18): from, to and cc as {address, name,
+	// original, slack_user_id when a member sent it}, the subject, the
+	// body as plain text (plain_text) and its first 500 characters
+	// (preview_plain_text), Preview its HTML, the attachments the email
+	// carried as Slack files (slack_file_id), the header date, and the
+	// sender's DMARC check. SimplifiedHTML is files.info's.
+	From                    EmailAddresses   `json:"from,omitempty"`
+	To                      EmailAddresses   `json:"to,omitempty"`
+	Cc                      EmailAddresses   `json:"cc,omitempty"`
+	Subject                 string           `json:"subject,omitempty"`
+	PlainText               string           `json:"plain_text,omitempty"`
+	PreviewPlainText        string           `json:"preview_plain_text,omitempty"`
+	SimplifiedHTML          string           `json:"simplified_html,omitempty"`
+	EmailAttachments        EmailAttachments `json:"attachments,omitempty"`
+	OriginalAttachmentCount int              `json:"original_attachment_count,omitempty"`
+	InlineAttachmentCount   int              `json:"inline_attachment_count,omitempty"`
+	HasMore                 bool             `json:"has_more,omitempty"`
+	SentToSelf              bool             `json:"sent_to_self,omitempty"`
+	EmailHeaders            *EmailHeaders    `json:"headers,omitempty"`
+	EmailSecurity           *EmailSecurity   `json:"email_security,omitempty"`
+	Timestamp               int64            `json:"timestamp,omitempty"`
+	AppID                   string           `json:"app_id,omitempty"`
+	AppName                 string           `json:"app_name,omitempty"`
+
 	// Clack only, never on the wire. Pending marks a file of the viewer's
 	// optimistic send whose upload hasn't finished (Slack's pendingUpload
 	// in a placeholder's pendingFiles); its thumbs are localimg URLs.
@@ -282,6 +405,80 @@ type File struct {
 	// sent, processing).
 	Pending       bool `json:"-"`
 	UploadPercent int  `json:"-"`
+}
+
+// EmailAddress is one of an email file's from, to or cc: the address,
+// the display name, the header as written (original), and the member who
+// sent it (slack_user_id).
+type EmailAddress struct {
+	Address     string `json:"address"`
+	Name        string `json:"name"`
+	Original    string `json:"original,omitempty"`
+	SlackUserID string `json:"slack_user_id,omitempty"`
+}
+
+// EmailAttachment is a file an email carried: Slack keeps each as a file
+// of its own (slack_file_id).
+type EmailAttachment struct {
+	Filename    string          `json:"filename"`
+	Size        int64           `json:"size"`
+	Mimetype    string          `json:"mimetype"`
+	URL         string          `json:"url"`
+	SlackFileID string          `json:"slack_file_id,omitempty"`
+	Metadata    json.RawMessage `json:"metadata,omitempty"`
+}
+
+// EmailHeaders are an email file's headers.
+type EmailHeaders struct {
+	Date      string `json:"date,omitempty"`
+	MessageID string `json:"message_id,omitempty"`
+}
+
+// EmailSecurity is an email file's sender checks.
+type EmailSecurity struct {
+	HasValidDMARC *bool `json:"has_valid_dmarc,omitempty"`
+}
+
+// The email fields decode leniently: another kind of file may carry a
+// field of the same name in another shape, and a message must never fail
+// to decode over one.
+type (
+	EmailAddresses   []EmailAddress
+	EmailAttachments []EmailAttachment
+)
+
+func (a *EmailAddresses) UnmarshalJSON(b []byte) error {
+	var v []EmailAddress
+	if json.Unmarshal(b, &v) == nil {
+		*a = v
+	}
+	return nil
+}
+
+func (a *EmailAttachments) UnmarshalJSON(b []byte) error {
+	var v []EmailAttachment
+	if json.Unmarshal(b, &v) == nil {
+		*a = v
+	}
+	return nil
+}
+
+func (h *EmailHeaders) UnmarshalJSON(b []byte) error {
+	type plain EmailHeaders
+	var v plain
+	if json.Unmarshal(b, &v) == nil {
+		*h = EmailHeaders(v)
+	}
+	return nil
+}
+
+func (e *EmailSecurity) UnmarshalJSON(b []byte) error {
+	type plain EmailSecurity
+	var v plain
+	if json.Unmarshal(b, &v) == nil {
+		*e = EmailSecurity(v)
+	}
+	return nil
 }
 
 type AttachmentField struct {
@@ -327,12 +524,15 @@ type Attachment struct {
 	IsAppUnfurl   bool              `json:"is_app_unfurl,omitempty"`
 	Hidden        bool              `json:"hidden,omitempty"`
 	IsMsgUnfurl   bool              `json:"is_msg_unfurl"`
-	IsShare       bool              `json:"is_share"`
-	ChannelID     string            `json:"channel_id"`
-	ChannelName   string            `json:"channel_name"`
-	MsgSubtype    string            `json:"msg_subtype"`
-	Blocks        json.RawMessage   `json:"blocks,omitempty"`
-	MessageBlocks []struct {
+	// AgentChannelUnfurl is the card of a code channel an agent made
+	// (MessageKitAttachments draws it as CodeChannelEntityCard)
+	AgentChannelUnfurl *AgentChannelUnfurl `json:"agent_channel_unfurl,omitempty"`
+	IsShare            bool                `json:"is_share"`
+	ChannelID          string              `json:"channel_id"`
+	ChannelName        string              `json:"channel_name"`
+	MsgSubtype         string              `json:"msg_subtype"`
+	Blocks             json.RawMessage     `json:"blocks,omitempty"`
+	MessageBlocks      []struct {
 		Message struct {
 			Blocks json.RawMessage `json:"blocks"`
 		} `json:"message"`
@@ -391,6 +591,7 @@ type User struct {
 	TZOffset          int     `json:"tz_offset,omitempty"`
 	IsAdmin           bool    `json:"is_admin,omitempty"`
 	IsOwner           bool    `json:"is_owner,omitempty"`
+	IsPrimaryOwner    bool    `json:"is_primary_owner,omitempty"`
 	IsBot             bool    `json:"is_bot,omitempty"`
 	IsAppUser         bool    `json:"is_app_user,omitempty"`
 	IsSlackbot        bool    `json:"is_slackbot,omitempty"` // gmjA: Slackbot (with id USLACKBOT)
@@ -399,6 +600,7 @@ type User struct {
 	AgentStatus       string  `json:"agent_status,omitempty"`      // not_an_agent | consistently_an_agent | check_required (bot users)
 	IsWorkflowBot     bool    `json:"is_workflow_bot,omitempty"`   // Workflow Builder's bot user: badged WORKFLOW
 	IsAgentforceBot   bool    `json:"is_agentforce_bot,omitempty"` // a Salesforce Agentforce agent: badged AGENTFORCE
+	IsSidekickBot     bool    `json:"is_sidekick_bot,omitempty"`   // 7jev isSidekickMember (bD9l keeps it out of Slack Connect channels)
 	Updated           int64   `json:"updated,omitempty"`
 	Profile           Profile `json:"profile"`
 	Presence          string  `json:"presence,omitempty"`
@@ -420,6 +622,7 @@ type EnterpriseUser struct {
 	Teams          []string `json:"teams,omitempty"`
 	IsAdmin        bool     `json:"is_admin,omitempty"`
 	IsOwner        bool     `json:"is_owner,omitempty"`
+	IsPrimaryOwner bool     `json:"is_primary_owner,omitempty"`
 }
 
 type Profile struct {
@@ -593,16 +796,21 @@ type Counts struct {
 	// ActivityV2 is the Activity inbox's unread badge count by entry type
 	// (Slack's transformClientCountsOutput activityV2).
 	ActivityV2 map[string]int `json:"activity_v2"`
+	// Alerts is the unread count by user alert type (Slack's userAlerts;
+	// the classic Activity badge sums some: core classic_badges.go).
+	Alerts map[string]int `json:"alerts"`
 }
 
 // UnmarshalJSON decodes a message and keeps the raw attachments JSON (for
 // plugins that need fields the typed Attachment drops). Malformed
-// attachments no longer fail the whole message.
+// attachments no longer fail the whole message. SubscribedSet records
+// whether "subscribed" was there at all.
 func (m *Message) UnmarshalJSON(b []byte) error {
 	type plain Message
 	aux := struct {
 		*plain
 		RawAtt json.RawMessage `json:"attachments,omitempty"`
+		RawSub json.RawMessage `json:"subscribed,omitempty"`
 	}{plain: (*plain)(m)}
 	if err := json.Unmarshal(b, &aux); err != nil {
 		return err
@@ -613,5 +821,51 @@ func (m *Message) UnmarshalJSON(b []byte) error {
 		m.RawAttachments = append(json.RawMessage(nil), aux.RawAtt...)
 		_ = json.Unmarshal(aux.RawAtt, &m.Attachments)
 	}
+	m.Subscribed, m.SubscribedSet = false, false
+	if len(aux.RawSub) > 0 && string(aux.RawSub) != "null" {
+		m.SubscribedSet = json.Unmarshal(aux.RawSub, &m.Subscribed) == nil
+	}
 	return nil
+}
+
+// MessageAIContext is a message's ai_context (the fields Slack's client
+// reads).
+type MessageAIContext struct {
+	ResultStatus    string `json:"result_status,omitempty"`
+	StoppedByUserID string `json:"stopped_by_user_id,omitempty"`
+	// Type "slackbot_ai" marks Slackbot AI's reply (X1VC
+	// isSlackbotAiMessage); Summary.Type "huddle" an AI huddle summary
+	// (getMsgSenderEntity's isAiHuddleSummary).
+	Type    string            `json:"type,omitempty"`
+	Summary *MessageAISummary `json:"summary,omitempty"`
+}
+
+// MessageAISummary is ai_context.summary.
+type MessageAISummary struct {
+	Type string `json:"type,omitempty"`
+}
+
+// MessageComment is a legacy file_comment message's comment: its author
+// is the message's sender when the message has no user (getMsgSenderEntity:
+// t.user || t.comment.user).
+type MessageComment struct {
+	User string `json:"user,omitempty"`
+}
+
+// MessageListEdit is a list_edit message's list_edit: who made the edit
+// (getMsgSenderEntity's isListEditMsg sender).
+type MessageListEdit struct {
+	CreatedBy string `json:"created_by,omitempty"`
+}
+
+// AgentChannelUnfurl is an attachment's agent_channel_unfurl: the code
+// channel an agent session made.
+type AgentChannelUnfurl struct {
+	ChannelID             string `json:"channel_id"`
+	ChannelName           string `json:"channel_name"`
+	AgentBotUserID        string `json:"agent_bot_user_id"`
+	IsPrivate             bool   `json:"is_private"`
+	JoinableFromChannelID string `json:"joinable_from_channel_id"`
+	WorkflowName          string `json:"workflow_name,omitempty"`
+	WorkflowTriggerID     string `json:"workflow_trigger_id,omitempty"`
 }

@@ -45,23 +45,19 @@ type Backend struct {
 	// vertArray is bound during a frame. We don't need it, but
 	// core desktop OpenGL profile 3.3 requires some array bound.
 	vertArray gl.VertexArray
+
+	// skipped counts the calls Clack patch 37 left out: vertex attribute
+	// pointers and uniforms set to what they are already (patch 36).
+	skipped int64
 }
 
 // State tracking.
 type glState struct {
 	drawFBO     gl.Framebuffer
 	readFBO     gl.Framebuffer
-	vertAttribs [5]struct {
-		obj        gl.Buffer
-		enabled    bool
-		size       int
-		typ        gl.Enum
-		normalized bool
-		stride     int
-		offset     uintptr
-	}
-	prog     gl.Program
-	texUnits struct {
+	vertAttribs [5]vertAttrib
+	prog        gl.Program
+	texUnits    struct {
 		active gl.Enum
 		binds  [2]gl.Texture
 	}
@@ -82,6 +78,11 @@ type glState struct {
 	viewport          [4]int
 	unpack_row_length int
 	pack_row_length   int
+	// scissor is the scissor test and its box (Clack patch 46)
+	scissor struct {
+		on  bool
+		box [4]int32
+	}
 }
 
 type state struct {
@@ -154,6 +155,11 @@ type uniformLocation struct {
 	offset  int
 	typ     shader.DataType
 	size    int
+	// last is the value the program has, bit for bit (Clack patch 37): a
+	// program's uniforms keep their values, so setting the same again is
+	// left out
+	last [4]uint32
+	set  bool
 }
 
 // textureTriple holds the type settings for
@@ -287,6 +293,7 @@ func (b *Backend) BeginFrame(target driver.RenderTarget, clear bool, viewport im
 }
 
 func (b *Backend) EndFrame() {
+	b.glstate.setScissor(b.funcs, image.Rectangle{}) // the blit below obeys it (Clack patch 46)
 	if b.sRGBFBO != nil {
 		b.glstate.bindFramebuffer(b.funcs, gl.FRAMEBUFFER, b.outputFBO)
 		if b.clear {
@@ -320,6 +327,7 @@ func (b *Backend) queryState() glState {
 		s.pack_row_length = b.funcs.GetInteger(gl.PACK_ROW_LENGTH)
 	}
 	s.blend.enable = b.funcs.IsEnabled(gl.BLEND)
+	s.scissor.on = b.funcs.IsEnabled(gl.SCISSOR_TEST)
 	s.blend.srcRGB = gl.Enum(b.funcs.GetInteger(gl.BLEND_SRC_RGB))
 	s.blend.dstRGB = gl.Enum(b.funcs.GetInteger(gl.BLEND_DST_RGB))
 	s.blend.srcA = gl.Enum(b.funcs.GetInteger(gl.BLEND_SRC_ALPHA))
@@ -349,14 +357,7 @@ func (b *Backend) queryState() glState {
 	}
 	s.activeTexture(b.funcs, active)
 	for i := range s.vertAttribs {
-		a := &s.vertAttribs[i]
-		a.enabled = b.funcs.GetVertexAttrib(i, gl.VERTEX_ATTRIB_ARRAY_ENABLED) != gl.FALSE
-		a.obj = gl.Buffer(b.funcs.GetVertexAttribBinding(i, gl.VERTEX_ATTRIB_ARRAY_ENABLED))
-		a.size = b.funcs.GetVertexAttrib(i, gl.VERTEX_ATTRIB_ARRAY_SIZE)
-		a.typ = gl.Enum(b.funcs.GetVertexAttrib(i, gl.VERTEX_ATTRIB_ARRAY_TYPE))
-		a.normalized = b.funcs.GetVertexAttrib(i, gl.VERTEX_ATTRIB_ARRAY_NORMALIZED) != gl.FALSE
-		a.stride = b.funcs.GetVertexAttrib(i, gl.VERTEX_ATTRIB_ARRAY_STRIDE)
-		a.offset = b.funcs.GetVertexAttribPointer(i, gl.VERTEX_ATTRIB_ARRAY_POINTER)
+		s.vertAttribs[i] = queryVertAttrib(b.funcs, i)
 	}
 	return s
 }
@@ -371,6 +372,14 @@ func (b *Backend) restoreState(dst glState) {
 	src.bindFramebuffer(f, gl.FRAMEBUFFER, dst.drawFBO)
 	src.bindFramebuffer(f, gl.READ_FRAMEBUFFER, dst.readFBO)
 	src.set(f, gl.BLEND, dst.blend.enable)
+	if dst.scissor.on != src.scissor.on {
+		if dst.scissor.on {
+			f.Enable(gl.SCISSOR_TEST)
+		} else {
+			f.Disable(gl.SCISSOR_TEST)
+		}
+		src.scissor.on = dst.scissor.on
+	}
 	bf := dst.blend
 	src.setBlendFuncSeparate(f, bf.srcRGB, bf.dstRGB, bf.srcA, bf.dstA)
 	src.set(f, gl.FRAMEBUFFER_SRGB, dst.srgb)
@@ -410,9 +419,14 @@ func (s *glState) setVertexAttribArray(f *gl.Functions, idx int, enabled bool) {
 	}
 }
 
-func (s *glState) vertexAttribPointer(f *gl.Functions, buf gl.Buffer, idx, size int, typ gl.Enum, normalized bool, stride, offset int) {
-	s.bindBuffer(f, gl.ARRAY_BUFFER, buf)
+// vertexAttribPointer points attribute idx into buf, unless it points
+// there already (Clack patch 37); it reports whether it called OpenGL.
+func (s *glState) vertexAttribPointer(f *gl.Functions, buf gl.Buffer, idx, size int, typ gl.Enum, normalized bool, stride, offset int) bool {
 	a := &s.vertAttribs[idx]
+	if driver.ClackStateCache && a.points(buf, size, typ, normalized, stride, offset) {
+		return false
+	}
+	s.bindBuffer(f, gl.ARRAY_BUFFER, buf)
 	a.obj = buf
 	a.size = size
 	a.typ = typ
@@ -420,6 +434,7 @@ func (s *glState) vertexAttribPointer(f *gl.Functions, buf gl.Buffer, idx, size 
 	a.stride = stride
 	a.offset = uintptr(offset)
 	f.VertexAttribPointer(gl.Attrib(idx), a.size, a.typ, a.normalized, a.stride, int(a.offset))
+	return true
 }
 
 func (s *glState) activeTexture(f *gl.Functions, unit gl.Enum) {
@@ -454,8 +469,56 @@ func (s *glState) deleteFramebuffer(f *gl.Functions, fbo gl.Framebuffer) {
 	}
 }
 
+// vertAttrib is a vertex attribute's state.
+type vertAttrib struct {
+	obj        gl.Buffer
+	enabled    bool
+	size       int
+	typ        gl.Enum
+	normalized bool
+	stride     int
+	offset     uintptr
+}
+
+// attribQuerier reads vertex attributes' state (*gl.Functions does).
+type attribQuerier interface {
+	GetVertexAttrib(index int, pname gl.Enum) int
+	GetVertexAttribBinding(index int, pname gl.Enum) gl.Object
+	GetVertexAttribPointer(index int, pname gl.Enum) uintptr
+}
+
+// queryVertAttrib is attribute i's state as OpenGL has it. The buffer it
+// points into is VERTEX_ATTRIB_ARRAY_BUFFER_BINDING's: Gio read
+// VERTEX_ATTRIB_ARRAY_ENABLED there, so an enabled attribute seemed to
+// point into buffer 1, and Clack patch 37 trusts the buffer to leave a
+// call out.
+func queryVertAttrib(q attribQuerier, i int) vertAttrib {
+	return vertAttrib{
+		enabled:    q.GetVertexAttrib(i, gl.VERTEX_ATTRIB_ARRAY_ENABLED) != gl.FALSE,
+		obj:        gl.Buffer(q.GetVertexAttribBinding(i, gl.VERTEX_ATTRIB_ARRAY_BUFFER_BINDING)),
+		size:       q.GetVertexAttrib(i, gl.VERTEX_ATTRIB_ARRAY_SIZE),
+		typ:        gl.Enum(q.GetVertexAttrib(i, gl.VERTEX_ATTRIB_ARRAY_TYPE)),
+		normalized: q.GetVertexAttrib(i, gl.VERTEX_ATTRIB_ARRAY_NORMALIZED) != gl.FALSE,
+		stride:     q.GetVertexAttrib(i, gl.VERTEX_ATTRIB_ARRAY_STRIDE),
+		offset:     q.GetVertexAttribPointer(i, gl.VERTEX_ATTRIB_ARRAY_POINTER),
+	}
+}
+
+// points reports whether the attribute points into buf as given already:
+// a buffer it points into (none is unknown) and the same format.
+func (a *vertAttrib) points(buf gl.Buffer, size int, typ gl.Enum, normalized bool, stride, offset int) bool {
+	return !a.obj.Equal(gl.Buffer{}) && a.obj.Equal(buf) && a.size == size && a.typ == typ && a.normalized == normalized && a.stride == stride && a.offset == uintptr(offset)
+}
+
 func (s *glState) deleteBuffer(f *gl.Functions, b gl.Buffer) {
 	f.DeleteBuffer(b)
+	// the attributes pointing into b point nowhere now; the next buffer
+	// may get its name (Clack patch 37)
+	for i := range s.vertAttribs {
+		if b.Equal(s.vertAttribs[i].obj) {
+			s.vertAttribs[i].obj = gl.Buffer{}
+		}
+	}
 	if b.Equal(s.arrayBuf) {
 		s.arrayBuf = gl.Buffer{}
 	}
@@ -609,6 +672,27 @@ func (s *glState) setClearColor(f *gl.Functions, r, g, b, a float32) {
 	}
 }
 
+// setScissor turns the scissor test on for r, or off for an empty r
+// (Clack patch 46). It's also what clears and blits obey.
+func (s *glState) setScissor(f *gl.Functions, r image.Rectangle) {
+	on := !r.Empty()
+	if on != s.scissor.on {
+		if on {
+			f.Enable(gl.SCISSOR_TEST)
+		} else {
+			f.Disable(gl.SCISSOR_TEST)
+		}
+		s.scissor.on = on
+	}
+	if on {
+		box := [4]int32{int32(r.Min.X), int32(r.Min.Y), int32(r.Dx()), int32(r.Dy())}
+		if box != s.scissor.box {
+			f.Scissor(box[0], box[1], box[2], box[3])
+			s.scissor.box = box
+		}
+	}
+}
+
 func (s *glState) setViewport(f *gl.Functions, x, y, width, height int) {
 	view := [4]int{x, y, width, height}
 	if view != s.viewport {
@@ -696,7 +780,9 @@ func (b *Backend) NewTexture(format driver.TextureFormat, width, height int, min
 	switch format {
 	case driver.TextureFormatFloat:
 		tex.triple = b.floatTriple
-	case driver.TextureFormatSRGBA:
+	case driver.TextureFormatSRGBA, driver.TextureFormatOutput:
+		// Output: the window's own format, sRGB (Clack patch 46's frame
+		// texture)
 		tex.triple = b.srgbaTriple
 	case driver.TextureFormatRGBA8:
 		tex.triple = textureTriple{gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE}
@@ -989,8 +1075,14 @@ func (b *Backend) BindUniforms(buf driver.Buffer) {
 	if bf.typ&driver.BufferBindingUniforms == 0 {
 		panic("not a uniform buffer")
 	}
-	b.state.pipeline.prog.vertUniforms.update(b.funcs, bf)
-	b.state.pipeline.prog.fragUniforms.update(b.funcs, bf)
+	b.skipped += b.state.pipeline.prog.vertUniforms.update(b.funcs, bf)
+	b.skipped += b.state.pipeline.prog.fragUniforms.update(b.funcs, bf)
+}
+
+// ClackCalls implements driver.CallCounter (Clack patch 36): the calls into
+// OpenGL.
+func (b *Backend) ClackCalls() driver.Calls {
+	return driver.Calls{API: b.funcs.Calls, Skipped: b.skipped, Crossings: b.funcs.Calls}
 }
 
 func (b *Backend) BindProgram(prog driver.Program) {
@@ -1015,16 +1107,28 @@ func (u *uniforms) setup(funcs *gl.Functions, p gl.Program, uniformSize int, uni
 	u.size = uniformSize
 }
 
-func (p *uniforms) update(funcs *gl.Functions, buf *buffer) {
+// update sets the program's uniforms from buf, the ones that changed
+// (Clack patch 37); it returns how many it left alone.
+func (p *uniforms) update(funcs *gl.Functions, buf *buffer) (skipped int64) {
 	if buf.size < p.size {
 		panic(fmt.Errorf("uniform buffer too small, got %d need %d", buf.size, p.size))
 	}
 	data := buf.data
-	for _, u := range p.locs {
+	for i := range p.locs {
+		u := &p.locs[i]
 		if !u.uniform.Valid() {
 			continue
 		}
 		data := data[u.offset:]
+		if u.typ == shader.DataTypeFloat && u.size >= 1 && u.size <= 4 {
+			var v [4]uint32
+			copy(v[:u.size], unsafe.Slice((*uint32)(unsafe.Pointer(unsafe.SliceData(data))), u.size))
+			if driver.ClackStateCache && u.set && v == u.last {
+				skipped++
+				continue
+			}
+			u.last, u.set = v, true
+		}
 		switch {
 		case u.typ == shader.DataTypeFloat && u.size == 1:
 			data := data[:4]
@@ -1046,6 +1150,7 @@ func (p *uniforms) update(funcs *gl.Functions, buf *buffer) {
 			panic("unsupported uniform data type or size")
 		}
 	}
+	return skipped
 }
 
 func (b *buffer) Upload(data []byte) {
@@ -1128,7 +1233,9 @@ func (b *Backend) setupVertexArrays() {
 			panic("unsupported data type")
 		}
 		enabled[inp.Location] = true
-		b.glstate.vertexAttribPointer(b.funcs, buf.obj, inp.Location, l.Size, gltyp, false, p.layout.Stride, buf.offset+l.Offset)
+		if !b.glstate.vertexAttribPointer(b.funcs, buf.obj, inp.Location, l.Size, gltyp, false, p.layout.Stride, buf.offset+l.Offset) {
+			b.skipped++
+		}
 	}
 	for i := range max {
 		b.glstate.setVertexAttribArray(b.funcs, i, enabled[i])
@@ -1198,6 +1305,9 @@ func (b *Backend) EndCompute() {
 func (b *Backend) BeginRenderPass(tex driver.Texture, desc driver.LoadDesc) {
 	fbo := tex.(*texture).ensureFBO()
 	b.glstate.bindFramebuffer(b.funcs, gl.FRAMEBUFFER, fbo)
+	// a pass starts unscissored, and glClear obeys the scissor (Clack
+	// patch 46)
+	b.glstate.setScissor(b.funcs, image.Rectangle{})
 	switch desc.Action {
 	case driver.LoadActionClear:
 		c := desc.ClearColor
@@ -1208,6 +1318,40 @@ func (b *Backend) BeginRenderPass(tex driver.Texture, desc driver.LoadDesc) {
 }
 
 func (b *Backend) EndRenderPass() {
+	b.glstate.setScissor(b.funcs, image.Rectangle{})
+}
+
+// clackBlitter is a gl.Functions with glBlitFramebuffer (OpenGL ES 3 and
+// OpenGL 3 contexts outside Windows and the web).
+type clackBlitter interface {
+	BlitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1 int, mask gl.Enum, filter gl.Enum)
+	ClackBlitFramebufferLoaded() bool
+}
+
+// ClackPartialOK implements driver.ClackPartial (Clack patch 46): the
+// frame is copied into the window with glBlitFramebuffer, and a context
+// shared with others may have a scissor of its own.
+func (b *Backend) ClackPartialOK() bool {
+	bf, ok := any(b.funcs).(clackBlitter)
+	return ok && bf.ClackBlitFramebufferLoaded() && b.glver[0] >= 3 && !b.sharedCtx
+}
+
+// ClackCopyDraws implements driver.ClackPartial: a framebuffer blit.
+func (b *Backend) ClackCopyDraws() bool { return false }
+
+// ClackScissor implements driver.ClackPartial.
+func (b *Backend) ClackScissor(r image.Rectangle) {
+	b.glstate.setScissor(b.funcs, r)
+}
+
+// ClackCopyToTarget implements driver.ClackPartial: a glBlitFramebuffer
+// of the same size, NEAREST, from src's framebuffer into target's.
+func (b *Backend) ClackCopyToTarget(target, src driver.Texture, size image.Point) {
+	bf := any(b.funcs).(clackBlitter)
+	b.glstate.setScissor(b.funcs, image.Rectangle{})
+	b.glstate.bindFramebuffer(b.funcs, gl.READ_FRAMEBUFFER, src.(*texture).ensureFBO())
+	b.glstate.bindFramebuffer(b.funcs, gl.DRAW_FRAMEBUFFER, target.(*texture).ensureFBO())
+	bf.BlitFramebuffer(0, 0, size.X, size.Y, 0, 0, size.X, size.Y, gl.COLOR_BUFFER_BIT, gl.NEAREST)
 }
 
 func (f *texture) ImplementsRenderTarget() {}

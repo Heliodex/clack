@@ -36,7 +36,51 @@ type Backend struct {
 	caps driver.Caps
 
 	floatFormat uint32
+
+	// Clack patch 37: what the device context was last set to; setting it
+	// again is left out. Patch 36: the COM calls made, and the ones left
+	// out.
+	set   ctxState
+	calls driver.Calls
+	// raster are the rasterizer states without and with the scissor test,
+	// scissorOn which one is set (Clack patch 46)
+	raster    [2]*d3d11.RasterizerState
+	scissorOn bool
+
+	// Clack patch 51: the samplers of wrapped textures (linear, nearest),
+	// shared by all of them, and how many aren't released yet.
+	extSamplers [2]*d3d11.SamplerState
+	wrapped     int
+	// texBytes and bufBytes are what the textures and buffers this
+	// backend made and hasn't released take (Clack patch 46:
+	// ClackResourceBytes)
+	texBytes, bufBytes int64
 }
+
+// ctxState is the device context state the backend last set (Clack patch
+// 37). Gio sets the shaders, input layout, blend state, topology, vertex
+// buffer, textures, constant buffers and viewport for every op, each a
+// COM call through syscall; a set of what the context already has is
+// left out. A field's zero value is unknown: Gio never sets nil.
+type ctxState struct {
+	vs            *d3d11.VertexShader
+	ps            *d3d11.PixelShader
+	layout        *d3d11.InputLayout
+	blend         *d3d11.BlendState
+	topology      uint32
+	vbuf          *d3d11.Buffer
+	vstride, voff uint32
+	ibuf          *d3d11.Buffer
+	vsCB, psCB    *d3d11.Buffer
+	samplers      [texUnits]*d3d11.SamplerState
+	srvs          [texUnits]*d3d11.ShaderResourceView
+	viewport      d3d11.VIEWPORT
+	hasViewport   bool
+}
+
+// texUnits is how many texture units ctxState follows; Gio's renderer
+// uses two.
+const texUnits = 4
 
 type Pipeline struct {
 	vert     *d3d11.VertexShader
@@ -45,6 +89,9 @@ type Pipeline struct {
 	blend    *d3d11.BlendState
 	stride   int
 	topology driver.Topology
+	// fragUniforms is whether the pixel shader reads the constant buffer
+	// (Clack patch 37)
+	fragUniforms bool
 }
 
 type Texture struct {
@@ -61,6 +108,13 @@ type Texture struct {
 	height  int
 	mipmap  bool
 	foreign bool
+	// external is a shader resource view someone else made (ClackWrap,
+	// Clack patch 51): the texture holds a reference to it, and samples it
+	// with the backend's shared sampler
+	external bool
+	// bytes is what the texture takes, its mipmaps included (Clack patch
+	// 46: ClackResourceBytes)
+	bytes int64
 }
 
 type VertexShader struct {
@@ -72,6 +126,8 @@ type VertexShader struct {
 type FragmentShader struct {
 	backend *Backend
 	shader  *d3d11.PixelShader
+	// uniforms is whether it reads the constant buffer (Clack patch 37)
+	uniforms bool
 }
 
 type Program struct {
@@ -87,6 +143,9 @@ type Buffer struct {
 	uaView    *d3d11.UnorderedAccessView
 	size      int
 	immutable bool
+	// last is a constant buffer's contents as last uploaded: uploading the
+	// same bytes again is left out (Clack patch 37)
+	last []byte
 }
 
 func init() {
@@ -138,17 +197,102 @@ func newDirect3D11Device(api driver.Direct3D11) (driver.Device, error) {
 		b.floatFormat = fmt
 		b.caps.Features |= driver.FeatureFloatRenderTargets
 	}
-	// Disable backface culling to match OpenGL.
-	state, err := dev.CreateRasterizerState(&d3d11.RASTERIZER_DESC{
-		CullMode: d3d11.CULL_NONE,
-		FillMode: d3d11.FILL_SOLID,
-	})
-	if err != nil {
-		return nil, err
+	// Disable backface culling to match OpenGL. The second state scissors
+	// (Clack patch 46: partial frames).
+	for i := range b.raster {
+		state, err := dev.CreateRasterizerState(&d3d11.RASTERIZER_DESC{
+			CullMode:      d3d11.CULL_NONE,
+			FillMode:      d3d11.FILL_SOLID,
+			ScissorEnable: uint32(i),
+		})
+		if err != nil {
+			b.releaseRaster()
+			return nil, err
+		}
+		b.raster[i] = state
 	}
-	defer d3d11.IUnknownRelease(unsafe.Pointer(state), state.Vtbl.Release)
-	b.ctx.RSSetState(state)
+	b.ctx.RSSetState(b.raster[0])
 	return b, nil
+}
+
+func (b *Backend) releaseRaster() {
+	for i, st := range b.raster {
+		if st != nil {
+			d3d11.IUnknownRelease(unsafe.Pointer(st), st.Vtbl.Release)
+			b.raster[i] = nil
+		}
+	}
+}
+
+// ClackPartialOK implements driver.ClackPartial (Clack patch 46).
+func (b *Backend) ClackPartialOK() bool { return b.raster[1] != nil }
+
+// ClackResourceBytes implements driver.ClackResources (Clack patch 46): the
+// bytes of the textures and buffers made and not yet released.
+func (b *Backend) ClackResourceBytes() (textures, buffers int64) { return b.texBytes, b.bufBytes }
+
+// texelBytes is a texel's size in a format NewTexture makes.
+func texelBytes(format uint32) int64 {
+	switch format {
+	case d3d11.DXGI_FORMAT_R16_FLOAT:
+		return 2
+	}
+	return 4 // R32_FLOAT, R8G8B8A8_UNORM(_SRGB)
+}
+
+// ClackCopyDraws implements driver.ClackPartial: a copy into the swap
+// chain's buffer.
+func (b *Backend) ClackCopyDraws() bool { return false }
+
+// ClackScissor implements driver.ClackPartial: the scissoring rasterizer
+// state and its rectangle, or the plain state again.
+func (b *Backend) ClackScissor(r image.Rectangle) {
+	on := !r.Empty()
+	if on != b.scissorOn {
+		st := b.raster[0]
+		if on {
+			st = b.raster[1]
+		}
+		b.ctx.RSSetState(st)
+		b.calls.API++
+		b.scissorOn = on
+	}
+	if on {
+		rc := d3d11.RECT{Left: int32(r.Min.X), Top: int32(r.Min.Y), Right: int32(r.Max.X), Bottom: int32(r.Max.Y)}
+		b.ctx.RSSetScissorRects(&rc)
+		b.calls.API++
+	}
+}
+
+// ClackCopyToTarget implements driver.ClackPartial: CopySubresourceRegion
+// into the target's texture (the swap chain's buffer behind its render
+// target view).
+func (b *Backend) ClackCopyToTarget(target, src driver.Texture, size image.Point) {
+	dst := target.(*Texture)
+	var res *d3d11.Resource
+	if dst.tex != nil {
+		res = (*d3d11.Resource)(unsafe.Pointer(dst.tex))
+	} else {
+		res = dst.renderTarget.GetResource()
+		b.calls.API++
+		defer d3d11.IUnknownRelease(unsafe.Pointer(res), res.Vtbl.Release)
+		// no further than the buffer goes: a box past it drops the copy
+		if t, err := d3d11.IUnknownQueryInterface(unsafe.Pointer(res), res.Vtbl.QueryInterface, &d3d11.IID_Texture2D); err == nil {
+			desc := (*d3d11.Texture2D)(unsafe.Pointer(t)).GetDesc()
+			d3d11.IUnknownRelease(unsafe.Pointer(t), t.Vtbl.Release)
+			b.calls.API += 3
+			size.X, size.Y = min(size.X, int(desc.Width)), min(size.Y, int(desc.Height))
+		}
+	}
+	if size.X <= 0 || size.Y <= 0 {
+		return
+	}
+	b.ctx.CopySubresourceRegion(res, 0, 0, 0, 0, (*d3d11.Resource)(unsafe.Pointer(src.(*Texture).tex)), 0, &d3d11.BOX{
+		Right:  uint32(size.X),
+		Bottom: uint32(size.Y),
+		Back:   1,
+	})
+	b.calls.API++
 }
 
 func (b *Backend) BeginFrame(target driver.RenderTarget, clear bool, viewport image.Point) driver.Texture {
@@ -163,13 +307,25 @@ func (b *Backend) BeginFrame(target driver.RenderTarget, clear bool, viewport im
 			panic(fmt.Errorf("d3d11: invalid render target type: %T", target))
 		}
 	}
+	// state set outside the backend (the window's swap chain code) is
+	// unknown: set everything again this frame (Clack patch 37)
+	b.set = ctxState{}
 	b.ctx.OMSetRenderTargets(renderTarget, nil)
+	b.calls.API++
 	return &Texture{backend: b, renderTarget: renderTarget, foreign: true}
+}
+
+// ClackCalls implements driver.CallCounter (Clack patch 36): the COM
+// calls into the device context.
+func (b *Backend) ClackCalls() driver.Calls {
+	c := b.calls
+	c.Crossings = c.API // each a syscall
+	return c
 }
 
 func (b *Backend) CopyTexture(dstTex driver.Texture, dstOrigin image.Point, srcTex driver.Texture, srcRect image.Rectangle) {
 	dst := (*d3d11.Resource)(unsafe.Pointer(dstTex.(*Texture).tex))
-	src := (*d3d11.Resource)(srcTex.(*Texture).tex)
+	src := (*d3d11.Resource)(unsafe.Pointer(srcTex.(*Texture).tex))
 	b.ctx.CopySubresourceRegion(
 		dst,
 		0,                                           // Destination subresource.
@@ -203,6 +359,12 @@ func (b *Backend) IsTimeContinuous() bool {
 }
 
 func (b *Backend) Release() {
+	b.releaseRaster()
+	for _, s := range b.extSamplers {
+		if s != nil {
+			d3d11.IUnknownRelease(unsafe.Pointer(s), s.Vtbl.Release)
+		}
+	}
 	d3d11.IUnknownRelease(unsafe.Pointer(b.ctx), b.ctx.Vtbl.Release)
 	*b = Backend{}
 }
@@ -212,7 +374,9 @@ func (b *Backend) NewTexture(format driver.TextureFormat, width, height int, min
 	switch format {
 	case driver.TextureFormatFloat:
 		d3dfmt = b.floatFormat
-	case driver.TextureFormatSRGBA:
+	case driver.TextureFormatSRGBA, driver.TextureFormatOutput:
+		// Output: the swap chain's (app/d3d11_windows.go), for Clack patch
+		// 46's frame texture
 		d3dfmt = d3d11.DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
 	case driver.TextureFormatRGBA8:
 		d3dfmt = d3d11.DXGI_FORMAT_R8G8B8A8_UNORM
@@ -340,7 +504,12 @@ func (b *Backend) NewTexture(format driver.TextureFormat, width, height int, min
 			return nil, err
 		}
 	}
-	return &Texture{backend: b, format: d3dfmt, tex: tex, sampler: sampler, resView: resView, uaView: uaView, renderTarget: fbo, bindings: bindings, width: width, height: height, mipmap: mipmap}, nil
+	var bytes int64
+	for l := 0; l < nmipmaps; l++ {
+		bytes += int64(max(width>>l, 1)*max(height>>l, 1)) * texelBytes(d3dfmt)
+	}
+	b.texBytes += bytes
+	return &Texture{backend: b, format: d3dfmt, tex: tex, sampler: sampler, resView: resView, uaView: uaView, renderTarget: fbo, bindings: bindings, width: width, height: height, mipmap: mipmap, bytes: bytes}, nil
 }
 
 func (b *Backend) newInputLayout(vertexShader shader.Sources, layout []driver.InputDesc) (*d3d11.InputLayout, error) {
@@ -472,6 +641,7 @@ func (b *Backend) newBuffer(typ driver.BufferBinding, size int, data []byte, imm
 			return nil, err
 		}
 	}
+	b.bufBytes += int64(size)
 	return &Buffer{backend: b, buf: buf, bind: bind, size: size, resView: resView, uaView: uaView, immutable: immutable}, nil
 }
 
@@ -507,12 +677,13 @@ func (b *Backend) NewPipeline(desc driver.PipelineDesc) (driver.Pipeline, error)
 	d3d11.IUnknownAddRef(unsafe.Pointer(fshRef), fshRef.Vtbl.AddRef)
 
 	return &Pipeline{
-		vert:     vshRef,
-		frag:     fshRef,
-		layout:   layout,
-		stride:   desc.VertexLayout.Stride,
-		blend:    blend,
-		topology: desc.Topology,
+		vert:         vshRef,
+		frag:         fshRef,
+		layout:       layout,
+		stride:       desc.VertexLayout.Stride,
+		blend:        blend,
+		topology:     desc.Topology,
+		fragUniforms: fsh.uniforms,
 	}, nil
 }
 
@@ -547,11 +718,11 @@ func (b *Backend) NewFragmentShader(src shader.Sources) (driver.FragmentShader, 
 	if err != nil {
 		return nil, err
 	}
-	return &FragmentShader{b, fs}, nil
+	return &FragmentShader{backend: b, shader: fs, uniforms: len(src.Uniforms.Locations) > 0}, nil
 }
 
 func (b *Backend) Viewport(x, y, width, height int) {
-	b.viewport = d3d11.VIEWPORT{
+	v := d3d11.VIEWPORT{
 		TopLeftX: float32(x),
 		TopLeftY: float32(y),
 		Width:    float32(width),
@@ -559,30 +730,74 @@ func (b *Backend) Viewport(x, y, width, height int) {
 		MinDepth: 0.0,
 		MaxDepth: 1.0,
 	}
+	if driver.ClackStateCache && b.set.hasViewport && b.set.viewport == v {
+		b.calls.Skipped++
+		return
+	}
+	b.viewport = v
+	b.set.viewport, b.set.hasViewport = v, true
 	b.ctx.RSSetViewports(&b.viewport)
+	b.calls.API++
 }
 
 func (b *Backend) DrawArrays(off, count int) {
 	b.prepareDraw()
 	b.ctx.Draw(uint32(count), uint32(off))
+	b.calls.API++
 }
 
 func (b *Backend) DrawElements(off, count int) {
 	b.prepareDraw()
 	b.ctx.DrawIndexed(uint32(count), uint32(off), 0)
+	b.calls.API++
 }
 
+// prepareDraw sets the pipeline's state and the vertex buffer, what the
+// context doesn't have already (Clack patch 37).
 func (b *Backend) prepareDraw() {
 	p := b.pipeline
 	if p == nil {
 		return
 	}
-	b.ctx.VSSetShader(p.vert)
-	b.ctx.PSSetShader(p.frag)
-	b.ctx.IASetInputLayout(p.layout)
-	b.ctx.OMSetBlendState(p.blend, nil, 0xffffffff)
-	if b.vert.buffer != nil {
-		b.ctx.IASetVertexBuffers(b.vert.buffer.buf, uint32(p.stride), uint32(b.vert.offset))
+	s := &b.set
+	c := driver.ClackStateCache
+	if !c || s.vs != p.vert {
+		b.ctx.VSSetShader(p.vert)
+		s.vs = p.vert
+		b.calls.API++
+	} else {
+		b.calls.Skipped++
+	}
+	if !c || s.ps != p.frag {
+		b.ctx.PSSetShader(p.frag)
+		s.ps = p.frag
+		b.calls.API++
+	} else {
+		b.calls.Skipped++
+	}
+	if !c || p.layout == nil || s.layout != p.layout {
+		b.ctx.IASetInputLayout(p.layout)
+		s.layout = p.layout
+		b.calls.API++
+	} else {
+		b.calls.Skipped++
+	}
+	if !c || s.blend != p.blend {
+		b.ctx.OMSetBlendState(p.blend, nil, 0xffffffff)
+		s.blend = p.blend
+		b.calls.API++
+	} else {
+		b.calls.Skipped++
+	}
+	if vb := b.vert.buffer; vb != nil {
+		stride, off := uint32(p.stride), uint32(b.vert.offset)
+		if !c || s.vbuf != vb.buf || s.vstride != stride || s.voff != off {
+			b.ctx.IASetVertexBuffers(vb.buf, stride, off)
+			s.vbuf, s.vstride, s.voff = vb.buf, stride, off
+			b.calls.API++
+		} else {
+			b.calls.Skipped++
+		}
 	}
 	var topology uint32
 	switch p.topology {
@@ -593,11 +808,20 @@ func (b *Backend) prepareDraw() {
 	default:
 		panic("unsupported draw mode")
 	}
-	b.ctx.IASetPrimitiveTopology(topology)
+	if !c || s.topology != topology {
+		b.ctx.IASetPrimitiveTopology(topology)
+		s.topology = topology
+		b.calls.API++
+	} else {
+		b.calls.Skipped++
+	}
 }
 
 func (b *Backend) BindImageTexture(unit int, tex driver.Texture) {
 	t := tex.(*Texture)
+	// a resource bound for writing is unbound from the pixel shader's
+	// slots (Clack patch 37)
+	b.set.srvs = [texUnits]*d3d11.ShaderResourceView{}
 	if t.uaView != nil {
 		b.ctx.CSSetUnorderedAccessViews(uint32(unit), t.uaView)
 	} else {
@@ -624,12 +848,22 @@ func (t *Texture) Upload(offset, size image.Point, pixels []byte, stride int) {
 	}
 	res := (*d3d11.Resource)(unsafe.Pointer(t.tex))
 	t.backend.ctx.UpdateSubresource(res, dst, uint32(stride), uint32(len(pixels)), pixels)
+	t.backend.calls.API++
 	if t.mipmap {
 		t.backend.ctx.GenerateMips(t.resView)
+		t.backend.calls.API++
 	}
 }
 
 func (t *Texture) Release() {
+	if t.external {
+		// the view's reference ClackWrap took; the sampler is the
+		// backend's (Clack patch 51)
+		d3d11.IUnknownRelease(unsafe.Pointer(t.resView), t.resView.Vtbl.Release)
+		t.backend.wrapped--
+		*t = Texture{}
+		return
+	}
 	if t.foreign {
 		panic("texture not created by NewTexture")
 	}
@@ -646,6 +880,7 @@ func (t *Texture) Release() {
 		d3d11.IUnknownRelease(unsafe.Pointer(t.uaView), t.uaView.Vtbl.Release)
 	}
 	d3d11.IUnknownRelease(unsafe.Pointer(t.tex), t.tex.Vtbl.Release)
+	t.backend.texBytes -= t.bytes
 	*t = Texture{}
 }
 
@@ -653,8 +888,26 @@ func (b *Backend) PrepareTexture(tex driver.Texture) {}
 
 func (b *Backend) BindTexture(unit int, tex driver.Texture) {
 	t := tex.(*Texture)
-	b.ctx.PSSetSamplers(uint32(unit), t.sampler)
-	b.ctx.PSSetShaderResources(uint32(unit), t.resView)
+	if unit >= texUnits {
+		b.ctx.PSSetSamplers(uint32(unit), t.sampler)
+		b.ctx.PSSetShaderResources(uint32(unit), t.resView)
+		b.calls.API += 2
+		return
+	}
+	if s := &b.set.samplers[unit]; !driver.ClackStateCache || *s != t.sampler {
+		b.ctx.PSSetSamplers(uint32(unit), t.sampler)
+		*s = t.sampler
+		b.calls.API++
+	} else {
+		b.calls.Skipped++
+	}
+	if r := &b.set.srvs[unit]; !driver.ClackStateCache || *r != t.resView {
+		b.ctx.PSSetShaderResources(uint32(unit), t.resView)
+		*r = t.resView
+		b.calls.API++
+	} else {
+		b.calls.Skipped++
+	}
 }
 
 func (b *Backend) BindPipeline(pipe driver.Pipeline) {
@@ -692,6 +945,7 @@ func (p *Pipeline) Release() {
 
 func (b *Backend) BindStorageBuffer(binding int, buffer driver.Buffer) {
 	buf := buffer.(*Buffer)
+	b.set.srvs = [texUnits]*d3d11.ShaderResourceView{} // as in BindImageTexture
 	if buf.resView != nil {
 		b.ctx.CSSetShaderResources(uint32(binding), buf.resView)
 	} else {
@@ -699,10 +953,25 @@ func (b *Backend) BindStorageBuffer(binding int, buffer driver.Buffer) {
 	}
 }
 
+// BindUniforms binds the constant buffer to the vertex shader, and to the
+// pixel shader if it reads it, unless bound already (Clack patch 37).
 func (b *Backend) BindUniforms(buffer driver.Buffer) {
 	buf := buffer.(*Buffer)
-	b.ctx.VSSetConstantBuffers(buf.buf)
+	c := driver.ClackStateCache
+	if !c || b.set.vsCB != buf.buf {
+		b.ctx.VSSetConstantBuffers(buf.buf)
+		b.set.vsCB = buf.buf
+		b.calls.API++
+	} else {
+		b.calls.Skipped++
+	}
+	if p := b.pipeline; c && (p != nil && !p.fragUniforms || b.set.psCB == buf.buf) {
+		b.calls.Skipped++
+		return
+	}
 	b.ctx.PSSetConstantBuffers(buf.buf)
+	b.set.psCB = buf.buf
+	b.calls.API++
 }
 
 func (b *Backend) BindVertexBuffer(buf driver.Buffer, offset int) {
@@ -711,7 +980,14 @@ func (b *Backend) BindVertexBuffer(buf driver.Buffer, offset int) {
 }
 
 func (b *Backend) BindIndexBuffer(buf driver.Buffer) {
-	b.ctx.IASetIndexBuffer(buf.(*Buffer).buf, d3d11.DXGI_FORMAT_R16_UINT, 0)
+	bf := buf.(*Buffer).buf
+	if driver.ClackStateCache && b.set.ibuf == bf {
+		b.calls.Skipped++
+		return
+	}
+	b.ctx.IASetIndexBuffer(bf, d3d11.DXGI_FORMAT_R16_UINT, 0)
+	b.set.ibuf = bf
+	b.calls.API++
 }
 
 func (b *Buffer) Download(dst []byte) error {
@@ -727,6 +1003,16 @@ func (b *Buffer) Download(dst []byte) error {
 }
 
 func (b *Buffer) Upload(data []byte) {
+	if b.bind&d3d11.BIND_CONSTANT_BUFFER != 0 {
+		// a constant buffer given the bytes it has is left alone (Clack
+		// patch 37)
+		if driver.ClackStateCache && string(b.last) == string(data) {
+			b.backend.calls.Skipped++
+			return
+		}
+		b.last = append(b.last[:0], data...)
+	}
+	b.backend.calls.API++
 	var dst *d3d11.BOX
 	if len(data) < b.size {
 		dst = &d3d11.BOX{
@@ -749,6 +1035,7 @@ func (b *Buffer) Release() {
 		d3d11.IUnknownRelease(unsafe.Pointer(b.uaView), b.uaView.Vtbl.Release)
 	}
 	d3d11.IUnknownRelease(unsafe.Pointer(b.buf), b.buf.Vtbl.Release)
+	b.backend.bufBytes -= int64(b.size)
 	*b = Buffer{}
 }
 
@@ -776,7 +1063,7 @@ func (t *Texture) ReadPixels(src image.Rectangle, pixels []byte, stride int) err
 		res,
 		0,       // Destination subresource.
 		0, 0, 0, // Destination coordinates (x, y, z).
-		(*d3d11.Resource)(t.tex),
+		(*d3d11.Resource)(unsafe.Pointer(t.tex)),
 		0, // Source subresource.
 		&d3d11.BOX{
 			Left:   uint32(src.Min.X),
@@ -811,16 +1098,23 @@ func (b *Backend) EndCompute() {
 }
 
 func (b *Backend) BeginRenderPass(tex driver.Texture, d driver.LoadDesc) {
+	b.ClackScissor(image.Rectangle{}) // a pass starts unscissored (Clack patch 46)
 	t := tex.(*Texture)
 	b.ctx.OMSetRenderTargets(t.renderTarget, nil)
+	b.calls.API++
+	// a texture bound as the target is unbound from the pixel shader's
+	// slots (Clack patch 37)
+	b.set.srvs = [texUnits]*d3d11.ShaderResourceView{}
 	if d.Action == driver.LoadActionClear {
 		c := d.ClearColor
 		b.clearColor = [4]float32{c.R, c.G, c.B, c.A}
 		b.ctx.ClearRenderTargetView(t.renderTarget, &b.clearColor)
+		b.calls.API++
 	}
 }
 
 func (b *Backend) EndRenderPass() {
+	b.ClackScissor(image.Rectangle{})
 }
 
 func (f *Texture) ImplementsRenderTarget() {}

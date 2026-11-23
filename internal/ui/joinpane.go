@@ -18,6 +18,7 @@ import (
 
 	"github.com/some-du6e/clack/internal/core"
 	"github.com/some-du6e/clack/internal/i18n"
+	"github.com/some-du6e/clack/internal/logtag"
 	"github.com/some-du6e/clack/internal/ui/icons"
 	"github.com/some-du6e/clack/internal/ui/popups"
 	"github.com/some-du6e/clack/internal/ui/theme"
@@ -69,6 +70,15 @@ const (
 	footNone footerKind = iota
 	footPreview
 	footArchived
+	// footPending: a channel whose membership isn't known yet (opened
+	// from a link, search, the channel browser or Activity before
+	// conversations.info answered). Slack's MessagePaneInput picks the
+	// preview or the composer from the channel object (channelIsPreview:
+	// !!(channel && Opi6 isPreview(channel)), isPreview reading
+	// is_member), so neither shows before it is in: no composer that
+	// would post with not_in_channel, no Join for a channel the viewer is
+	// in.
+	footPending
 )
 
 // joinPane is one conversation's footer state.
@@ -106,6 +116,9 @@ func (a *App) convOf(ch string) *convInfo {
 // footerFor says what replaces the composer of c.
 func (a *App) footerFor(c *convo) footerKind {
 	ci := a.convOf(c.ch)
+	if ci == nil && a.membershipUnknown(c.ch) {
+		return footPending
+	}
 	if ci == nil || (ci.Kind != "channel" && ci.Kind != "private") {
 		return footNone
 	}
@@ -119,6 +132,24 @@ func (a *App) footerFor(c *convo) footerKind {
 		return footPreview
 	}
 	return footNone
+}
+
+// membershipUnknown reports a channel outside the sidebar's member set
+// whose conversations.info hasn't answered: after boot's first snapshot
+// every member conversation is in the model, so a channel id with no
+// model entry is one the viewer may not be in. Its lookup starts here
+// when no pane started it (a thread pane, a split). A lookup that failed
+// (offline, channel_not_found) leaves the composer, as before. DMs (D…)
+// always have an input.
+func (a *App) membershipUnknown(ch string) bool {
+	b := a.data
+	if b == nil || b.core == nil || b.booted.IsZero() || ch == "" || (ch[0] != 'C' && ch[0] != 'G') {
+		return false
+	}
+	if b.extFailed[ch] {
+		return false
+	}
+	return b.resolved(ch) == nil
 }
 
 // layoutFooter draws the footer for kind at the pane's width; org is its
@@ -514,7 +545,7 @@ func (a *App) layoutArchivedBar(gtx layout.Context, c *convo, ci *convInfo) layo
 			ch := c.ch
 			go func() { // onUnarchiveLinkClicked: submitUnarchive
 				if err := svc.Unarchive(context.Background(), ch); err != nil {
-					log.Printf("unarchive %s: %v", ch, err)
+					log.Printf("unarchive %s: %v", logtag.ID(ch), err)
 				}
 			}()
 		}

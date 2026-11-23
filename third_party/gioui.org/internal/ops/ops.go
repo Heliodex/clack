@@ -15,6 +15,14 @@ import (
 type Ops struct {
 	// version is incremented at each Reset.
 	version uint32
+	// Clack patch 3: since the last Reset, Rollback went back to data
+	// offset rbPC or before it (rolled), epoch times in all. The ops at or
+	// past rbPC read now get keys of this epoch (Reader), so what is
+	// written after a rollback never has the key of what was there before:
+	// the GPU's caches would take it for that.
+	rolled bool
+	rbPC   uint32
+	epoch  uint32
 	// data contains the serialized operations.
 	data []byte
 	// refs hold external references for operations.
@@ -77,6 +85,12 @@ const (
 	TypeSemanticSelected
 	TypeSemanticEnabled
 	TypeActionInput
+	// TypeClipInterior (Clack patch 38) comes right before the TypeClip of
+	// an outline it knows the fully covered interior of.
+	TypeClipInterior
+	// TypeClipHole (Clack patch 42) comes right before the TypeClip of a
+	// stroke it knows covers nothing inside a rectangle.
+	TypeClipHole
 )
 
 type StackID struct {
@@ -153,7 +167,36 @@ const (
 	TypeSemanticSelectedLen = 2
 	TypeSemanticEnabledLen  = 2
 	TypeActionInputLen      = 1 + 1
+	TypeClipInteriorLen     = 1 + 4*4
+	TypeClipHoleLen         = 1 + 4*4
 )
+
+// DecodeClipInterior decodes a TypeClipInterior op: the rectangle where
+// the next clip's outline covers every pixel fully (Clack patch 38).
+func DecodeClipInterior(data []byte) image.Rectangle {
+	if len(data) < TypeClipInteriorLen || OpType(data[0]) != TypeClipInterior {
+		panic("invalid op")
+	}
+	return decodeRect(data)
+}
+
+// DecodeClipHole decodes a TypeClipHole op: the rectangle where the next
+// clip's stroke covers no pixel (Clack patch 42).
+func DecodeClipHole(data []byte) image.Rectangle {
+	if len(data) < TypeClipHoleLen || OpType(data[0]) != TypeClipHole {
+		panic("invalid op")
+	}
+	return decodeRect(data)
+}
+
+func decodeRect(data []byte) image.Rectangle {
+	bo := binary.LittleEndian
+	// not image.Rect, which would swap the corners of an empty rectangle
+	return image.Rectangle{
+		Min: image.Pt(int(int32(bo.Uint32(data[1:]))), int(int32(bo.Uint32(data[5:])))),
+		Max: image.Pt(int(int32(bo.Uint32(data[9:]))), int(int32(bo.Uint32(data[13:])))),
+	}
+}
 
 func (op *ClipOp) Decode(data []byte) {
 	if len(data) < TypeClipLen || OpType(data[0]) != TypeClip {
@@ -184,6 +227,7 @@ func Reset(o *Ops) {
 	o.stringRefs = o.stringRefs[:0]
 	o.nextStateID = 0
 	o.version++
+	o.rolled, o.rbPC = false, 0
 }
 
 func Write(o *Ops, n int) []byte {
@@ -426,6 +470,8 @@ var opProps = [0x100]opProp{
 	TypeSemanticSelected: {Size: TypeSemanticSelectedLen, NumRefs: 0},
 	TypeSemanticEnabled:  {Size: TypeSemanticEnabledLen, NumRefs: 0},
 	TypeActionInput:      {Size: TypeActionInputLen, NumRefs: 0},
+	TypeClipInterior:     {Size: TypeClipInteriorLen, NumRefs: 0},
+	TypeClipHole:         {Size: TypeClipHoleLen, NumRefs: 0},
 }
 
 func (t OpType) props() (size, numRefs uint32) {
@@ -491,6 +537,10 @@ func (t OpType) String() string {
 		return "Stroke"
 	case TypeSemanticLabel:
 		return "SemanticDescription"
+	case TypeClipInterior:
+		return "ClipInterior"
+	case TypeClipHole:
+		return "ClipHole"
 	default:
 		panic("unknown OpType")
 	}
@@ -519,9 +569,11 @@ func SaveCheckpoint(o *Ops) Checkpoint {
 // Rollback drops everything written to o since c and restores its macro
 // and op stacks to what they were then, as if the pushes, records and
 // writes since had never happened (a layout that panicked half way). Stack
-// ids keep counting up, so a handle from the dropped part can never match.
-// It reports false (and does nothing) if o was Reset since c or is shorter
-// than c.
+// ids keep counting up, so a handle from the dropped part can never match,
+// and the ops written from c on get op keys of a new epoch (Reader): a
+// cache keyed by an op (the GPU's paths) never takes one written after
+// the rollback for the one that was there before it. It reports false
+// (and does nothing) if o was Reset since c or is shorter than c.
 func Rollback(o *Ops, c Checkpoint) bool {
 	if o.version != c.version || len(o.data) < c.data || len(o.refs) < c.refs || len(o.stringRefs) < c.stringRefs {
 		return false
@@ -540,5 +592,10 @@ func Rollback(o *Ops, c Checkpoint) bool {
 	for i := range o.stacks {
 		o.stacks[i].currentID = c.stacks[i]
 	}
+	if pc := uint32(c.data); !o.rolled || pc < o.rbPC {
+		o.rbPC = pc
+	}
+	o.rolled = true
+	o.epoch++
 	return true
 }

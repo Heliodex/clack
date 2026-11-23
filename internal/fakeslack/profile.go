@@ -128,15 +128,14 @@ func (s *Server) profileSections(f url.Values) any {
 // ---- writes (the Edit profile modal, core/profile_write.go) ----
 
 // profileState is what the viewer's profile writes changed: section
-// element overrides (element id → the setSections element) and the
-// photo. Kept beside the Server so its struct stays as it is.
+// element overrides (element id → the setSections element); the photo's
+// state is photo.go's. Kept beside the Server so its struct stays as it is.
 type profileState struct {
 	mu       sync.Mutex
 	elements map[string]map[string]json.RawMessage // user → element id → element
-	photo    string                                // the prepared photo's id
 }
 
-var profileStates sync.Map // *Server -> *profileState
+var profileStates = newPerServer() // *Server -> *profileState
 
 func (s *Server) profile() *profileState {
 	v, _ := profileStates.LoadOrStore(s, &profileState{elements: map[string]map[string]json.RawMessage{}})
@@ -148,8 +147,11 @@ func (s *Server) profile() *profileState {
 // field, like Slack), users.profile.setSections (the elements override
 // what getSections serves), users.preparePhoto, users.setPhoto and
 // users.deletePhoto (the viewer's pictures switch to a "custom" set and
-// back). Synthetic only.
+// back; photo.go's photoWrite). Synthetic only.
 func (s *Server) handleProfileWrites(method string, f url.Values) (any, bool) {
+	if out, handled := s.photoWrite(method, f); handled {
+		return out, true
+	}
 	switch method {
 	case "users.profile.set":
 		var p map[string]any
@@ -201,37 +203,9 @@ func (s *Server) handleProfileWrites(method string, f url.Values) (any, bool) {
 		}
 		ps.mu.Unlock()
 		return ok(), true
-	case "users.preparePhoto":
-		if f.Get(photoBytesKey) == "" {
-			return map[string]any{"ok": false, "error": "no_image"}, true
-		}
-		ps := s.profile()
-		ps.mu.Lock()
-		ps.photo = "F0PHOTO0001"
-		ps.mu.Unlock()
-		return ok("id", "F0PHOTO0001", "url", s.URL+"img/460x460/photo.png"), true
-	case "users.setPhoto":
-		ps := s.profile()
-		ps.mu.Lock()
-		defer ps.mu.Unlock()
-		if f.Get("id") == "" || f.Get("id") != ps.photo {
-			return map[string]any{"ok": false, "error": "invalid_image"}, true
-		}
-		s.setSelfPhoto(true)
-		return ok("profile", s.users[0].Profile), true
-	case "users.deletePhoto":
-		ps := s.profile()
-		ps.mu.Lock()
-		s.setSelfPhoto(false)
-		ps.mu.Unlock()
-		return ok(), true
 	}
 	return nil, false
 }
-
-// photoBytesKey carries a users.preparePhoto upload's image size (the
-// multipart body isn't a form).
-const photoBytesKey = "_fake_image_bytes"
 
 // setSelfPhoto switches the viewer's pictures to the uploaded ones (on)
 // or back to the generated default.

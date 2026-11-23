@@ -9,6 +9,7 @@ import (
 	"image"
 	"image/color"
 	"math"
+	"sync/atomic"
 	"time"
 
 	"gioui.org/f32"
@@ -20,6 +21,7 @@ import (
 	"gioui.org/op/paint"
 
 	"github.com/some-du6e/clack/internal/core"
+	"github.com/some-du6e/clack/internal/ui/blockkit"
 	"github.com/some-du6e/clack/internal/ui/composer"
 	"github.com/some-du6e/clack/internal/ui/icons"
 	"github.com/some-du6e/clack/internal/ui/popups"
@@ -115,7 +117,26 @@ func codeSpinner(gtx layout.Context, d int, col color.NRGBA) {
 	base := float32(-90.0/219.9*2*math.Pi) - float32(math.Pi/4)
 	arc(base+float32(2*math.Pi*ccBezier(.25, .29, .54, .86, t)), dash, col)
 	arc(base+float32(2*math.Pi*ccBezier(.41, .24, .64, .69, t)), dash, col)
-	gtx.Execute(op.InvalidateCmd{At: gtx.Now.Add(33 * time.Millisecond)})
+	indicatorFrame(gtx, 33*time.Millisecond)
+}
+
+// windowActive is the main window's focus as the frame being laid out saw
+// it (App.frame): indicatorFrame reads it.
+var windowActive atomic.Bool
+
+// indicatorFrame asks for an indicator's next frame d from now (a working
+// agent's spinner in the sidebar, its chip or shimmer) while the window
+// is active. An inactive window's indicators hold still and ask for none,
+// as its caret does (Gio patch 10, Chromium's FrameCaret): Clack can't
+// turn a 16 px spinner without laying out and drawing the whole window,
+// and a code channel whose agent worked drew it 30 times a second while
+// the Mac ran something else (Karim 2026-11-14, 64-75% of a core). The
+// window's activation draws again, and they move on from there.
+func indicatorFrame(gtx layout.Context, d time.Duration) {
+	if !windowActive.Load() {
+		return
+	}
+	gtx.Execute(op.InvalidateCmd{At: gtx.Now.Add(d)})
 }
 
 // ccBezier is CSS cubic-bezier(x1, y1, x2, y2) at progress x.
@@ -154,6 +175,7 @@ func (a *App) codeHeaderTile(gtx layout.Context) layout.Dimensions {
 // ---- the agent context bar (ContextBarAgentChannelContent) ----
 
 func init() {
+	blockkit.IndicatorActive = windowActive.Load // agent plans' spinners (blockkit agent.go)
 	composer.ContextBar = func(gtx layout.Context, h composer.Host, ch, ts string) layout.Dimensions {
 		a, ok := h.(*App)
 		if !ok {
@@ -392,7 +414,9 @@ func (a *App) ccItem(gtx layout.Context, ch string, it core.ContextBarItem, p cc
 	}
 	switch {
 	case link:
-		a.OpenURL(it.URL)
+		if !a.FollowLink(it.URL, false) { // Slack's Link: in the client, else the browser
+			openURL(it.URL)
+		}
 	case act && !off && a.data != nil && a.data.core != nil:
 		if a.ccPending == nil {
 			a.ccPending = map[string]bool{}

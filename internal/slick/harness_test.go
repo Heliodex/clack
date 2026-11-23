@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -101,6 +102,20 @@ type testUI struct {
 	overlays []taut.Overlay
 	tabs     []taut.PreferencesTab
 	toasts   []string
+	goCalls  []int64 // the {"$gofn"} ids JS called (UIHooks.CallGo)
+}
+
+// called reports how many times JS called Go func id.
+func (u *testUI) called(id int64) int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	n := 0
+	for _, c := range u.goCalls {
+		if c == id {
+			n++
+		}
+	}
+	return n
 }
 
 func (u *testUI) hooks() taut.UIHooks {
@@ -111,6 +126,12 @@ func (u *testUI) hooks() taut.UIHooks {
 			u.mu.Unlock()
 		},
 		SetPatched: func(names []string) { u.mu.Lock(); u.patched = names; u.mu.Unlock() },
+		CallGo: func(id int64, args []byte) ([]byte, error) {
+			u.mu.Lock()
+			u.goCalls = append(u.goCalls, id)
+			u.mu.Unlock()
+			return []byte("null"), nil
+		},
 		SetStyle: func(k, css string) {
 			u.mu.Lock()
 			if _, ok := u.styles[k]; !ok {
@@ -209,8 +230,15 @@ func (h *harness) spellOn() bool {
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 	api := newFakeAPI(t)
-	c := slack.New(slack.Creds{Token: "xoxc-test", Cookie: "xoxd-test%2Fcookie", UserID: selfID, Team: teamID, EnterpriseID: entID,
-		TeamURL: api.srv.URL + "/", EnterpriseURL: api.srv.URL + "/"})
+	return newHarnessOn(t, api, slack.New(slack.Creds{Token: "xoxc-test", Cookie: "xoxd-test%2Fcookie", UserID: selfID, Team: teamID, EnterpriseID: entID,
+		TeamURL: api.srv.URL + "/", EnterpriseURL: api.srv.URL + "/"}))
+}
+
+// newHarnessOn is newHarness with Clack's client c (on another fake
+// Slack, e.g. internal/fakeslack's); api still answers fetches of its own
+// URL.
+func newHarnessOn(t *testing.T, api *fakeAPI, c *slack.Client) *harness {
+	t.Helper()
 	st := store.New("")
 	seed(st)
 	app := core.New(c, st)
@@ -439,26 +467,35 @@ func treeText(nodes []any) string {
 
 // state is what Taut's and Slick's runtimes have registered.
 type state struct {
-	Running        []string `json:"running"`
-	Mains          []string `json:"mains"`
-	Components     []string `json:"components"`
-	Thunks         []string `json:"thunks"`
-	RTM            []string `json:"rtm"`
-	SendChecks     int      `json:"sendChecks"`
-	SendTransforms int      `json:"sendTransforms"`
-	Styles         []string `json:"styles"`
-	Slices         []string `json:"slices"`
-	StatePatches   int      `json:"statePatches"`
-	Tabs           []string `json:"tabs"`
-	Overlays       []string `json:"overlays"`
-	Resize         int      `json:"resize"`
-	Delta          int      `json:"deltaTransforms"`
-	Documents      int      `json:"documentListeners"`
-	MainListeners  int      `json:"mainListeners"`
-	Protocols      []string `json:"protocols"`
-	NetRules       int      `json:"netRules"`
-	NotifyFilters  int      `json:"notificationFilters"`
-	Switches       []string `json:"switches"`
+	Running    []string `json:"running"`
+	Mains      []string `json:"mains"`
+	Components []string `json:"components"`
+	// ComponentPatches: how many patches match each component (Taut's
+	// matchers), so a plugin's own patch on a name Slick also patches
+	// still shows when it's left behind
+	ComponentPatches map[string]int `json:"componentPatches"`
+	Thunks           []string       `json:"thunks"`
+	RTM              []string       `json:"rtm"`
+	SendChecks       int            `json:"sendChecks"`
+	SendTransforms   int            `json:"sendTransforms"`
+	Styles           []string       `json:"styles"`
+	Slices           []string       `json:"slices"`
+	StatePatches     int            `json:"statePatches"`
+	Tabs             []string       `json:"tabs"`
+	Overlays         []string       `json:"overlays"`
+	Resize           int            `json:"resize"`
+	Delta            int            `json:"deltaTransforms"`
+	Documents        int            `json:"documentListeners"`
+	MainListeners    int            `json:"mainListeners"`
+	Protocols        []string       `json:"protocols"`
+	NetRules         int            `json:"netRules"`
+	NotifyFilters    int            `json:"notificationFilters"`
+	Switches         []string       `json:"switches"`
+	MessageActions   int            `json:"messageActions"`
+	Panels           []string       `json:"panels"`
+	// MessageMenu: Slick's own MAMenu patch is installed (with the first
+	// message action provider, until the last goes)
+	MessageMenu bool `json:"messageMenu"`
 }
 
 func (h *harness) state() state {
@@ -475,7 +512,24 @@ func (st state) registrations() []string {
 			out = append(out, kind+":"+x)
 		}
 	}
-	add("component", st.Components)
+	// one entry per patch, less Slick's own MAMenu patch while it's
+	// installed (with the providers): a plugin's own MAMenu patch left
+	// behind after a stop still counts
+	names := make([]string, 0, len(st.ComponentPatches))
+	for name := range st.ComponentPatches {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	for _, name := range names {
+		k := st.ComponentPatches[name]
+		if name == "MAMenu" && st.MessageMenu {
+			k--
+		}
+		for i := 0; i < k; i++ {
+			out = append(out, "component:"+name)
+		}
+	}
+	add("panel", st.Panels)
 	add("thunk", st.Thunks)
 	add("rtm", st.RTM)
 	add("style", st.Styles)
@@ -497,6 +551,7 @@ func (st state) registrations() []string {
 	n("mainListener", st.MainListeners)
 	n("netRule", st.NetRules)
 	n("notifyFilter", st.NotifyFilters)
+	n("messageActions", st.MessageActions)
 	return out
 }
 

@@ -2,6 +2,8 @@ package core
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"log"
 	"net/url"
 	"strings"
@@ -143,10 +145,7 @@ func (a *App) resolveChannels(ctx context.Context, ids []string) []string {
 			a.S.ForgetMissing('c', ids[i:j]...)
 			continue
 		}
-		for _, c := range r.Results {
-			if c.ID == "" {
-				continue
-			}
+		put := func(c slack.Conversation) {
 			a.S.PutName(c.ID, c.Name)
 			acc := richtext.ChannelVisible
 			if c.IsPrivate && !c.IsMPIM {
@@ -155,42 +154,185 @@ func (a *App) resolveChannels(ctx context.Context, ids []string) []string {
 			a.S.SetChannelAccess(c.ID, acc)
 			out = append(out, c.ID)
 		}
-		// failed_ids: channels the viewer can't see (private ones they're
-		// not in, other workspaces'): Slack's "Private channel" chip
+		for _, c := range r.Results {
+			if c.ID != "" {
+				put(c)
+			}
+		}
+		// failed_ids go to conversations.genericInfo, as Slack's
+		// fetchRawChannelsById falls back for flannel's misses; what
+		// neither knows is a channel the viewer can't see (private ones
+		// they're not in, other workspaces'): Slack's "Private channel"
+		got := map[string]bool{}
+		for _, c := range a.genericChannels(ctx, r.Failed) {
+			if c.ID != "" && !got[c.ID] {
+				got[c.ID] = true
+				put(c)
+			}
+		}
 		for _, id := range r.Failed {
-			a.S.SetChannelAccess(id, richtext.ChannelHidden)
-			out = append(out, id)
+			if !got[id] {
+				a.S.SetChannelAccess(id, richtext.ChannelHidden)
+				out = append(out, id)
+			}
 		}
 	}
 	return out
 }
 
-// resolveBots caches bot names and icons (bots.info, comma-separated batch).
-func (a *App) resolveBots(ctx context.Context, ids []string) []string {
-	var out []string
-	for i := 0; i < len(ids); i += 50 {
-		j := min(i+50, len(ids))
-		var r struct {
-			Bots []slack.BotProfile `json:"bots"`
-			Bot  *slack.BotProfile  `json:"bot"`
+// genericChannels is Slack's fetchRawChannelsFromAPI (client-boot 6ndL,
+// build 2c0d02ca130f): conversations.genericInfo {updated_channels: {id:
+// 0}} for the ids flannel's channels/info failed, 250 at a time. A batch
+// that fails leaves its ids out, as Slack's does.
+func (a *App) genericChannels(ctx context.Context, ids []string) []slack.Conversation {
+	var out []slack.Conversation
+	for i := 0; i < len(ids); i += 250 {
+		up := map[string]int{}
+		for _, id := range ids[i:min(i+250, len(ids))] {
+			up[id] = 0
 		}
-		if err := a.C.Call(ctx, "bots.info", url.Values{"bots": {strings.Join(ids[i:j], ",")}}, &r); err != nil {
-			log.Printf("bots.info: %v", err)
+		b, _ := json.Marshal(up)
+		var r struct {
+			Channels []slack.Conversation `json:"channels"`
+		}
+		if err := a.C.Call(ctx, "conversations.genericInfo", url.Values{"updated_channels": {string(b)}}, &r); err != nil {
+			log.Printf("conversations.genericInfo: %v", err)
 			continue
 		}
-		if r.Bot != nil {
-			r.Bots = append(r.Bots, *r.Bot)
-		}
-		for _, b := range r.Bots {
-			if b.ID == "" {
+		out = append(out, r.Channels...)
+	}
+	return out
+}
+
+// resolveBots is Slack's fetchBotsById (client-boot 0H7E y, build
+// 2c0d02ca130f), the bots UnknownFetchManager's fetch for a client with a
+// socket: the edge cache's users/info (flannel MEMBER_INFO, iFK2
+// fetchBotsById: chunks of 100, every id at 0 in updated_ids) first, then
+// bots.info for the ids it didn't return, with app_ids lined up with them
+// when a message that drew one carried its app (getBotByMsg's app_id).
+// Slack's fallback covers the edge's failed_ids and failed chunks; Clack
+// sends bots.info for any id the edge didn't answer with a bot.
+//
+// bots.info goes to the enterprise host on Grid (the team host answers
+// bots_not_found for org apps); ids it doesn't know (bots_not_found, or
+// left out of a partial answer) are asked once more on the team host,
+// which knows the workspace's own bots. An id neither answers is a
+// non-existent bot for the session (store.PutNonexistentBots), as Slack's
+// upsertNonExistent leaves it, and comes back with the ids it named; a
+// request that failed outright (the network, a 5xx, a timeout) forgets
+// its ids so the next draw asks again.
+func (a *App) resolveBots(ctx context.Context, ids []string) []string {
+	got := map[string]bool{}
+	want := map[string]bool{}
+	for _, id := range ids {
+		want[id] = true
+	}
+	var out []string
+	put := func(bs []slack.BotProfile) {
+		for _, b := range bs {
+			if b.ID == "" || !want[b.ID] || got[b.ID] {
 				continue
 			}
+			got[b.ID] = true
 			a.S.PutBot(b.ID, store.BotInfo{Name: b.Name, Icon: firstNonEmpty(b.Icons.Image72, b.Icons.Image48, b.Icons.Image36),
-				AppID: b.AppID, Workflow: b.IsWorkflowBot})
+				AppID: b.AppID, Workflow: b.IsWorkflowBot, TeamID: b.TeamID})
 			out = append(out, b.ID)
 		}
 	}
-	return out
+	left := func(part []string) []string {
+		var rest []string
+		for _, id := range part {
+			if !got[id] {
+				rest = append(rest, id)
+			}
+		}
+		return rest
+	}
+	for i := 0; i < len(ids); i += 100 {
+		part := ids[i:min(i+100, len(ids))]
+		bs, err := a.edgeBots(ctx, part)
+		if err != nil {
+			log.Printf("edge users/info %v: %v", part, err)
+		}
+		put(bs)
+	}
+	rest := left(ids)
+	var transient, gone []string
+	for i := 0; i < len(rest); i += 50 {
+		part := rest[i:min(i+50, len(rest))]
+		bs, err := a.botsInfo(ctx, part, a.C.Call)
+		put(bs)
+		if err != nil {
+			log.Printf("bots.info %v: %v", part, err)
+		}
+		missing := left(part)
+		if len(missing) > 0 && a.C.OnEnterprise("bots.info") && (err == nil || isCode(err, "bots_not_found")) {
+			bs, err2 := a.botsInfo(ctx, missing, a.C.CallTeam)
+			put(bs)
+			if err2 != nil {
+				log.Printf("bots.info %v (team host): %v", missing, err2)
+			}
+			err = err2
+			missing = left(missing)
+		}
+		if err != nil && !isAPIError(err) {
+			transient = append(transient, missing...)
+		} else {
+			gone = append(gone, missing...)
+		}
+	}
+	if len(transient) > 0 {
+		a.S.ForgetMissing('b', transient...) // asked again at the next draw
+	}
+	// what neither answered is a non-existent bot (the UnknownFetchManager's
+	// upsertNonExistent): the rows that drew it unknown draw it again, as
+	// BaseMissingMember's non-existent bar, so "names" lists it too
+	a.S.PutNonexistentBots(gone)
+	return append(out, gone...)
+}
+
+// edgeBots is fetchBotsById's flannel step: the bots users/info returns
+// among ids.
+func (a *App) edgeBots(ctx context.Context, ids []string) ([]slack.BotProfile, error) {
+	up := make(map[string]int, len(ids))
+	for _, id := range ids {
+		up[id] = 0
+	}
+	var r struct {
+		Results []slack.BotProfile `json:"results"`
+	}
+	err := a.C.Edge(ctx, "users/info", map[string]any{"updated_ids": up}, &r)
+	return r.Results, err
+}
+
+// botsInfo is fetchBotsInfo: bots.info {bots, app_ids} through call.
+func (a *App) botsInfo(ctx context.Context, ids []string, call func(context.Context, string, url.Values, any) error) ([]slack.BotProfile, error) {
+	p := url.Values{"bots": {strings.Join(ids, ",")}}
+	apps := make([]string, len(ids))
+	known := false
+	for i, id := range ids {
+		apps[i] = a.S.MissingBotApp(id)
+		known = known || apps[i] != ""
+	}
+	if known {
+		p.Set("app_ids", strings.Join(apps, ","))
+	}
+	var r struct {
+		Bots []slack.BotProfile `json:"bots"`
+		Bot  *slack.BotProfile  `json:"bot"`
+	}
+	err := call(ctx, "bots.info", p, &r)
+	if r.Bot != nil {
+		r.Bots = append(r.Bots, *r.Bot)
+	}
+	return r.Bots, err
+}
+
+// isAPIError reports whether err is an answer from Slack ({"ok":false}),
+// not a request that failed on the way.
+func isAPIError(err error) bool {
+	var se *slack.Error
+	return errors.As(err, &se)
 }
 
 // ResolveConv returns any conversation by id: the sidebar's, or one looked
@@ -207,30 +349,50 @@ func (a *App) ResolveConv(ctx context.Context, id string) (Conv, bool) {
 		return c, true
 	}
 	var c *slack.Conversation
-	err := a.once("ci:"+id, func() error {
-		var err error
-		c, err = a.C.ConversationInfo(ctx, id)
-		return err
+	// onceCtx: a caller joining another's lookup (History's side read on
+	// a popup's) waits only while its own ctx lasts. The caller that runs
+	// the lookup stores the answer inside it, before the joiners wake: a
+	// joiner reads the conversation from the store, and it used to wake
+	// between the answer and its store, find nothing and report the
+	// conversation unknown. The UI's lookup (backend.resolved), joining
+	// History's side read for a channel opened from a link, then marked it
+	// failed and drew the composer in a channel the viewer isn't in until
+	// the next resnapshot (TestPreviewFooterMembershipUnknownAtOpen, α.135).
+	err := a.onceCtx(ctx, "ci:"+id, func() error {
+		got, err := a.C.ConversationInfo(ctx, id)
+		if err != nil || got == nil {
+			return err
+		}
+		if got.ID == "" {
+			got.ID = id
+		}
+		if _, member := a.S.Conv(id); member {
+			a.S.PutConv(*got)
+		} else {
+			a.S.PutExtConv(*got)
+		}
+		c = got
+		return nil
 	})
 	if isCode(err, "channel_not_found") {
 		a.S.SetChannelAccess(id, richtext.ChannelHidden)
 	}
 	if err != nil || c == nil {
-		if v, ok := a.Conv(id); ok && (named(v) || err != nil) { // a concurrent caller stored it, or it stays partial
+		// a joiner (the lookup was another caller's: its answer is in the
+		// store, and an IM's partner is fetched as the owner fetches it),
+		// or the lookup failed and a partial copy stays
+		v, ok := a.Conv(id)
+		if ok && err == nil && v.Kind == "im" && v.User != "" {
+			a.EnsureUsers(ctx, []string{v.User})
+			v, ok = a.Conv(id)
+		}
+		if ok {
 			return v, true
 		}
 		return Conv{}, false
 	}
-	if c.ID == "" {
-		c.ID = id
-	}
 	if c.IsIM && c.User != "" {
 		a.EnsureUsers(ctx, []string{c.User})
-	}
-	if _, member := a.S.Conv(id); member {
-		a.S.PutConv(*c)
-	} else {
-		a.S.PutExtConv(*c)
 	}
 	if id == a.selectedID() && !c.IsIM {
 		a.emit(Event{Type: "sidebar_changed"}) // the open channel's row (preview.go)

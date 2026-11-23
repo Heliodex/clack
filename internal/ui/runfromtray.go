@@ -110,15 +110,22 @@ func (a *App) closeToTray() bool {
 	t := a.trayIcon()
 	keep := a.keepAppInTaskbar()
 	if t == nil && !keep && !closeHidesWithoutTray {
+		a.noteExit("the window closed (no notification-area icon to keep running in)")
 		return false
 	}
 	on := a.runFromTrayOn()
 	if !on && !keep || a.data == nil || a.login != nil { // 0 === zT(workspaces)
 		log.Printf("ui: main window closed, consider it a quit action (runFromTray %v, keepAppInTaskbar %v)", on, keep)
+		if a.data == nil || a.login != nil {
+			a.noteExit("the window closed while signed out")
+		} else {
+			a.noteExit("the window closed (Leave app running in notification area is off)")
+		}
 		return false
 	}
 	if keep {
 		if !a.minimizeWindow() {
+			a.noteExit("the window closed (it couldn't be minimized)")
 			return false
 		}
 		log.Print("ui: attempted to close the window, minimizing to preserve taskbar flash")
@@ -130,11 +137,15 @@ func (a *App) closeToTray() bool {
 			}
 		}
 		if !a.hideWindow() {
+			a.noteExit("the window closed (it couldn't be hidden)")
 			return false
 		}
 		log.Print("ui: attempted to close the window, hiding due to run from tray")
 	}
-	a.focused = false // no ConfigEvent may come before the next notification
+	a.loseFocus() // no ConfigEvent may come before the next notification
+	// an inspect session (a frozen one holds the huddle window's animated
+	// images too) ends with the window: nothing it inspects is on screen
+	a.closeInspectSession()
 	var title, content string
 	switch {
 	case keep && !a.prefs.HasExplainedWindowFlash:
@@ -220,6 +231,11 @@ func (a *App) drainIdle() {
 		return
 	}
 	slackc.LockFrame()
+	a.wd.next(&stagePosted) // the freeze report's stage: posted work, not the event
 	a.drain()
+	// the work may have changed what the last frame drew (postLazy's
+	// doesn't Invalidate): the next frame is laid out, not shown again
+	// from the last one's ops (quiet.go)
+	a.layoutDue.Store(true)
 	slackc.UnlockFrame()
 }

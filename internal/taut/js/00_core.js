@@ -261,7 +261,9 @@ function fnRef(fn) {
 T.callFn = (id, args) => {
   const fn = jsFns.get(id)
   if (!fn) throw new Error(`[Taut] function ${id} was released`)
-  return fn(...decode(args || []))
+  const [a, events] = decodeArgs(args)
+  const r = fn(...a)
+  return events ? eventAnswer(events) : r
 }
 T.releaseFns = (ids) => {
   for (const id of ids || []) {
@@ -352,6 +354,7 @@ function decode(v) {
   if (v === null || typeof v !== 'object') return v
   if (Array.isArray(v)) return v.map(decode)
   if (typeof v.$gofn === 'number' && Object.keys(v).length === 1) return goFn(v.$gofn)
+  if (v.$event && typeof v.$event === 'object' && Object.keys(v).length === 1) return syntheticEvent(v.$event)
   if (typeof v.$fn === 'number' && Object.keys(v).length === 1) return jsFns.get(v.$fn) ?? (() => {})
   // a file from Go (composer attachments): a real File, which plugins like AnonymizeFilenames rebuild
   if (v.$file && typeof v.$file === 'object' && typeof File !== 'undefined') {
@@ -367,6 +370,67 @@ function decode(v) {
   for (const k in v) out[k] = k === 'delta' ? reviveDelta(decode(v[k])) : decode(v[k])
   return out
 }
+/**
+ * A DOM event from Go ({$event: fields}) is React's synthetic event: the
+ * handler can call stopPropagation and preventDefault (kit's
+ * FormTextInput onKeyDown, where `e.stopPropagation()` on Escape keeps a
+ * Popover open, as react-modal never hears it). A call whose arguments
+ * carry one answers with what the handler did, {$event: {stopped,
+ * prevented}}, instead of its result (eventAnswer).
+ */
+let decodedEvents = null
+const hide = (o, methods) => {
+  for (const [k, value] of Object.entries(methods)) Object.defineProperty(o, k, { value, writable: true, configurable: true, enumerable: false })
+}
+function syntheticEvent(fields) {
+  const e = decode(fields)
+  let stopped = false
+  let prevented = !!e.defaultPrevented
+  const stop = () => {
+    stopped = true
+  }
+  const prevent = () => {
+    prevented = true
+    e.defaultPrevented = true
+  }
+  // non-enumerable, as on React's SyntheticEvent prototype: an event a
+  // handler passes on to Go (Slick's onSelectAction hands its own to the
+  // menu's) encodes as its fields, not five new function refs each time
+  // (encode walks with for…in, and nothing releases those)
+  hide(e, {
+    stopPropagation: stop,
+    preventDefault: prevent,
+    isPropagationStopped: () => stopped,
+    isDefaultPrevented: () => prevented,
+    persist() {},
+  })
+  if (e.nativeEvent && typeof e.nativeEvent === 'object') {
+    hide(e.nativeEvent, { stopPropagation: stop, stopImmediatePropagation: stop, preventDefault: prevent })
+  }
+  ;(decodedEvents ??= []).push(() => ({ stopped, prevented }))
+  return e
+}
+/** decodes a call's arguments: them, and the synthetic events among them (null: none) */
+function decodeArgs(args) {
+  decodedEvents = null
+  const a = decode(args || [])
+  const events = decodedEvents
+  decodedEvents = null
+  return [a, events]
+}
+/** what the handler did with the call's events, read as it returns (a handler stops an event synchronously) */
+function eventAnswer(events) {
+  const out = { stopped: false, prevented: false }
+  for (const ev of events) {
+    const { stopped, prevented } = ev()
+    out.stopped ||= stopped
+    out.prevented ||= prevented
+  }
+  return { $event: out }
+}
+T.decodeArgs = decodeArgs
+T.eventAnswer = eventAnswer
+
 /**
  * Slack hands composer deltas around as Quill Delta instances, and plugins
  * build on them (`new delta.constructor().insert('/channel ')` in

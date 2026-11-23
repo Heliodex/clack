@@ -73,7 +73,10 @@ func (c *CLI) Run(ctx context.Context) error {
 		return nil
 	}
 	say("Newer release: %s (%s)", r.Tag, r.URL)
-	a, err := c.Install.PickAsset(r)
+	a, err := c.Install.ReadyAsset(r, time.Now())
+	if errors.Is(err, ErrAssetsPending) {
+		return fmt.Errorf("%w; Clack %s is still being published, try again in a minute", err, r.Tag)
+	}
 	if err != nil {
 		return fmt.Errorf("%w; download it from %s", err, r.URL)
 	}

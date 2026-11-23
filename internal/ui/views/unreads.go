@@ -128,6 +128,11 @@ type Unreads struct {
 	evq     []core.Event
 	fetched []unrFetched
 	sub     bool
+	// shown: whether the view drew in the latest frame (the events'
+	// goroutine redraws only then); stale: the queue overflowed while it
+	// didn't, so the next Layout builds again instead of replaying it
+	shown shownTracker
+	stale bool
 
 	focused bool
 	active  int       // the keyboard's row (index into rows), -1: none
@@ -147,6 +152,7 @@ func NewUnreads(h Host) *Unreads {
 		rng: rand.New(rand.NewSource(time.Now().UnixNano()))}
 	v.list.Axis = layout.Vertical
 	v.pickEmpty()
+	v.mediaPane = "unreads"
 	return v
 }
 
@@ -186,7 +192,7 @@ func (v *Unreads) sectionFilter() string {
 }
 
 func (v *Unreads) sections() []core.Section {
-	return v.h.Core().Snapshot().Sections
+	return v.h.Core().RecentSnapshot().Sections // read every frame (the section filter)
 }
 
 func (v *Unreads) section(id string) *core.Section {
@@ -324,10 +330,17 @@ func (v *Unreads) subscribe() {
 		for ev := range ch {
 			switch ev.Type {
 			case "message", "update", "delete", "prefs", "marked":
+				shown := v.shown.shown(v.h)
 				v.mu.Lock()
-				v.evq = append(v.evq, ev)
+				if shown || len(v.evq) < unrQueueMax {
+					v.evq = append(v.evq, ev)
+				} else {
+					v.evq, v.stale = nil, true // let it go: the next Layout builds again
+				}
 				v.mu.Unlock()
-				v.h.Invalidate()
+				if shown {
+					v.h.Invalidate()
+				}
 			}
 		}
 	}()
@@ -623,10 +636,23 @@ func (v *Unreads) lastRead(ch string) string { return v.h.Core().Count(ch).LastR
 // ---- Layout ----
 
 // Layout draws the view.
+// unrQueueMax bounds the events queued while the view isn't on screen
+// (a busy workspace's messages, edits and marks): past it the queue goes
+// and the next Layout builds the view again.
+const unrQueueMax = 1024
+
 func (v *Unreads) Layout(gtx C) D {
+	v.shown.mark(v.h)
 	v.frame()
 	v.notes.drain(v.h)
 	v.subscribe()
+	v.mu.Lock()
+	stale := v.stale
+	v.stale = false
+	v.mu.Unlock()
+	if stale && v.built {
+		v.build()
+	}
 	if !v.built && v.known() {
 		v.build()
 	}
@@ -707,7 +733,7 @@ func (v *Unreads) filterLabel() string {
 // allLabel: "All of {org}" on an Enterprise org (isEnterprise), else
 // "All of {workspace}" / "All conversations".
 func (v *Unreads) allLabel() string {
-	snap := v.h.Core().Snapshot()
+	snap := v.h.Core().RecentSnapshot()
 	if n := snap.Team.Name; n != "" {
 		return nsUnreads.T("All of {workspace}", "workspace", n)
 	}
@@ -725,7 +751,7 @@ func (v *Unreads) control(gtx C, c *widget.Clickable, label string, team bool) D
 				if !team || v.sectionFilter() != "" {
 					return D{}
 				}
-				icon := v.h.Core().Snapshot().Team.Icon
+				icon := v.h.Core().RecentSnapshot().Team.Icon
 				return layout.Inset{Right: 4}.Layout(gtx, func(gtx C) D { return v.avatar(gtx, icon, 16) })
 			}),
 			layout.Rigid(func(gtx C) D { return v.label(gtx, 13, wReg, col, label) }),
@@ -1208,14 +1234,18 @@ func (v *Unreads) message(gtx C, r unrRow) D {
 		v.msgs[key] = s
 	}
 	hovered := s.hv.Update(gtx.Source)
+	menu := false // opened once the body laid out: it may be the body's (content_menu.go)
 	for {
 		ev, ok := gtx.Event(pointer.Filter{Target: &s.ctx, Kinds: pointer.Press})
 		if !ok {
 			break
 		}
 		if e, ok := ev.(pointer.Event); ok && ctxclick.Press(e) {
-			v.messageMenu(*m)
+			menu = true
 		}
+	}
+	if menu {
+		defer v.messageMenu(gtx, *m)
 	}
 	w := gtx.Constraints.Max.X
 	name, av := v.authorOf(m)
@@ -1276,24 +1306,30 @@ func (v *Unreads) message(gtx C, r unrRow) D {
 		}
 		fill(gtx, rr, bg)
 	}
-	call.Add(gtx.Ops)
+	// the row's hover and right-click target are the content's parent
+	// (threads.go msg: a sibling on top took the pointer from the body)
 	st := clip.Rect(rr).Push(gtx.Ops)
 	s.hv.Add(gtx.Ops)
-	pass := pointer.PassOp{}.Push(gtx.Ops)
 	event.Op(gtx.Ops, &s.ctx)
-	pass.Pop()
+	call.Add(gtx.Ops)
 	st.Pop()
 	return D{Size: rr.Size()}
 }
 
 // messageMenu opens the message's context menu at the pointer.
-func (v *Unreads) messageMenu(m core.Message) {
+func (v *Unreads) messageMenu(gtx C, m core.Message) {
 	ph, ok := v.h.(popups.Host)
 	if !ok {
 		v.h.OpenMessageMenu(image.Point{}, m)
 		return
 	}
 	at := v.menuAt().Min
+	// what the press was on in the body (an image, a link, a mention, a
+	// file: popups.ContentMenu), as the channel's list opens it
+	if o, ok := v.contentMenu(gtx, ph, at, m); ok {
+		ph.ShowOverlay(o)
+		return
+	}
 	ph.ShowOverlay(popups.NewMessageContextMenu(ph, at, m, popups.InChannel, popups.MessageMenuOpts{}))
 }
 

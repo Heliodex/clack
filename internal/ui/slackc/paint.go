@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"gioui.org/f32"
+	"gioui.org/font"
 	"gioui.org/io/event"
 	"gioui.org/io/pointer"
 	"gioui.org/layout"
@@ -124,11 +125,17 @@ func (p *painter) rect(b *box, r rectF) {
 	if p.hasXf {
 		sr = xfRect(p.xf, r)
 	}
-	if b.rectFr != p.v.frameNo || b.scope != p.s {
-		b.rect, b.rectFr = sr, p.v.frameNo
+	switch {
+	case measuring > 0:
+		// a measure pass (measureNative): its layout is discarded
+	case b.rectFr != p.v.frameNo || b.scope != p.s:
+		b.rect, b.rectFr, b.rectPaint = sr, p.v.frameNo, p.s.paintSeq
 		p.s.painted = append(p.s.painted, b)
-	} else {
-		b.rect = b.rect.union(sr)
+	case b.rectPaint != p.s.paintSeq:
+		// painted again this frame (its host drawn again): the later layout
+		b.rect, b.rectPaint = sr, p.s.paintSeq
+	default:
+		b.rect = b.rect.union(sr) // another fragment of this paint
 	}
 	if !p.hasXf {
 		sr = sr.inter(p.clip)
@@ -419,7 +426,7 @@ func (p *painter) content(b *box, x, y float32) {
 	}
 	saveU, saveUSet := p.under, p.uset
 	defer func() { p.under, p.uset = saveU, saveUSet }()
-	if visible {
+	if visible && !b.ownBox() { // a native drawing its own box paints these itself (Host.PaintBox)
 		p.shadows(b, r, rad, false)
 		p.background(b, r, rad)
 		p.coverWith(st.Background.Color) // what the box's content is painted over
@@ -573,8 +580,23 @@ func (p *painter) fixed(k *box) {
 	saveClip := p.clip
 	p.clip = noClip
 	p.inDefer = true
+	var area clip.Stack
+	modal := k.Modal() && p.s != nil
+	if modal {
+		// an open modal <dialog> in the page's own tree: a window layer
+		// (layers.go), its area inside the deferred ops it's drawn by
+		l := &p.v.state(k).layer
+		OpenLayer(p.s.gtx, l, l.spec())
+		area = clip.Rect(irect(rectF{-ox, -oy, -ox + p.v.vw, -oy + p.v.vh})).Push(p.ops)
+		pass := pointer.PassOp{}.Push(p.ops)
+		event.Op(p.ops, &l.area)
+		pass.Pop()
+	}
 	p.backdrop(k, ox, oy)
 	p.paintBox(k, x, y)
+	if modal {
+		area.Pop()
+	}
 	p.inDefer = false
 	p.clip = saveClip
 	// a pass-through handler inside the deferred ops so events over the
@@ -1079,6 +1101,17 @@ func (p *painter) outline(b *box, r rectF, rad [4]float32) {
 // shadows draws outer (inset=false) or inner box shadows; blur is
 // approximated by stacked translucent layers.
 func (p *painter) shadows(b *box, r rectF, rad [4]float32, inset bool) {
+	p.shadowsSliced(b, r, rad, inset, false, false)
+}
+
+// shadowsSliced is shadows for one line's piece of an inline box that
+// wraps, which goes on before it (noLeft) or after it (noRight): as
+// Chromium paints a sliced fragment's shadows (BoxPainterBase's
+// ClipToSides and AdjustRectForSideClipping), an outer shadow is cut off
+// at the piece's edge on those sides, its shape running on past it, and an
+// inset one's hole runs on past them, so neither shows where the box
+// broke.
+func (p *painter) shadowsSliced(b *box, r rectF, rad [4]float32, inset, noLeft, noRight bool) {
 	for i := len(b.st.BoxShadow) - 1; i >= 0; i-- {
 		sh := &b.st.BoxShadow[i]
 		if sh.Inset != inset || sh.Color.A == 0 {
@@ -1087,15 +1120,30 @@ func (p *painter) shadows(b *box, r rectF, rad [4]float32, inset bool) {
 		dp := p.v.dp
 		ox, oy, blur, spread := sh.X*dp, sh.Y*dp, sh.Blur*dp, sh.Spread*dp
 		col := p.col(sh.Color)
+		// how far past a cut side the shape runs: further than any blur
+		on := 4*blur + abs32(ox) + abs32(spread) + 50
 		if !inset {
 			// clip out the box itself so translucent boxes don't show it
 			var pa clip.Path
 			pa.Begin(p.ops)
 			big := rectF{r.x0 - 4*blur - abs32(ox) - spread - 50, r.y0 - 4*blur - abs32(oy) - spread - 50, r.x1 + 4*blur + abs32(ox) + spread + 50, r.y1 + 4*blur + abs32(oy) + spread + 50}
+			if noLeft {
+				big.x0 = r.x0
+			}
+			if noRight {
+				big.x1 = r.x1
+			}
 			addRRect(&pa, big, [4]float32{}, false)
 			addRRect(&pa, r, rad, true)
 			cs := clip.Outline{Path: pa.End()}.Op().Push(p.ops)
-			base := rectF{r.x0 + ox - spread, r.y0 + oy - spread, r.x1 + ox + spread, r.y1 + oy + spread}
+			sr := r
+			if noLeft {
+				sr.x0 -= on
+			}
+			if noRight {
+				sr.x1 += on
+			}
+			base := rectF{sr.x0 + ox - spread, sr.y0 + oy - spread, sr.x1 + ox + spread, sr.y1 + oy + spread}
 			brad := rad
 			for j := range brad {
 				if brad[j] > 0 || spread > 0 {
@@ -1141,6 +1189,12 @@ func (p *painter) shadows(b *box, r rectF, rad [4]float32, inset bool) {
 				d += blur * (float32(k) + 0.5) / float32(layers)
 			}
 			hole := rectF{pr.x0 + ox + d, pr.y0 + oy + d, pr.x1 + ox - d, pr.y1 + oy - d}
+			if noLeft {
+				hole.x0 = pr.x0 - on
+			}
+			if noRight {
+				hole.x1 = pr.x1 + on
+			}
 			outer := rectF{pr.x0 - 1e3, pr.y0 - 1e3, pr.x1 + 1e3, pr.y1 + 1e3}
 			paint.FillShape(p.ops, c, clip.Outline{Path: ringPath(p.ops, outer, [4]float32{}, hole, shrinkRad(prad, d))}.Op())
 		}
@@ -1215,6 +1269,11 @@ func (p *painter) drawWord(sh *shaped, x, y float32, col color.NRGBA, st *css.St
 	if sh == nil || len(sh.glyphs) == 0 || col.A == 0 {
 		return
 	}
+	// the labels' ink (theme.Text): light-on-dark glyphs faded for Gio's
+	// linear-light coverage, so a plugin's text (UserPronouns' 12px
+	// sk_foreground_max_solid) is no heavier than the native timestamp
+	// beside it
+	col = TextInk(col, st.FontWeight, p.v.dp, chromeText())
 	shp := shaper()
 	path, bm := sh.pathOf(shp)
 	t := op.Affine(f32.AffineId().Offset(f32.Pt(x, float32(math.Round(float64(y)))))).Push(p.ops)
@@ -1235,6 +1294,19 @@ func (p *painter) drawWord(sh *shaped, x, y float32, col color.NRGBA, st *css.St
 		bm.Add(p.ops)
 	}
 	t.Pop()
+}
+
+// TextInk is the colour a word in col at CSS weight (100..900) is inked
+// in at dp px per dp: the labels' (theme.LabelInk).
+func TextInk(col color.NRGBA, weight int, dp float32, chrome bool) color.NRGBA {
+	return theme.LabelInk(col, dp, font.Weight(weight-400), chrome)
+}
+
+// chromeText reports whether the theme is drawing the aubergine chrome
+// (top nav, rail, sidebar), whose light text fades less (theme.LabelInk).
+func chromeText() bool {
+	th := env().Theme
+	return th != nil && th.Chrome
 }
 
 // run paints an inline formatting context; (x, y) is the container's
@@ -1472,4 +1544,13 @@ func (p *painter) native(b *box, x, y float32) {
 	b.natCall.Add(p.ops)
 	o()
 	t.Pop()
+	// a host component's children (Host.Children) flushed their rects
+	// while it laid them out, before it placed them inside it
+	// (Host.PlaceChildren) and before this layout pass put it where it is
+	// now: flush them from here, this frame
+	if b.hostEl != nil {
+		if s := p.v.subs[subKey{b: b, kind: 1}]; s != nil {
+			s.flushRects()
+		}
+	}
 }

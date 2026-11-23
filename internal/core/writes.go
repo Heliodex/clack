@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -37,9 +38,55 @@ func isCode(err error, codes ...string) bool {
 	return false
 }
 
-// Edit replaces a message's text (and optional blocks).
+// Edit replaces a message's text (and optional blocks), as Slack's
+// saveMessageEdit (boot-shared IHC0) does: editMessage (wVuW u_) puts the
+// edit into the store first, so the list and anything reading the store
+// (Up, /s) see it at once. Like the reducer it sets the blocks when there
+// are any, else the text, and drops edited (the call passes no editTs:
+// "(edited)" comes back with message_changed). chat.update goes out next,
+// and a failure puts the message back as it was (text, blocks, edited,
+// files).
 func (a *App) Edit(ctx context.Context, ch, ts, text string, blocks json.RawMessage) error {
-	return a.C.Update(ctx, ch, ts, text, blocks)
+	prev, had := a.S.Find(ch, ts)
+	if had && !editUnchanged(&prev, text, blocks) {
+		if upd, ok := a.S.MutateNoted(ch, ts, func(x *slack.Message) {
+			if len(blocks) > 0 {
+				x.Blocks = blocks
+			} else {
+				x.Text = text
+			}
+			x.Edited = nil
+		}); ok {
+			a.emitUpdate(ch, &upd)
+		}
+	}
+	err := a.C.Update(ctx, ch, ts, text, blocks)
+	if err != nil && had {
+		if upd, ok := a.S.MutateNoted(ch, ts, func(x *slack.Message) {
+			x.Text, x.Blocks, x.Edited, x.Files = prev.Text, prev.Blocks, prev.Edited, prev.Files
+		}); ok {
+			a.emitUpdate(ch, &upd)
+		}
+	}
+	return err
+}
+
+// editUnchanged is editMessage's no-op: the same blocks (or, with none,
+// the same text) as the message has.
+func editUnchanged(m *slack.Message, text string, blocks json.RawMessage) bool {
+	if len(blocks) > 0 {
+		return bytes.Equal(bytes.TrimSpace(blocks), bytes.TrimSpace(m.Blocks))
+	}
+	return m.Text == text
+}
+
+// EndStale reports whether ch's window stops short of the conversation's
+// end: a slow connect's catch-up hasn't joined it to what the socket
+// brought (reached_end.go). Slack's getTimestampsByChannelId with no start
+// is empty until reachedEnd, so its edit-last selectors find nothing then.
+func (a *App) EndStale(ch string) bool {
+	t := a.S.Timeline(ch)
+	return t != nil && t.EndStale
 }
 
 // EditWithFiles saves an edit whose files changed (Slack's
@@ -77,7 +124,7 @@ func (a *App) DeleteAttachment(ctx context.Context, ch, ts, id string) error {
 	for _, s := range ids {
 		drop[s] = true
 	}
-	if upd, ok := a.S.Mutate(ch, ts, func(x *slack.Message) {
+	if upd, ok := a.S.MutateNoted(ch, ts, func(x *slack.Message) { // a read out now keeps it
 		kept := x.Attachments[:0:0]
 		for _, at := range x.Attachments {
 			if !drop[strconv.Itoa(at.ID)] {
@@ -184,6 +231,7 @@ func (a *App) Upload(ctx context.Context, o UploadOpts) ([]UploadedFile, error) 
 	raws := make([]*PendingFile, len(o.Files))
 	for i, f := range o.Files {
 		raws[i] = NewPendingFile(f.Name, firstNonEmpty(f.Title, f.Name), f.Data)
+		raws[i].Subtype = f.Subtype
 	}
 	var ph *filePlaceholder
 	if o.Channel != "" {
@@ -317,9 +365,11 @@ func (a *App) PrepareUpload(ctx context.Context, f UploadFile, progress func(sen
 }
 
 // uploadOnce is one eager upload attempt: files.getUploadURL {filename,
-// length, snippet_type, alt_txt} (Slack's getUploadURL fetcher sends the
-// last two for snippets and for images with alt text), the multipart POST
-// to upload_url, files.completeUpload.
+// length, snippet_type, subtype, alt_txt} (Slack's getUploadURL fetcher
+// sends snippet_type for snippets, subtype for clips and alt_txt for
+// images with alt text), the multipart POST to upload_url,
+// files.completeUpload {files: [{id, title, subtype}]} (UploadQueue's
+// _getMultiFileUploadDataForApi adds subtype when the File has one).
 func (a *App) uploadOnce(ctx context.Context, f UploadFile, progress func(sent, total int64)) (string, error) {
 	t0 := time.Now()
 	var r struct {
@@ -331,6 +381,9 @@ func (a *App) uploadOnce(ctx context.Context, f UploadFile, progress func(sent, 
 	args := url.Values{"filename": {f.Name}, "length": {strconv.Itoa(n)}}
 	if f.SnippetType != "" {
 		args.Set("snippet_type", f.SnippetType)
+	}
+	if f.Subtype != "" {
+		args.Set("subtype", f.Subtype)
 	}
 	if f.AltText != "" {
 		args.Set("alt_txt", f.AltText)
@@ -348,7 +401,7 @@ func (a *App) uploadOnce(ctx context.Context, f UploadFile, progress func(sent, 
 		return "", err
 	}
 	log.Printf("upload: %s POST %d bytes in %s", id, n, time.Since(t0).Round(time.Millisecond))
-	if err := a.C.CompleteUpload(ctx, []slack.UploadedRef{{ID: id, Title: firstNonEmpty(f.Title, f.Name)}}); err != nil {
+	if err := a.C.CompleteUpload(ctx, []slack.UploadedRef{{ID: id, Title: firstNonEmpty(f.Title, f.Name), Subtype: f.Subtype}}); err != nil {
 		log.Printf("upload: %s completeUpload failed (%s)", id, uploadErrClass(err))
 		return "", err
 	}
@@ -386,21 +439,47 @@ func uploadErrClass(err error) string {
 	return "network error"
 }
 
-// Pin / Unpin a message.
+// Pin is the message menu's pin (Slack's pinMessage, boot-shared fBOF):
+// the Pins tab's row (prependPinnedItem) and the message's pin
+// (upsertMessagePinnedStatus: pinned_to and pinned_info {pinned_by: the
+// viewer}, "Pinned by you") change at once, then pins.add {channel,
+// timestamp, reason "pin-message"} (htKN pinsAdd). A failure other than
+// already_pinned takes both back (removePinnedItem, the pin cleared);
+// the caller toasts too_many_pins (PinErrorToast). The pin_added that
+// follows a success finds both done.
 func (a *App) Pin(ctx context.Context, ch, ts string) error {
-	err := a.C.Call(ctx, "pins.add", url.Values{"channel": {ch}, "timestamp": {ts}}, nil)
-	if isCode(err, "already_pinned") {
+	self := a.S.SelfID()
+	it := PinsTabItem{Type: "message", Channel: ch, TS: ts, Created: time.Now().Unix(), CreatedBy: self}
+	if m, ok := a.S.SetPin(ch, ts, true, &slack.PinnedInfo{Channel: ch, PinnedBy: self}); ok {
+		it.Msg = a.messagePtr(ch, &m)
+		a.emitUpdate(ch, &m)
+	}
+	a.pinsTabPrepend(ch, it)
+	err := a.C.Call(ctx, "pins.add", url.Values{"channel": {ch}, "timestamp": {ts}, "reason": {"pin-message"}}, nil)
+	if err == nil || isCode(err, "already_pinned") {
 		return nil
+	}
+	a.pinsTabRemove(ch, it)
+	if m, ok := a.S.SetPin(ch, ts, false, nil); ok {
+		a.emitUpdate(ch, &m)
 	}
 	return err
 }
 
+// IsTooManyPins reports a pins.add refused for a channel at its pin limit
+// (too_many_pins: Slack's TooManyPins, PinErrorToast).
+func IsTooManyPins(err error) bool { return isCode(err, "too_many_pins") }
+
+// Unpin is the message menu's unpin (Slack's unpinMessage, boot-shared
+// 4mNC): the row and the message's pin go at once, pins.remove {channel,
+// timestamp, reason "unpin-message"}, both back on a failure; no_pin
+// counts as done. The Pins tab's Remove pin runs the same (UnpinFromTab).
 func (a *App) Unpin(ctx context.Context, ch, ts string) error {
-	err := a.C.Call(ctx, "pins.remove", url.Values{"channel": {ch}, "timestamp": {ts}}, nil)
-	if isCode(err, "no_pin") {
-		return nil
+	it := PinsTabItem{Type: "message", Channel: ch, TS: ts}
+	if row, ok := a.pinsTabRow(ch, it); ok {
+		it = row // its place and pin time come back on a failure
 	}
-	return err
+	return a.UnpinFromTab(ctx, it)
 }
 
 func savedParams(ch, ts string) url.Values {
@@ -431,6 +510,19 @@ func (a *App) Unsave(ctx context.Context, ch, ts string) error {
 		return err
 	}
 	a.markSaved(ch, ts, false)
+	return nil
+}
+
+// ClearSaved is clearSavedItemImmediately's saved.delete (boot-shared
+// PxoD): saved_not_found, an item already cleared elsewhere, counts as
+// cleared, as Slack's catch skips it (_.RF.SavedNotFound).
+func (a *App) ClearSaved(ctx context.Context, ch, ts string) error {
+	if err := a.Unsave(ctx, ch, ts); err != nil {
+		if !isCode(err, "saved_not_found") {
+			return err
+		}
+		a.markSaved(ch, ts, false)
+	}
 	return nil
 }
 
@@ -476,9 +568,10 @@ func (a *App) SubscribeThread(ctx context.Context, ch, threadTS string, follow b
 	}
 	err := a.C.Call(ctx, m, url.Values{"channel": {ch}, "thread_ts": {threadTS}}, nil)
 	if err == nil {
-		// The root's subscribed flag now, as the thread_subscribed event
+		// The thread's subscribed flag now, as the thread_subscribed event
 		// would set it (it may come late or, on some workspaces, not at all).
-		if msg, ok := a.S.Mutate(ch, threadTS, func(m *slack.Message) { m.Subscribed = follow }); ok {
+		a.S.SetThreadSub(ch, threadTS, func(s *store.ThreadSub) { s.Subscribed = follow })
+		if msg, ok := a.S.FindHeld(ch, threadTS); ok { // a root fetched by id too (store/fetched.go)
 			a.emitUpdate(ch, &msg)
 		}
 		a.refreshCountsSoon()
@@ -491,8 +584,10 @@ func (a *App) MarkThread(ctx context.Context, ch, threadTS, ts string) error {
 	err := a.C.Call(ctx, "subscriptions.thread.mark", url.Values{"channel": {ch}, "thread_ts": {threadTS}, "ts": {ts}, "read": {"1"}}, nil)
 	if err == nil {
 		// setThreadLastRead: the subscription's last_read now, as the
-		// thread_marked event would set it
+		// thread_marked event would set it, and markThread's
+		// updateActivitiesUnreadState for the reply bars' items
 		a.setThreadLastRead(ch, threadTS, ts)
+		a.threadActivityRead(ch, threadTS, ts)
 		a.refreshCountsSoon()
 	}
 	return err
@@ -515,7 +610,7 @@ func (a *App) join(ctx context.Context, ch string, exp int64) (Conv, error) {
 	if full, err := a.C.ConversationInfo(ctx, ch); err == nil {
 		c = *full
 	}
-	a.S.PutConv(c)
+	a.S.PutConvLocal(c)
 	v := a.conv(&c)
 	a.emit(Event{Type: "conv", Channel: ch, Conv: &v})
 	return v, nil
@@ -561,7 +656,7 @@ func (a *App) OpenDM(ctx context.Context, users ...string) (Conv, error) {
 		c.IsIM, c.User = true, users[0]
 	}
 	a.EnsureUsers(ctx, append(users, c.User))
-	a.S.PutConv(c)
+	a.S.PutConvLocal(c)
 	a.openDM(c.ID)
 	v := a.conv(&c)
 	a.emit(Event{Type: "conv", Channel: c.ID, Conv: &v})

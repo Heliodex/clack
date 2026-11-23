@@ -3,9 +3,12 @@ package popups
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"image"
+	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +20,7 @@ import (
 
 	"github.com/some-du6e/clack/internal/core"
 	"github.com/some-du6e/clack/internal/fakeslack"
+	"github.com/some-du6e/clack/internal/ui/richclip"
 	"github.com/some-du6e/clack/internal/ui/shortcut"
 	"github.com/some-du6e/clack/internal/ui/slackc"
 )
@@ -30,10 +34,21 @@ type mkEnv struct {
 	now time.Time
 	// clip is the last text the menu put on the clipboard.
 	clip string
+	// rich gets Copy message's copy where the platform has a rich
+	// clipboard (macOS, Windows): richclip writes it off the UI goroutine,
+	// not through Gio's clipboard, so on those runners the router never
+	// saw it and clip stayed "" (menu-keys' macos job, red 11-14..11-20)
+	rich chan string
 }
 
 func newMkEnv(t *testing.T, m *Menu) *mkEnv {
-	e := &mkEnv{t: t, m: m, now: time.Date(2026, 11, 8, 15, 0, 0, 0, time.UTC)}
+	e := &mkEnv{t: t, m: m, now: time.Date(2026, 11, 8, 15, 0, 0, 0, time.UTC), rich: make(chan string, 8)}
+	prev := writeRich
+	writeRich = func(_ context.Context, c richclip.Copy) error {
+		e.rich <- c.Text
+		return nil
+	}
+	t.Cleanup(func() { writeRich = prev })
 	// two frames: the first one's FocusCmd holds that frame's events
 	e.frame()
 	e.frame()
@@ -49,7 +64,21 @@ func (e *mkEnv) frame() {
 	if _, b, ok := e.r.WriteClipboard(); ok {
 		e.clip = string(b)
 	}
+	select {
+	case s := <-e.rich:
+		e.clip = s
+	default:
+	}
 	e.now = e.now.Add(16 * time.Millisecond)
+}
+
+// clipWait runs frames until the clipboard has want or 5 s pass: a rich
+// copy lands from its own goroutine.
+func (e *mkEnv) clipWait(want string) string {
+	for end := time.Now().Add(5 * time.Second); e.clip != want && time.Now().Before(end); time.Sleep(5 * time.Millisecond) {
+		e.frame()
+	}
+	return e.clip
 }
 
 // press sends a key press and release and runs the frames that handle it.
@@ -65,7 +94,35 @@ func (e *mkEnv) press(n key.Name, mods key.Modifiers) {
 // menus' actions (mark unread, save, pin) run.
 func mkHost(t *testing.T) *tzHost {
 	t.Helper()
-	h := hcEnv(t)
+	return mkBoot(t, hcEnv(t))
+}
+
+// mkHostCounting is mkHost over a fake that counts the API calls each
+// method gets (calls, safe from any goroutine).
+func mkHostCounting(t *testing.T) (h *tzHost, calls func(method string) int) {
+	t.Helper()
+	fs, err := fakeslack.Start(fakeslack.Small)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { fs.Close() })
+	var mu sync.Mutex
+	n := map[string]int{}
+	fs.SetHook(func(method string, _ url.Values) (any, bool) {
+		mu.Lock()
+		n[method]++
+		mu.Unlock()
+		return nil, false
+	})
+	return mkBoot(t, hcEnvOn(t, fs)), func(method string) int {
+		mu.Lock()
+		defer mu.Unlock()
+		return n[method]
+	}
+}
+
+func mkBoot(t *testing.T, h *tzHost) *tzHost {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	done := make(chan error, 1)
@@ -209,8 +266,8 @@ func TestMenuKeysMessageActions(t *testing.T) {
 		t.Errorf("read cursor %q, want %s: Mark unread didn't run", h.a.Count("C0FAKE00001").LastRead, want)
 	}
 	copied := func(t *testing.T, _ *tzHost, e *mkEnv, _ *mkHooks) {
-		if e.clip != "synthetic menu keys" {
-			t.Errorf("clipboard %q", e.clip)
+		if clip := e.clipWait("synthetic menu keys"); clip != "synthetic menu keys" {
+			t.Errorf("clipboard %q", clip)
 		}
 	}
 	cases := []struct {
@@ -301,7 +358,6 @@ func TestMenuKeysIgnored(t *testing.T) {
 		{"linux", "L", key.ModShift},
 		{"darwin", "C", key.ModCtrl},
 		{"linux", "C", key.ModSuper},
-		{"linux", "P", 0},                    // Pin is in Organize ▸; the submenu has the key
 		{"linux", key.NameDeleteForward, 0},  // not own: no Delete message…
 		{"linux", key.NameDeleteBackward, 0}, // Backspace deletes on macOS only
 		{"darwin", "E", 0},                   // not own: no Edit message
@@ -323,10 +379,12 @@ func TestMenuKeysIgnored(t *testing.T) {
 }
 
 // M opens Add a reminder ▸ with the keyboard (it's a submenu row); P
-// pins once the Organize ▸ submenu has keyboard focus.
+// pins once the Organize ▸ submenu has keyboard focus, and from the root
+// menu too: Slack's MessageActionsMenu (2rcC onMenuKeyDown) runs the keys
+// of the submenu actions it built (Organize's Pin) and closes the menu.
 func TestMenuKeysSubmenus(t *testing.T) {
 	setGOOS(t, "linux")
-	h := mkHost(t)
+	h, calls := mkHostCounting(t)
 	e, _ := mkOpen(t, h, "more", false)
 	e.press("M", 0)
 	if e.m.Dismissed() || e.m.sub == nil || !e.m.sub.kbd || e.m.items[e.m.subIdx].Label != "Add a reminder" {
@@ -342,12 +400,58 @@ func TestMenuKeysSubmenus(t *testing.T) {
 	if e.m.sub == nil || !e.m.sub.kbd {
 		t.Fatal("→ didn't open Organize")
 	}
+	seq := h.a.S.PinSeq()
 	e.press("P", 0)
 	if !e.m.Dismissed() {
 		t.Error("P in Organize ▸ left the menu open")
 	}
-	if ts := waitToast(h, e, 10*time.Second); len(ts) == 0 {
+	// pinMessage (core.Pin) pins the message at once, before pins.add
+	// answers, and Slack toasts nothing: the store saw a pin
+	for end := time.Now().Add(10 * time.Second); h.a.S.PinSeq() == seq && time.Now().Before(end); {
+		e.frame()
+		time.Sleep(10 * time.Millisecond)
+	}
+	if h.a.S.PinSeq() == seq {
 		t.Error("P didn't pin")
+	}
+	if ts := h.toastList(); slices.Contains(ts, "Message pinned") {
+		t.Errorf("a pin toasted %q; Slack's pinMessage toasts nothing", ts)
+	}
+
+	// P from the root of the context menu and of More actions: one pin
+	// request each, counted at the fake (the store's pin seq also moves
+	// when a pin the fake refuses is reverted, after the press). Each on a
+	// message of its own: the client holds back a request identical to
+	// one that just failed (the fake refuses these pins), and a refused
+	// pin's revert lands after the press.
+	pinRequests := func() int { return calls("pins.add") + calls("pins.remove") }
+	for end := time.Now().Add(10 * time.Second); pinRequests() == 0 && time.Now().Before(end); {
+		time.Sleep(10 * time.Millisecond) // Organize ▸ P's request, at the fake before we count
+	}
+	time.Sleep(200 * time.Millisecond)
+	for i, which := range []string{"context", "more"} {
+		msg := mkMsg(false)
+		msg.TS = fmt.Sprintf("1700000000.%06d", 201+i)
+		var m *Menu
+		if which == "more" {
+			m = NewMessageMenuOpts(h, image.Pt(600, 100), msg, MessageMenuOpts{})
+		} else {
+			m = NewMessageContextMenu(h, image.Pt(200, 200), msg, InChannel, MessageMenuOpts{})
+		}
+		e := newMkEnv(t, m)
+		before := pinRequests()
+		e.press("P", 0)
+		if !e.m.Dismissed() {
+			t.Errorf("%s: P from the root left the menu open", which)
+		}
+		for end := time.Now().Add(10 * time.Second); pinRequests() == before && time.Now().Before(end); {
+			e.frame()
+			time.Sleep(10 * time.Millisecond)
+		}
+		time.Sleep(100 * time.Millisecond) // a second request would be on its way
+		if n := pinRequests() - before; n != 1 {
+			t.Errorf("%s: P from the root sent %d pin requests, want 1", which, n)
+		}
 	}
 }
 
@@ -418,8 +522,8 @@ func TestMenuTypeAhead(t *testing.T) {
 	}
 	e, _ = mkOpen(t, h, "context", false)
 	e.press("C", key.ModCtrl) // modified shortcuts still run
-	if e.clip != "synthetic menu keys" || !e.m.Dismissed() {
-		t.Errorf("Ctrl+C with type-ahead: clip %q", e.clip)
+	if clip := e.clipWait("synthetic menu keys"); clip != "synthetic menu keys" || !e.m.Dismissed() {
+		t.Errorf("Ctrl+C with type-ahead: clip %q", clip)
 	}
 
 	setGOOS(t, "darwin")

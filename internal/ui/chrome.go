@@ -171,6 +171,7 @@ func (a *App) layoutTopNav(gtx layout.Context, primaryX, width int) {
 	h := gtx.Dp(theme.TopNavH)
 	tn := clsTopNav.Enter(gtx, 0, a.scopeMod())
 	defer tn.Leave()
+	defer slackc.InspectArea(gtx, image.Rect(0, 0, width, h)) // over what it draws (the inspect tool)
 	if tn.Hidden() {
 		return
 	}
@@ -191,12 +192,18 @@ func (a *App) layoutTopNav(gtx layout.Context, primaryX, width int) {
 		name := [...]string{"back", "forward", "history"}[i]
 		btn := a.clicks.get("nav." + name)
 		col := c.ChromeText
-		if (i == 0 && !a.router.CanBack()) || (i == 1 && !a.router.CanForward()) {
-			col = theme.WithAlpha(col, 0x70)
+		disabled := (i == 0 && !a.router.CanBack()) || (i == 1 && !a.router.CanForward())
+		if disabled { // [aria-disabled=true]: opacity .45, and no :hover tile
+			col = theme.WithAlpha(col, 0x73)
 		}
 		org := image.Pt(x, y)
 		at(gtx, org, image.Pt(b, b), func(gtx layout.Context) layout.Dimensions {
-			return a.chromeButton(gtx, org, btn, name, 26, 18, col, 4)
+			if i == 2 {
+				defer insNavHistory.Inspect(0).End(gtx, image.Pt(b, b))
+			} else {
+				defer insNavButton.Inspect(1<<i).End(gtx, image.Pt(b, b)) // -back, -forward
+			}
+			return a.chromeButtonHover(gtx, org, btn, name, 26, 18, col, 4, !disabled)
 		})
 		x -= b + gap
 	}
@@ -206,6 +213,7 @@ func (a *App) layoutTopNav(gtx layout.Context, primaryX, width int) {
 	if clicked(a.clicks.get("nav.forward")) {
 		a.Forward()
 	}
+	slackc.InspectArea(gtx, image.Rect(0, 0, sx, h)) // the left container ends where the search box starts
 	left.Leave()
 	if clicked(a.clicks.get("nav.history")) { // the rightmost of the three
 		hx := sx - gtx.Dp(9) - b
@@ -217,13 +225,13 @@ func (a *App) layoutTopNav(gtx layout.Context, primaryX, width int) {
 	sorg := image.Pt(sx, (h-sh)/2)
 	a.searchPill = image.Rectangle{Min: sorg, Max: sorg.Add(image.Pt(sw, sh))}
 	at(gtx, sorg, image.Pt(sw, sh), func(gtx layout.Context) layout.Dimensions {
+		defer insSearch.Inspect(0).End(gtx, image.Pt(sw, sh))
 		d := clickArea(gtx, a.clicks.get("nav.search"), func(gtx layout.Context, sz image.Point, hovered bool) {
-			bg := c.SearchBg
-			if hovered {
-				bg = c.SearchHover
-			}
-			// Slack: rgba(249,237,255,.25) plus a rgba(131,56,138,.08) tint.
-			a.chrome(gtx, sorg, image.Rectangle{Max: sz}, gtx.Dp(4), bg, theme.SearchTint)
+			// .p-top_nav__search__container: theme-surf-inv-pry under the
+			// theme-surf-inv-pry-hover layer, blended (ChromeHoverTint); in
+			// the ia4 top nav the pill's :hover changes nothing (its
+			// box-shadow is none there)
+			a.chrome(gtx, sorg, image.Rectangle{Max: sz}, gtx.Dp(4), c.SearchBg, c.ChromeHoverTint)
 		}, func(gtx layout.Context) layout.Dimensions {
 			sz := image.Pt(sw, sh)
 			if a.searchBoxIcon() {
@@ -236,6 +244,7 @@ func (a *App) layoutTopNav(gtx layout.Context, primaryX, width int) {
 				tw = sw - gtx.Dp(26) - tx // the clear button's 26px
 			}
 			at(gtx, image.Pt(tx, 0), image.Pt(tw, sh), func(gtx layout.Context) layout.Dimensions {
+				defer insSearchText.Inspect(0).End(gtx, image.Pt(tw, sh))
 				return vcenter(gtx, sh, func(gtx layout.Context) layout.Dimensions {
 					return a.th.Label(gtx, 13, theme.Regular, c.SearchText, a.searchBoxText())
 				})
@@ -260,6 +269,7 @@ func (a *App) layoutTopNav(gtx layout.Context, primaryX, width int) {
 		gtx.Constraints = layout.Constraints{Max: image.Pt(max(width-gtx.Dp(8)-wco-(sorg.X+sw+gtx.Dp(8)), b), h)}
 		return slackc.Component(gtx, "HelpButton", navHelp{a: a, org: horg, b: b}, nil, navHelp.layout)
 	})
+	slackc.InspectArea(gtx, image.Rect(width-gtx.Dp(8)-wco-d.Size.X, 0, width, h))
 	rs.Leave()
 	place(gtx, call, image.Pt(width-gtx.Dp(8)-wco-d.Size.X, (h-d.Size.Y)/2))
 	if clicked(a.clicks.get("nav.help")) {
@@ -455,6 +465,7 @@ func (a *App) railFit(gtx layout.Context, space int) (show, overflow []string) {
 
 func (a *App) layoutRail(gtx layout.Context, top, height int) {
 	c := &a.th.C
+	defer insRail.Inspect(0).EndAt(gtx, image.Rect(0, top, gtx.Dp(theme.RailW), top+height)) // the inspect tool's .p-tab_rail
 	// workspace icon 36×36 at (17, top+8), radius 8.
 	ws := gtx.Dp(36)
 	x0 := gtx.Dp(17)
@@ -503,10 +514,14 @@ func (a *App) layoutRail(gtx layout.Context, top, height int) {
 			a.tabPeekFrame(gtx, t.key, image.Rectangle{Min: org, Max: org.Add(image.Pt(gtx.Dp(52), th))}, btn.Hovered(), active == t.key)
 			peek = a.tabPeekOpen(t.key)
 		}
+		// the inspect tool's button, its icon and its label (inside it in
+		// Slack's DOM, drawn after it here)
+		bm := insRailButtonFor(t.key).Inspect(insMod(active == t.key))
 		at(gtx, org, image.Pt(gtx.Dp(52), th), func(gtx layout.Context) layout.Dimensions {
 			return clickArea(gtx, btn, nil, func(gtx layout.Context) layout.Dimensions {
 				sel := active == t.key
 				tile := image.Rect(gtx.Dp(8), gtx.Dp(8), gtx.Dp(44), gtx.Dp(44))
+				defer insRailIcon.Inspect(0).EndAt(gtx, tile)
 				// .p-tab_rail__button__icon: hover, :active, --active and a
 				// visible peek all fill it theme-surf-inv-pry
 				if sel || btn.Hovered() || peek {
@@ -551,6 +566,7 @@ func (a *App) layoutRail(gtx layout.Context, top, height int) {
 		// rail's (CSS start-aligns an overflowing line; .p-tab_rail is
 		// overflow hidden), past the button's clip.
 		lc := clip.Rect{Min: image.Pt(0, org.Y), Max: image.Pt(gtx.Dp(70), org.Y+th)}.Push(gtx.Ops)
+		lm := insRailLabel.Inspect(0)
 		for li, ln := range lines {
 			lw := a.th.Measure(gtx, 11, theme.Bold, ln)
 			lo := org.Add(image.Pt(max((gtx.Dp(52)-lw)/2, 0), gtx.Dp(48)+li*gtx.Dp(12)))
@@ -558,7 +574,9 @@ func (a *App) layoutRail(gtx layout.Context, top, height int) {
 				return a.th.Label(gtx, 11, theme.Bold, c.ChromeText, ln)
 			})
 		}
+		lm.EndAt(gtx, image.Rect(org.X, org.Y+gtx.Dp(48), org.X+gtx.Dp(52), org.Y+th))
 		lc.Pop()
+		bm.EndAt(gtx, image.Rectangle{Min: org, Max: org.Add(image.Pt(gtx.Dp(52), th))})
 		if clicked(btn) {
 			if t.key == "browse" {
 				a.railMoreClick() // forceOpenOnClick
@@ -587,46 +605,36 @@ func (a *App) layoutRail(gtx layout.Context, top, height int) {
 			}
 			continue
 		}
-		icon := "plus"
 		org := image.Pt(x0, by-lift)
 		at(gtx, org, image.Pt(cs, cs), func(gtx layout.Context) layout.Dimensions {
-			btn := a.clicks.get(k)
-			bg := c.ChromeActive // theme-surf-inv-pry in the rail's scope
-			if btn.Hovered() {
-				bg = c.SearchHover
-			}
-			return clickArea(gtx, btn, func(gtx layout.Context, sz image.Point, hovered bool) {
-				a.chrome(gtx, org, image.Rectangle{Max: sz}, sz.X/2, bg)
-			}, func(gtx layout.Context) layout.Dimensions {
-				off := (cs - gtx.Dp(20)) / 2
-				fg := theme.Over(c.ChromeTextDim, theme.Over(bg, a.chromeBase(org.Add(image.Pt(cs/2, cs/2)))))
-				at(gtx, image.Pt(off, off), image.Pt(cs, cs), func(gtx layout.Context) layout.Dimensions {
-					return icons.Get(icon)(gtx, 20, fg)
-				})
-				return layout.Dimensions{Size: image.Pt(cs, cs)}
-			})
+			return a.createButton(gtx, org, cs)
 		})
 		by += gtx.Dp(52)
 	}
 	if clicked(a.clicks.get("rail.new")) {
 		org := image.Pt(x0, newY) // the + button (first in the strip)
 		a.openCreateMenu(image.Rectangle{Min: org, Max: org.Add(image.Pt(cs, cs))})
+		gtx.Execute(op.InvalidateCmd{}) // --active: the plus turns
 	}
 	if tshow { // under the avatar (.c-avatar is positioned and comes later)
 		a.railStatusTabDraw(gtx, image.Pt(x0, by), cs, te)
 	}
 	// the user button: the tab's part above the avatar, then the avatar
 	at(gtx, image.Pt(x0, by-lift), image.Pt(cs+gtx.Dp(8), cs+gtx.Dp(8)+lift), func(gtx layout.Context) layout.Dimensions {
+		defer insRailMe.Inspect(0).End(gtx, image.Pt(cs, cs+lift))
 		return clickArea(gtx, a.clicks.get("rail.me"), nil, func(gtx layout.Context) layout.Dimensions {
 			defer op.Offset(image.Pt(0, lift)).Push(gtx.Ops).Pop()
 			a.avatar(gtx, a.selfAvatar(), a.selfName(), cs, gtx.Dp(8))
 			// presence ring: 20px circle at the bottom-right, chrome-colored ring.
 			pc := image.Pt(cs-gtx.Dp(4), cs-gtx.Dp(4))
 			theme.Circle(gtx, pc, gtx.Dp(14), c.ChromeB)
+			// .p-control_strip .c-presence--active: theme-base-inv-hgl-2;
+			// away is currentColor, .c-avatar__presence's
+			// theme-content-inv-pry
 			if a.selfActive() {
 				theme.Circle(gtx, pc, gtx.Dp(10), c.Presence)
 			} else {
-				theme.Circle(gtx, pc, gtx.Dp(10), c.ChromeTextDim)
+				theme.Circle(gtx, pc, gtx.Dp(10), c.ChromeText)
 				theme.Circle(gtx, pc, gtx.Dp(5), c.ChromeB)
 			}
 			return layout.Dimensions{Size: image.Pt(cs, cs+lift)}
@@ -640,8 +648,20 @@ func (a *App) layoutRail(gtx layout.Context, top, height int) {
 // chromeButton is an icon button on the chrome whose hover tile is
 // composited in sRGB. org is the button's window position.
 func (a *App) chromeButton(gtx layout.Context, org image.Point, c *widget.Clickable, name string, box, iconSz unit.Dp, col color.NRGBA, radius unit.Dp) layout.Dimensions {
+	return a.chromeButtonHover(gtx, org, c, name, box, iconSz, col, radius, true)
+}
+
+// chromeButtonHover is chromeButton with its :hover tile (ChromeHover,
+// theme-surf-inv-pry) and its :active one (ChromePressed,
+// theme-surf-inv-sec) only when hoverable (.p-ia4_history_buttons__button
+// [aria-disabled=false]).
+func (a *App) chromeButtonHover(gtx layout.Context, org image.Point, c *widget.Clickable, name string, box, iconSz unit.Dp, col color.NRGBA, radius unit.Dp, hoverable bool) layout.Dimensions {
 	return clickArea(gtx, c, func(gtx layout.Context, sz image.Point, hovered bool) {
-		if hovered {
+		switch {
+		case !hoverable:
+		case c.Pressed():
+			a.chrome(gtx, org, image.Rectangle{Max: sz}, gtx.Dp(radius), a.th.C.ChromePressed)
+		case hovered:
 			a.chrome(gtx, org, image.Rectangle{Max: sz}, gtx.Dp(radius), a.th.C.ChromeHover)
 		}
 	}, func(gtx layout.Context) layout.Dimensions {

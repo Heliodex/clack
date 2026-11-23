@@ -33,6 +33,30 @@ type typingState struct {
 	// app names the typers as the line draws (typers); nil: the names
 	// the events carried
 	app *core.App
+	// drawn: the conversations whose composers drew a typing line in the
+	// latest frame one did (at drawnAt, gtx.Now; shown). A change to
+	// another conversation's typers draws nothing: a busy workspace types
+	// in hundreds of channels, and each event redrew the window
+	drawn   map[string]bool
+	drawnAt time.Time
+}
+
+// shown notes that the composer for ch/ts draws its typing line in the
+// frame at now (UI goroutine, as it lays out).
+func (s *typingState) shown(ch, ts string, now time.Time) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.drawn == nil {
+		s.drawn = map[string]bool{}
+	}
+	if now.After(s.drawnAt) { // a newer frame: what it draws replaces the last one's
+		clear(s.drawn)
+		s.drawnAt = now
+	}
+	s.drawn[draftKey(ch, ts)] = true
+	s.mu.Unlock()
 }
 
 var typingHubs struct {
@@ -59,6 +83,12 @@ func typingHub(a *core.App) *typingState {
 		for ev := range evs {
 			s.apply(ev)
 		}
+		// core closed the events: the App was released, its typing goes
+		typingHubs.Lock()
+		if typingHubs.m[a] == s {
+			delete(typingHubs.m, a)
+		}
+		typingHubs.Unlock()
 	}()
 	return s
 }
@@ -131,8 +161,11 @@ func (s *typingState) apply(ev core.Event) {
 			delete(us, uid)
 		}
 	}
-	inv := s.invalidators()
-	if s.timer == nil {
+	var inv []func()
+	if s.drawn[k] {
+		inv = s.invalidators()
+	}
+	if s.timer == nil && len(s.m) > 0 {
 		s.timer = time.AfterFunc(typingTick, s.tick)
 	}
 	s.mu.Unlock()
@@ -156,7 +189,7 @@ func (s *typingState) tick() {
 		for id, t := range us {
 			if !t.until.After(now) {
 				delete(us, id)
-				gone = true
+				gone = gone || s.drawn[k] // a line on screen loses a typer
 			} else {
 				live = true
 			}

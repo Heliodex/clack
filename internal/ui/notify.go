@@ -9,6 +9,8 @@ import (
 
 	"github.com/some-du6e/clack/internal/desktop"
 	"github.com/some-du6e/clack/internal/i18n"
+	"github.com/some-du6e/clack/internal/logtag"
+	"github.com/some-du6e/clack/internal/slick"
 	"github.com/some-du6e/clack/internal/ui/composer"
 	"github.com/some-du6e/clack/internal/ui/huddleui"
 	"github.com/some-du6e/clack/internal/ui/uipref"
@@ -58,11 +60,21 @@ func (a *App) notifyMessage(title, body string, n *desktopNote) {
 	if c == nil || c.PrefBool("mute_sounds", false) {
 		return
 	}
-	file := messageSound(c.GlobalNotifyString("desktop_sound"))
+	// getNewMsgSoundPath: a VIP's message plays priority_desktop_sound
+	// (Mvkl Tk); canPlaySound: one that came through Do Not Disturb plays
+	// through it too (shouldOverrideDndForMessage)
+	pref, throughDND := "desktop_sound", false
+	if n != nil {
+		throughDND = n.soundThroughDND
+		if n.prioritySound {
+			pref = "priority_desktop_sound"
+		}
+	}
+	file := messageSound(c.GlobalNotifyString(pref))
 	go func() { // dnd.info the first time: off the UI goroutine
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if !c.DNDActive(ctx) && soundPlayback() {
+		if (throughDND || !c.DNDActive(ctx)) && soundPlayback() {
 			huddleui.PlaySlackSound(file)
 		}
 	}()
@@ -91,23 +103,35 @@ func messageSound(v string) string {
 }
 
 func (a *App) notifyShow(title, body string, n *desktopNote) bool {
-	if !a.notifyOn() || uipref.Get().NoDesktopPush { // Notifications > Desktop notifications
+	// Notifications > Desktop notifications; a message's own conversation
+	// decided already (desktop_push_enabled: notePushOn)
+	if a.inert || !a.notifyOn() || (n == nil || !n.pushChecked) && uipref.Get().NoDesktopPush {
 		return false
 	}
-	if uipref.Get().NoTextInNotifications { // Notifications: no message preview
+	if uipref.Get().NoTextInNotifications && (n == nil || !n.textChecked) { // Notifications: no message preview
 		body = ""
 	}
 	if a.notify == nil {
 		a.notify = newNotifier()
 	}
+	sl := a.Slick()
 	if nn, ok := a.notify.(noteNotifier); ok {
 		if n == nil {
 			n = a.plainNote()
 		}
 		n.Title, n.Body = title, body
-		go func() { _ = nn.NotifyNote(n) }()
+		sendNote(func() { // in order (notify_conv.go)
+			if slickAllows(sl, n) {
+				_ = nn.NotifyNote(n)
+			}
+		})
 	} else {
-		go func() { _ = a.notify.Notify(title, body) }()
+		nf := a.notify
+		sendNote(func() {
+			if slickAllows(sl, &desktopNote{Title: title, Body: body}) {
+				_ = nf.Notify(title, body)
+			}
+		})
 	}
 	a.bounceDock()        // mac_ssb_bounce
 	a.notificationShown() // Windows: the frame flash (windowFlashBehavior)
@@ -134,10 +158,15 @@ func (a *App) notifyActions(n huddleui.Notification) {
 	if a.notify == nil {
 		a.notify = newNotifier()
 	}
+	sl := a.Slick()
 	if nn, ok := a.notify.(noteNotifier); ok && n.Channel != "" {
 		dn := a.huddleNote(n)
 		dn.Body = body
-		go func() { _ = nn.NotifyNote(dn) }()
+		go func() {
+			if slickAllows(sl, dn) {
+				_ = nn.NotifyNote(dn)
+			}
+		}()
 		a.notificationShown()
 		return
 	}
@@ -148,6 +177,9 @@ func (a *App) notifyActions(n huddleui.Notification) {
 	acts := n.Actions
 	a.notificationShown()
 	go func() {
+		if !slickAllows(sl, &desktopNote{Title: n.Title, Body: body}) {
+			return
+		}
 		_ = a.notify.NotifyActions(n.Title, body, keys, func(key string) {
 			for _, ac := range acts {
 				if ac.Key == key && ac.Do != nil {
@@ -156,6 +188,19 @@ func (a *App) notifyActions(n huddleui.Notification) {
 			}
 		})
 	}()
+}
+
+// slickAllows is Slick's notification filters over toast n, just before
+// it goes to the system (slick.AllowNotification): Slick patches
+// Electron's Notification.prototype.show, so its filters see what is
+// about to show, and keep only the toast from showing (the sound and the
+// dock bounce Slack's renderer started stay). Off the UI goroutine.
+func slickAllows(sl *slick.Slick, n *desktopNote) bool {
+	if sl == nil || sl.AllowNotification(context.Background(), slick.NotificationOptions{Title: n.Title, Subtitle: n.Subtitle, Body: n.Body, Silent: n.Silent}) {
+		return true
+	}
+	log.Printf("notify: a Slick filter kept %s/%s from showing", logtag.ID(n.Channel), logtag.ID(n.Msg))
+	return false
 }
 
 // ---- the payloads (UI goroutine) ----
@@ -244,18 +289,23 @@ func (a *App) huddleNote(h huddleui.Notification) *desktopNote {
 // (replyToNotification), a button (its launch URI as a deep link, else the
 // webapp's handleNotificationAction; Clack runs the button's own action).
 // A click and a link bring the window to the front, as notifyBrowser's
-// onclick (window.focus) and the shell's deep-link handler do; a reply and
-// a button without a link leave it where it is.
+// onclick (window.focus) and the shell's deep-link handler do (the mac
+// shell's CLICK_NOTIFICATION is FOCUS_MAIN_WINDOW's: show, restore if
+// minimized, focus; a window a close hid comes back too, Raise's
+// ActionRaise); a reply and a button without a link leave it where it is.
 func (a *App) toastActivated(n *desktopNote, act toastActivation) {
 	raise := func() {
-		if a.winLive.Load() != nil { // a click only comes while the window is up
+		if a.winLive.Load() != nil { // Run made the window (shown or hidden)
 			a.Raise()
 		}
 	}
+	logActivation(act)
 	switch act.Type {
 	case "notification":
 		raise()
-		a.notificationClicked(act.Channel, act.MessageID, act.ThreadTS, act.NotificationID)
+		a.withVia("a notification's click", func() {
+			a.notificationClicked(act.Channel, act.MessageID, act.ThreadTS, act.NotificationID)
+		})
 	case "reply":
 		a.replyFromNotification(act)
 	case "action":
@@ -272,14 +322,43 @@ func (a *App) toastActivated(n *desktopNote, act toastActivation) {
 	}
 }
 
+// logActivation is clack.log's line for what the user did with one of
+// Clack's notifications (navlog.go: ids as tags, never the text): what
+// the payload named, the message, its thread and its id's type, or the
+// button.
+func logActivation(act toastActivation) {
+	switch act.Type {
+	case "notification", "reply":
+		_, typ, _, _ := parseNotificationID(act.NotificationID)
+		msg := logTag(act.MessageID)
+		if strings.HasPrefix(act.MessageID, "huddle") {
+			msg = "huddle" // a huddle notification's tag, which names its conversation
+		}
+		what := "clicked"
+		if act.Type == "reply" {
+			what = "replied to" // the text isn't logged
+		}
+		log.Printf("notify: %s a notification: %s %s thread %s (id type %q)", what, logTag(act.Channel), msg, logTag(act.ThreadTS), typ)
+	case "action":
+		log.Printf("notify: a notification's button %d (a link: %t)", act.Index, isSlackURI(act.LaunchURI))
+	}
+}
+
 // notificationClicked is the webapp's notificationClicked (boot-shared
-// rFJr) for what Clack notifies about: a huddle's notification opens its
-// conversation (the msg starts "huddle", or the id says so); a message's
-// opens its conversation, in the thread for a reply.
+// rFJr, notificationClickedInVisitOrigin) for what Clack notifies about: a
+// huddle's notification opens its conversation (the msg starts "huddle",
+// or the id says so); a message's is jumpToMessage({channelId, ts: the
+// msg when it is a timestamp, threadTs}): its conversation at the message,
+// highlighted, or for a reply its thread at the reply (jump.go). Without a
+// channel the id's route (parseMessageNotificationRoute) gives the
+// channel, the message and the thread.
 func (a *App) notificationClicked(ch, msg, thread, id string) {
 	if _, typ, payload, truncated := parseNotificationID(id); ch == "" && !truncated && typ == noteTypeMessage && len(payload) > 0 {
 		// parseMessageNotificationRoute: the id names the conversation
 		ch = payload[0]
+		if len(payload) > 1 && msg == "" {
+			msg = payload[1]
+		}
 		if len(payload) > 2 && thread == "" {
 			thread = payload[2]
 		}
@@ -291,11 +370,25 @@ func (a *App) notificationClicked(ch, msg, thread, id string) {
 		a.Navigate("c/" + ch)
 		return
 	}
-	route := "c/" + ch
-	if thread != "" && slackTSRE.MatchString(thread) {
-		route += "/t/" + thread
+	ts := ""
+	if slackTSRE.MatchString(msg) { // (0,M.A)(V) ? V : void 0
+		ts = msg
 	}
-	a.Navigate(route)
+	if !slackTSRE.MatchString(thread) {
+		thread = ""
+	}
+	// a canvas's file channel without a thread: notificationClickedInVisitOrigin
+	// opens the document itself (openDoc, no section) before any
+	// jumpToMessage (a list goes the jump's way: Slack's openDoc there is
+	// the canvas viewer's)
+	if c := a.Core(); thread == "" && c != nil {
+		if fid, kind, _ := c.FileChannelKind(ch, ts); kind == "canvas" {
+			a.canvasNavigated()
+			a.OpenCanvasAt(fid, "", true)
+			return
+		}
+	}
+	a.jumpMessage(ch, ts, thread, lookupStore, false) // the payload has a reply's thread_ts: the store only
 }
 
 // replyFromNotification is delegate_replyToNotification (boot-render): the

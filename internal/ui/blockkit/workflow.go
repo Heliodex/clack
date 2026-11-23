@@ -6,6 +6,7 @@ import (
 	"errors"
 	"image"
 	"strings"
+	"sync"
 	"time"
 
 	"gioui.org/io/pointer"
@@ -66,7 +67,8 @@ type tripArgs struct {
 // speedbump, all inside the thunk as in Slack, so a plugin that swallows
 // it leaves nothing behind.
 func tripVia(h Host, link string, tc core.TripContext, uiPage, reason string) {
-	if core.WorkflowTriggerID(link) == "" {
+	id := core.WorkflowTriggerID(link)
+	if id == "" {
 		// "Missing or invalid linkTriggerUrl": the error toast
 		h.Toast(core.TripErrorText("", ""))
 		return
@@ -74,7 +76,9 @@ func tripVia(h Host, link string, tc core.TripContext, uiPage, reason string) {
 	appFor(h) // forms the workflow opens arrive as views
 	ix := h.Core().Interactive()
 	args := tripArgs{LinkTriggerURL: link, WorkflowLinkTriggerUIContext: camelKeys(tc), Reason: reason, UIPage: uiPage}
+	tripStarted(id)
 	go func() {
+		defer post(h, func() { tripEnded(id) }) // after the answer's own post
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		_, _ = taut.Dispatch(ctx, tautFor("workflowsTriggersTrip"), "workflowsTriggersTrip", args, func(ctx context.Context, a tripArgs) (struct{}, error) {
@@ -88,6 +92,35 @@ func tripVia(h Host, link string, tc core.TripContext, uiPage, reason string) {
 			return struct{}{}, nil
 		})
 	}()
+}
+
+// trips counts each trigger's trips in flight (Slack's isTriggerRunning,
+// 7x3p Zx): a workflow card's Start Workflow ignores clicks until its
+// trip is answered.
+var (
+	tripsMu sync.Mutex
+	trips   = map[string]int{}
+)
+
+func tripStarted(id string) {
+	tripsMu.Lock()
+	trips[id]++
+	tripsMu.Unlock()
+}
+
+func tripEnded(id string) {
+	tripsMu.Lock()
+	if trips[id]--; trips[id] <= 0 {
+		delete(trips, id)
+	}
+	tripsMu.Unlock()
+}
+
+// TripRunning reports whether a trip of trigger id is in flight.
+func TripRunning(id string) bool {
+	tripsMu.Lock()
+	defer tripsMu.Unlock()
+	return trips[id] > 0
 }
 
 // tripAnswered is the first trip's answer: the speedbump Slack's
@@ -158,11 +191,18 @@ func tripAgain(h Host, link string, tc core.TripContext) {
 	}, func(res core.TripResult, err error) { tripDone(h, id, res, err) })
 }
 
+// TripToasts, set by the ui root, shows the toasts below in Slack's toast
+// styles (workflows_wire.go); false leaves them to tripDone.
+var TripToasts func(h Host, id string, res core.TripResult, err error) bool
+
 // tripDone shows Slack's toast for a trip's answer (Izws): the error
 // toast's text, else, unless Slack's workflow execution window shows the
 // run instead (workflow_execution_window), "You successfully started a
 // workflow" or, for a slow workflow, the longer-to-run toast.
 func tripDone(h Host, id string, res core.TripResult, err error) {
+	if TripToasts != nil && TripToasts(h, id, res, err) {
+		return
+	}
 	if err != nil {
 		code, sub := "", ""
 		var te *core.TripError

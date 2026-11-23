@@ -355,6 +355,9 @@ func (v *UserGroupView) loadMembers(term, cursor string) {
 	})
 }
 
+// GroupID is the group the pane shows.
+func (v *UserGroupView) GroupID() string { return v.id }
+
 // Layout fills the constraints with the pane.
 func (v *UserGroupView) Layout(gtx layout.Context) layout.Dimensions {
 	drain()
@@ -589,7 +592,8 @@ func (v *UserGroupView) membersTab(gtx layout.Context, th *theme.Theme, cl *Colo
 			ny = ry + (rowH-dp(gtx, 40))/2
 		}
 		at(gtx, image.Pt(tx, ny), func(gtx layout.Context) layout.Dimensions {
-			return pfNameLine(gtx, v.h, th, nil, u, 15, 22, 9, tw)
+			pfWantDND(v.h, u, gtx.Now)
+			return pfNameLine(gtx, v.h, th, nil, u, pfName(u), 15, 22, 9, tw)
 		})
 		if !pfBlank(sub) {
 			at(gtx, image.Pt(tx, ny+dp(gtx, 22)), func(gtx layout.Context) layout.Dimensions {

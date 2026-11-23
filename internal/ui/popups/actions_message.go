@@ -11,6 +11,7 @@ import (
 	"gioui.org/layout"
 
 	"github.com/some-du6e/clack/internal/core"
+	"github.com/some-du6e/clack/internal/i18n"
 	"github.com/some-du6e/clack/internal/richtext"
 	"github.com/some-du6e/clack/internal/ui/openurl"
 	"github.com/some-du6e/clack/internal/ui/richclip"
@@ -46,6 +47,10 @@ type MessageMenuOpts struct {
 	// conversation, and "Send reply to this channel" is only in threads.
 	// NewMessageContextMenu sets it from its MessageContext.
 	Where MessageContext
+	// Trigger is the ⋮ button the menu opened from (window px): MAMenu's
+	// and MessageActionsMenu's targetBounds, Slack's DOMRect of the trigger
+	// (zero: the anchor point).
+	Trigger image.Rectangle
 }
 
 // NewMessageMenu builds the More actions menu for m. The menu's right edge
@@ -57,12 +62,16 @@ func NewMessageMenu(h Host, anchor image.Point, m core.Message) *Menu {
 // NewMessageMenuOpts is NewMessageMenu with caller hooks.
 func NewMessageMenuOpts(h Host, anchor image.Point, m core.Message, o MessageMenuOpts) *Menu {
 	a := pointRect(anchor)
-	p := actMenuProps(m, a)
+	trigger := o.Trigger
+	if trigger.Empty() {
+		trigger = a
+	}
+	p := actMenuProps(m, trigger)
 	if o.Where != InChannel {
 		p["messageContainerType"] = ctxContainer(o.Where)
 	}
-	return NewMenuOpts(h, actMessageItems(h, m, o), MenuOpts{Anchor: a, AlignRight: true,
-		Within: "MessageActionsMenu", WithinProps: p})
+	return NewMenuOpts(h, actMessageItems(h, m, o), MenuOpts{Anchor: a, Trigger: trigger, AlignRight: true,
+		Within: "MessageActionsMenu", WithinProps: p, MAMenu: MessageActionsProps(p, "overflow")})
 }
 
 // actMenuProps are Slack's MessageActionsMenu props for m's ⋮ menu
@@ -73,7 +82,7 @@ func actMenuProps(m core.Message, anchor image.Rectangle) slackc.Props {
 		"ts":                       m.TS,
 		"userId":                   m.User,
 		"menuUsageLocation":        "message_actions_menu",
-		"messageContainerType":     "message",
+		"messageContainerType":     ctxContainer(InChannel),
 		"showJumpActionInOverflow": false,
 		"targetBounds":             rectProps(anchor, 1),
 	}
@@ -114,7 +123,7 @@ func actMessageItems(h Host, m core.Message, o MessageMenuOpts) []MenuItem {
 
 	var items []MenuItem
 	if own {
-		items = append(items, MenuItem{Label: "Edit message", Icon: "edit", Hint: nsMessage.T("E"), Keys: KeyEdit, Do: func() {
+		items = append(items, MenuItem{Action: "edit_message", Label: "Edit message", Icon: "edit", Hint: nsMessage.T("E"), Keys: KeyEdit, Do: func() {
 			if o.OnEdit != nil {
 				o.OnEdit()
 				return
@@ -134,35 +143,39 @@ func actMessageItems(h Host, m core.Message, o MessageMenuOpts) []MenuItem {
 	// (JsXu, messageActionsMarkThreadUnreadAction) the thread. Slack only
 	// announces "Conversation marked as unread from this message" to
 	// screen readers: no toast.
-	markUnread := MenuItem{Key: "mark_unread", Label: nsMessage.T("Mark unread"), Icon: "mark-unread", Hint: nsMessage.T("U"), Keys: KeyMarkUnread, Do: func() {
+	markUnread := MenuItem{Key: "mark_unread", Action: "mark_unread", Label: nsMessage.T("Mark unread"), Icon: "mark-unread", Hint: nsMessage.T("U"), Keys: KeyMarkUnread, Do: func() {
 		actDo(h, "", func(ctx context.Context, a *core.App) error {
 			if inThread {
-				return a.MarkThreadUnread(ctx, ch, root, ts)
+				origin := core.MarkedInThread // the markOrigin: its messageContainerType
+				if o.Where == InThreadsView {
+					origin = core.MarkedInThreadsView
+				}
+				return a.MarkThreadUnreadFrom(ctx, ch, root, ts, origin)
 			}
 			_, err := a.MarkUnread(ctx, ch, ts)
 			return err
 		})
 	}}
 	if inThread {
-		markUnread.Key = "mark_thread_unread" // Slack's action ids (lq1n)
+		markUnread.Key, markUnread.Action = "mark_thread_unread", "mark_thread_unread" // Slack's action ids (lq1n)
 	}
 	sa := SaveActionFor(h.Core(), &m)
 	items = append(items,
 		markUnread,
-		MenuItem{Label: sa.Label, Icon: sa.Icon, Hint: shortcut.Format("Mod+Shift+S"), Keys: KeySaveTodos, Do: func() {
+		MenuItem{Action: "later", Label: sa.Label, Icon: sa.Icon, Hint: shortcut.Format("Mod+Shift+S"), Keys: KeySaveTodos, Do: func() {
 			RunSaveAction(h, m) // oMi4 / aSBj (actions_todo.go)
 		}}.In(nsSaved),
-		MenuItem{Label: ReminderLabel(h.Core(), &m), Icon: "remind", Hint: nsMessage.T("M"), Keys: KeyRemind, Sub: actReminderItems(remind, func() { h.ShowOverlay(actNewReminderModal(h, ch, ts)) })}.In(nsMessage), // ih0g
+		MenuItem{Action: "remind", Label: ReminderLabel(h.Core(), &m), Icon: "remind", Hint: nsMessage.T("M"), Keys: KeyRemind, Sub: actReminderItems(remind, func() { h.ShowOverlay(actNewReminderModal(h, ch, ts)) })}.In(nsMessage), // ih0g
 	)
 	if f, ok := actFollowItem(h, m, conv, root); ok {
 		items = append(items, f)
 	}
 	items = append(items,
 		Sep(),
-		MenuItem{Label: "Copy link", Icon: "link", Hint: "L", Keys: KeyCopyLink, DoCtx: func(gtx layout.Context) {
+		MenuItem{Action: "copy_link", Label: "Copy link", Icon: "link", Hint: "L", Keys: KeyCopyLink, DoCtx: func(gtx layout.Context) {
 			copyText(gtx, link()) // copyLink (5FS0): the clipboard only, no toast
 		}}.In(nsMessage),
-		MenuItem{Label: "Copy message", Icon: "text-format", Hint: shortcut.Format("Mod+C"), Keys: KeyCopyText, DoCtx: func(gtx layout.Context) {
+		MenuItem{Action: "copy_text", Label: "Copy message", Icon: "text-format", Hint: shortcut.Format("Mod+C"), Keys: KeyCopyText, DoCtx: func(gtx layout.Context) {
 			copyMessage(gtx, m)
 		}}.In(nsMessage),
 		Sep(),
@@ -174,18 +187,14 @@ func actMessageItems(h Host, m core.Message, o MessageMenuOpts) []MenuItem {
 	if channel {
 		pinLabel, unpinLabel = "Pin to channel", "Un-pin from channel"
 	}
-	pin := MenuItem{Label: pinLabel, Icon: "pin", Hint: nsMessage.T("P"), Keys: KeyPin, Do: func() {
-		actDo(h, "Message pinned", func(ctx context.Context, a *core.App) error { return a.Pin(ctx, ch, ts) })
-	}}.In(nsMessage)
+	pin := MenuItem{Action: "pin", Label: pinLabel, Icon: "pin", Hint: nsMessage.T("P"), Keys: KeyPin, Do: func() { actPin(h, ch, ts, true) }}.In(nsMessage)
 	if m.Pinned {
-		pin = MenuItem{Label: unpinLabel, Icon: "pin", Hint: nsMessage.T("P"), Keys: KeyPin, Do: func() {
-			actDo(h, "Message unpinned", func(ctx context.Context, a *core.App) error { return a.Unpin(ctx, ch, ts) })
-		}}.In(nsMessage)
+		pin = MenuItem{Action: "pin", Label: unpinLabel, Icon: "pin", Hint: nsMessage.T("P"), Keys: KeyPin, Do: func() { actPin(h, ch, ts, false) }}.In(nsMessage)
 	}
 	items = append(items,
-		MenuItem{Label: "Organize", Sub: []MenuItem{pin}}.In(nsMessage),
+		MenuItem{Action: "organize_actions_menu", Label: "Organize", Sub: []MenuItem{pin}}.In(nsMessage),
 		// no "Forward message…" here: Slack keeps it on the hover toolbar
-		MenuItem{Label: "Connect to apps", Sub: connectToApps(h, m)}.In(nsMessage),
+		MenuItem{Action: "connect_to_apps_actions_menu", Label: "Connect to apps", Sub: connectToApps(h, m)}.In(nsMessage),
 	)
 
 	// the broadcast and workflow group: [send reply, remove reply, view
@@ -199,7 +208,7 @@ func actMessageItems(h Host, m core.Message, o MessageMenuOpts) []MenuItem {
 		if dm {
 			label = "Send reply to this conversation"
 		}
-		bw = append(bw, MenuItem{Key: "broadcast_message", Label: label, Do: func() {
+		bw = append(bw, MenuItem{Key: "broadcast_message", Action: "broadcast_message", Label: label, Do: func() {
 			actDo(h, "", func(ctx context.Context, a *core.App) error { return a.BroadcastReply(ctx, ch, ts) })
 		}}.In(nsMessage))
 	}
@@ -211,7 +220,7 @@ func actMessageItems(h Host, m core.Message, o MessageMenuOpts) []MenuItem {
 		if channel {
 			label = "Remove reply from channel…"
 		}
-		bw = append(bw, MenuItem{Key: "remove_broadcast", Label: label, Do: func() { confirmRemoveBroadcast(h, m, channel) }}.In(nsMessage))
+		bw = append(bw, MenuItem{Key: "remove_broadcast", Action: "remove_broadcast", Label: label, Do: func() { confirmRemoveBroadcast(h, m, channel) }}.In(nsMessage))
 	}
 	// t7: a workflow bot's message with a trigger_id: "View workflow
 	// details" opens the workflow details view for the trigger
@@ -219,7 +228,7 @@ func actMessageItems(h Host, m core.Message, o MessageMenuOpts) []MenuItem {
 	wfBot := actWorkflowBot(h, m)
 	if wfBot && m.TriggerID != "" {
 		trig, ch := m.TriggerID, m.Channel
-		bw = append(bw, MenuItem{Key: "view_workflow_details", Label: "View workflow details", Do: func() {
+		bw = append(bw, MenuItem{Key: "view_workflow_details", Action: "view_workflow_details", Label: "View workflow details", Do: func() {
 			if OpenWorkflowDetails != nil {
 				OpenWorkflowDetails(trig, ch)
 			}
@@ -234,7 +243,7 @@ func actMessageItems(h Host, m core.Message, o MessageMenuOpts) []MenuItem {
 		if wfID == "" {
 			fetchTriggerPreview(h, trig)
 		}
-		bw = append(bw, MenuItem{Key: "copy_workflow_id", Label: "Copy workflow ID", DoCtx: func(gtx layout.Context) {
+		bw = append(bw, MenuItem{Key: "copy_workflow_id", Action: "copy_workflow_id", Label: "Copy workflow ID", DoCtx: func(gtx layout.Context) {
 			if id := workflowIDOf(h, wfID, trig); id != "" {
 				copyText(gtx, id)
 			}
@@ -259,10 +268,10 @@ func actMessageItems(h Host, m core.Message, o MessageMenuOpts) []MenuItem {
 	// not a tombstone, no flag row; Slack opens the help center's report
 	// form
 	if !flagged && !own && !m.Tombstone && m.TS != "" && actReporting(h) {
-		last = append(last, MenuItem{Key: "report_message", Label: "Report to Slack", Do: func() { reportMessage(h, link()) }}.In(nsMsgActionItems))
+		last = append(last, MenuItem{Key: "report_message", Action: "report_message", Label: "Report to Slack", Do: func() { reportMessage(h, link()) }}.In(nsMsgActionItems))
 	}
 	if own {
-		last = append(last, MenuItem{Label: "Delete message…", Hint: nsMessage.T("delete"), Keys: KeyDelete(), Danger: true, Do: func() { confirmDelete(h, m, o.Delete) }}.In(nsMessage))
+		last = append(last, MenuItem{Action: "delete_message", Label: "Delete message…", Hint: nsMessage.T("delete"), Keys: KeyDelete(), Danger: true, Do: func() { confirmDelete(h, m, o.Delete) }}.In(nsMessage))
 	}
 	if len(last) > 0 {
 		items = append(append(items, Sep()), last...)
@@ -285,13 +294,13 @@ func actFollowItem(h Host, m core.Message, conv core.Conv, root string) (MenuIte
 		return MenuItem{}, false
 	}
 	if subscribed {
-		return MenuItem{Key: "subscribe", Label: "Turn off notifications for replies", Icon: "bell-off", Do: func() {
+		return MenuItem{Key: "subscribe", Action: "subscribe", Label: "Turn off notifications for replies", Icon: "bell-off", Do: func() {
 			actDo(h, "You won't be notified about new replies", func(ctx context.Context, a *core.App) error {
 				return a.SubscribeThread(ctx, ch, root, false)
 			})
 		}}.In(nsMessage), true
 	}
-	return MenuItem{Key: "subscribe", Label: "Get notified about new replies", Icon: "bell", Do: func() {
+	return MenuItem{Key: "subscribe", Action: "subscribe", Label: "Get notified about new replies", Icon: "bell", Do: func() {
 		actDo(h, "You'll be notified about new replies", func(ctx context.Context, a *core.App) error {
 			return a.SubscribeThread(ctx, ch, root, true)
 		})
@@ -306,9 +315,10 @@ func actThreadSubscribed(h Host, ch, root string) bool {
 		return false
 	}
 	if r, ok := a.S.Find(ch, root); ok {
-		return r.Subscribed
+		return a.S.ThreadSubOf(ch, &r).Subscribed
 	}
-	return false
+	sub, _ := a.S.ThreadSub(ch, root)
+	return sub.Subscribed
 }
 
 // actKindOf guesses a conversation's kind from its id when core doesn't
@@ -347,6 +357,12 @@ func actWorkflowBot(h Host, m core.Message) bool {
 // view (Slack's WorkflowDetails, viewType WorkflowDetails) for a trigger
 // seen in channel ch.
 var OpenWorkflowDetails func(triggerID, ch string)
+
+// WorkflowCardMenu, set by the ui root, opens a share_shortcut card's
+// More actions menu (MoreActionsMenu, boot-shared 9mPk) from anchor (the
+// ⋮ button, window coordinates) for the card c in message ts of channel
+// ch.
+var WorkflowCardMenu func(h Host, anchor image.Rectangle, c *richtext.ShortcutCard, ch, ts string)
 
 // fetchTriggerPreview asks for a trigger's preview unless it is known
 // (getTriggerPreviews: fetchObjectWithId for the missing ones).
@@ -512,6 +528,30 @@ func actDo(h Host, okMsg string, work func(ctx context.Context, a *core.App) err
 	do(h, okMsg, func(ctx context.Context) error { return work(ctx, a) })
 }
 
+// actPin is the Organize menu's pin item: pinMessage / unpinMessage
+// (core.Pin, core.Unpin), whose row in the Pins tab and the message's pin
+// change at once and go back on a failure. Slack toasts nothing else:
+// only a channel at its 100 pins gets PinErrorToast (fBOF, the pins I18n).
+func actPin(h Host, ch, ts string, on bool) {
+	a := h.Core()
+	if a == nil {
+		h.Toast("Not connected yet")
+		return
+	}
+	run(h, func(ctx context.Context) (struct{}, error) {
+		if on {
+			return struct{}{}, a.Pin(ctx, ch, ts)
+		}
+		return struct{}{}, a.Unpin(ctx, ch, ts)
+	}, func(_ struct{}, err error) {
+		if on && core.IsTooManyPins(err) {
+			h.Toast(i18n.Plain(nsPins.RT("<strong>You\u2019ve reached the max of 100 pins in a channel.</strong> Try removing a pin before adding a new one.")))
+		}
+	})
+}
+
+var nsPins = i18n.NS("pins")
+
 // actToast returns an action that toasts s (features core can't do yet).
 func actToast(h Host, s string) func() { return func() { h.Toast(s) } }
 
@@ -522,15 +562,16 @@ func actSelfID(h Host) string {
 	return ""
 }
 
-// actSnapshot returns the core snapshot without blocking on boot.
+// actSnapshot returns the core snapshot without blocking on boot: false
+// until the sidebar's data is in (a warm start's boot data, or Boot).
 func actSnapshot(h Host) (core.Snapshot, bool) {
 	a := h.Core()
 	if a == nil {
 		return core.Snapshot{}, false
 	}
 	select {
-	case <-a.Ready():
-		return a.Snapshot(), true
+	case <-a.DataReady():
+		return a.SnapshotNow(), true
 	default:
 		return core.Snapshot{}, false
 	}
@@ -552,14 +593,27 @@ func copyMessage(gtx layout.Context, m core.Message) {
 	if t := richclip.TextyDelta(m.Doc); t != "" {
 		c.Custom = map[string]string{"slack/texty": t}
 	}
-	go func() { _ = richclip.Write(context.Background(), c) }()
+	write := writeRich
+	go func() { _ = write(context.Background(), c) }()
 }
+
+// writeRich is richclip.Write: the copy goes to the system clipboard off
+// the UI goroutine, not through Gio's clipboard, so the menu tests read
+// Copy message's copy through this (menu_keys_test.go's newMkEnv).
+var writeRich = richclip.Write
 
 func actMsgText(m core.Message) string {
 	if s := richtext.PlainText(m.Doc); strings.TrimSpace(s) != "" {
 		return s
 	}
 	return m.Text
+}
+
+// actPreviewSegs are actMsgPreview's text: the message, its files and
+// attachments after its text, with mentions as mention slugs and no raw
+// tokens (srPreviewRuns), its lines kept.
+func actPreviewSegs(h Host, m *core.Message) []srSeg {
+	return srRunSegs(srPreviewRuns(h, m), nil, false)
 }
 
 // actAuthor resolves the display name and avatar URL of m's author.
@@ -593,7 +647,8 @@ func actMsgPreview(gtx layout.Context, h Host, m core.Message, boxed bool) layou
 	innerW := maxInt(1, w-padL-padR)
 	name, av := actAuthor(h, m)
 	when := dayTime(tsTime(m.TS), time.Now())
-	body := actMsgText(m)
+	segs := actPreviewSegs(h, &m)
+	body := strings.TrimSpace(srSegsText(segs))
 
 	call, d := record(loose(gtx, image.Pt(innerW, 1<<20)), func(gtx layout.Context) layout.Dimensions {
 		avPx, gap := dp(gtx, 20), dp(gtx, 8)
@@ -615,7 +670,19 @@ func actMsgPreview(gtx layout.Context, h Host, m core.Message, boxed bool) layou
 			return layout.Dimensions{Size: image.Pt(innerW, y)}
 		}
 		bc, bd := record(loose(gtx, image.Pt(tw, 1<<20)), func(gtx layout.Context) layout.Dimensions {
-			return para(gtx, th, 15, 22, theme.Regular, cl.Fg, body, 4)
+			lh := dp(gtx, 22)
+			ell := textW(gtx, th, 15, theme.Regular, "…")
+			toks, lines, over := srWrapFit(gtx, th, segs, tw, 4, ell)
+			srDrawToks(gtx, th, cl, toks, lh, cl.Fg)
+			if over {
+				last := lines - 1
+				at(gtx, image.Pt(srEndX(toks, last), last*lh), func(gtx layout.Context) layout.Dimensions {
+					return vcenter(gtx, lh, func(gtx layout.Context) layout.Dimensions {
+						return text(gtx, th, 15, theme.Regular, cl.Fg, "…")
+					})
+				})
+			}
+			return layout.Dimensions{Size: image.Pt(tw, lines*lh)}
 		})
 		macroAt(gtx, bc, image.Pt(x, y))
 		return layout.Dimensions{Size: image.Pt(innerW, y+bd.Size.Y)}

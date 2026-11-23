@@ -94,6 +94,14 @@ type Options struct {
 	LifecycleTimeout time.Duration
 	// NoAutoStart keeps New from starting enabled plugins (tests).
 	NoAutoStart bool
+	// DeferStart: New does everything but start the enabled plugins and
+	// the update check: Start does, later. The theme and the user CSS are
+	// installed by New either way (the UI's launch shows them from its
+	// first frame, internal/ui/backend.go).
+	DeferStart bool
+	// Dark is the window's mode at start (SetDark later): New applies the
+	// theme for it, once.
+	Dark bool
 	// NoUpdates turns off the URL-installed plugins' update checks.
 	NoUpdates bool
 }
@@ -102,9 +110,13 @@ type Options struct {
 type Slick struct {
 	startDone     chan struct{} // closed when the start-up StartEnabled returned (StartDone)
 	startDoneOnce sync.Once
+	startOnce     sync.Once // Start's
 	opts          Options
 	t             *taut.Taut
 	dir           string
+	// noteFilters counts the main halves' notifications.filter predicates
+	// (js 30_main.js tells it): with none, a toast asks no JS
+	noteFilters atomic.Int32
 
 	mu      sync.Mutex
 	cfg     *storedConfig
@@ -115,8 +127,9 @@ type Slick struct {
 	userCSS string
 	themes  map[string]Theme
 	queues  map[string]*sync.Mutex
-	rt      *jsrt.Runtime // the runtime the prelude is in (nil until a plugin needs JS)
-	route   [2]string     // team, channel the UI shows
+	rt      *jsrt.Runtime   // the runtime the prelude is in (nil until a plugin needs JS)
+	panels  map[string]bool // api.settings.panel: the plugins with a panel (slick_panels)
+	route   [3]string       // team, channel, thread the UI shows
 	dark    atomic.Bool
 	styled  string // the theme CSS last handed to the UI
 
@@ -129,6 +142,8 @@ type Slick struct {
 
 	changeMu sync.Mutex
 	changeCh map[chan struct{}]struct{}
+	// pluginsGen counts changes to the installed plugins (PluginsGen)
+	pluginsGen atomic.Uint64
 
 	updating  sync.Mutex
 	stopTimer chan struct{}
@@ -168,6 +183,7 @@ func New(o Options) (*Slick, error) {
 		s.cfgErr = err
 	}
 	s.cfg = cfg
+	s.dark.Store(o.Dark)
 	if b, err := os.ReadFile(s.path("user.css")); err == nil {
 		s.userCSS = string(b)
 	}
@@ -175,6 +191,9 @@ func New(o Options) (*Slick, error) {
 	readJSONFile(s.path("plugins", "prefs.json"), &s.prefs)
 	s.themes = bundledThemes(o.Dir)
 	s.loadInstalled()
+	// the theme and the user CSS first: Go only, and the UI's launch waits
+	// for them (Extend may wait for a JS runtime already starting)
+	s.applyStyles()
 	if err := s.t.Extend(taut.Extension{
 		Name:             "slick",
 		Install:          s.installHost,
@@ -185,22 +204,35 @@ func New(o Options) (*Slick, error) {
 	}); err != nil {
 		return nil, err
 	}
-	s.applyStyles()
-	if !o.NoAutoStart {
+	switch {
+	case o.NoAutoStart:
+		s.markStartDone()
+	case o.DeferStart: // Start, later
+	default:
+		s.Start()
+	}
+	return s, nil
+}
+
+// Start starts the plugins enabled at start and the update check in the
+// background (once). New calls it unless Options.NoAutoStart or
+// DeferStart; StartDone closes when they started.
+func (s *Slick) Start() {
+	s.startOnce.Do(func() {
+		if s.closed.Load() {
+			s.markStartDone()
+			return
+		}
 		go func() {
 			t0 := time.Now()
 			s.StartEnabled(context.Background())
 			applog.Mark("slick-started", "in "+time.Since(t0).Round(time.Millisecond).String())
 			s.markStartDone()
 		}()
-		if !o.NoUpdates {
+		if !s.opts.NoUpdates {
 			go s.autoUpdate()
 		}
-	}
-	if o.NoAutoStart {
-		s.markStartDone()
-	}
-	return s, nil
+	})
 }
 
 func (s *Slick) markStartDone() {
@@ -217,6 +249,8 @@ func (s *Slick) Close() error {
 	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	defer s.closeSubscribers()
+	s.markStartDone() // never started (DeferStart): nothing waits for it
 	close(s.stopTimer)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*s.opts.LifecycleTimeout+time.Second)
 	defer cancel()
@@ -263,14 +297,15 @@ func (s *Slick) js() (*jsrt.Runtime, error) {
 	if s.rt != rt {
 		// a fresh runtime (the first, or after a crash): nothing is loaded in it
 		s.rt = rt
+		s.noteFilters.Store(0)
 		for _, p := range s.plugins {
 			p.inJS, p.mainInJS = false, false
 		}
-		team, ch := s.route[0], s.route[1]
+		team, ch, th := s.route[0], s.route[1], s.route[2]
 		s.mu.Unlock()
 		s.setPage(rt)
 		if team != "" {
-			s.post(rt, "setRoute", team, ch)
+			s.post(rt, "setRoute", team, ch, th)
 		}
 		return rt, nil
 	}
@@ -304,6 +339,7 @@ func (s *Slick) ready(rt *jsrt.Runtime, restarted bool) {
 		p.running, p.mainRunning = false, false
 	}
 	s.rt = nil
+	s.panels = nil // the panels were the old runtime's; restarted plugins set theirs again
 	s.mu.Unlock()
 	if len(restart) > 0 {
 		log.Printf("slick: the JS runtime restarted; restarting %d plugins", len(restart))
@@ -313,6 +349,32 @@ func (s *Slick) ready(rt *jsrt.Runtime, restarted bool) {
 		s.reconcile(ctx, id)
 		cancel()
 	}
+}
+
+// setPanels records which plugins have an api.settings.panel (slick_panels).
+func (s *Slick) setPanels(m map[string]bool) {
+	s.mu.Lock()
+	same := len(m) == len(s.panels)
+	for id := range m {
+		if !s.panels[id] {
+			same = false
+		}
+	}
+	s.panels = m
+	s.mu.Unlock()
+	if !same {
+		s.changed()
+	}
+}
+
+// RenderPanel mounts plugin id's api.settings.panel into slackc root, once
+// per plugin: its Preferences > Slick page draws it in a "Customize" card
+// after its settings while PluginInfo.Panel says it has one, as Slick's
+// settings.tsx does. The root follows the plugin setting a new panel and
+// renders it again when plugins start, stop or change settings, as
+// Slick's page does, keeping its React state.
+func (s *Slick) RenderPanel(root uint64, id string) {
+	s.t.Bridge().Mount(root, "slickPanelElement", id)
 }
 
 // call runs __slick.<fn>(args…) and decodes its result into out.
@@ -328,28 +390,34 @@ func (s *Slick) call(ctx context.Context, rt *jsrt.Runtime, fn string, out any, 
 }
 
 func (s *Slick) post(rt *jsrt.Runtime, fn string, args ...any) {
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if _, err := rt.Call(ctx, "__slick."+fn, args...); err != nil {
+	// queued now, on the caller's goroutine, in order with the user's
+	// later input (jsrt.InOrder): a click in the conversation the user
+	// just opened reads the new route, as a browser handles the
+	// navigation before the input after it
+	ctx, cancel := context.WithTimeout(jsrt.InOrder(context.Background()), 5*time.Second)
+	rt.CallThen(ctx, "__slick."+fn, func(_ json.RawMessage, err error) {
+		cancel()
+		if err != nil {
 			log.Printf("slick: %s: %v", fn, err)
 		}
-	}()
+	}, args...)
 }
 
-// SetRoute tells plugins which workspace and conversation the window shows
-// (location.pathname /client/<team>/<channel>: channels.getCurrentChannelId,
-// the active team). Cheap when no plugin runs.
-func (s *Slick) SetRoute(team, channel string) {
+// SetRoute tells plugins which workspace, conversation and thread the
+// window shows (location.pathname /client/<team>/<channel>:
+// channels.getCurrentChannelId, the active team; Slack's view state for
+// the thread: Taut's setView). Cheap when no plugin runs.
+func (s *Slick) SetRoute(team, channel, thread string) {
 	s.mu.Lock()
-	changed := s.route != [2]string{team, channel}
-	s.route = [2]string{team, channel}
+	moved := s.route[0] != team || s.route[1] != channel
+	changed := s.route != [3]string{team, channel, thread}
+	s.route = [3]string{team, channel, thread}
 	rt := s.rt
 	s.mu.Unlock()
 	if changed && rt != nil {
-		s.post(rt, "setRoute", team, channel)
+		s.post(rt, "setRoute", team, channel, thread)
 	}
-	if changed {
+	if moved {
 		go s.reconcileAll(context.Background()) // workspace restrictions
 	}
 }
@@ -370,10 +438,33 @@ func (s *Slick) Subscribe() (<-chan struct{}, func()) {
 	s.changeCh[c] = struct{}{}
 	s.changeMu.Unlock()
 	return c, func() {
+		// whoever takes c out closes it (changed sends under changeMu): its
+		// range loop ends whether stop or Close comes first
 		s.changeMu.Lock()
-		delete(s.changeCh, c)
+		if _, live := s.changeCh[c]; live {
+			delete(s.changeCh, c)
+			close(c)
+		}
 		s.changeMu.Unlock()
 	}
+}
+
+// PluginsGen counts the changes to the installed plugins' files: one
+// read from disk, installed, replaced or removed (not one started,
+// stopped or set up). A reader that keeps what it read of them (the
+// plugin library's install states) reads again when it moves.
+func (s *Slick) PluginsGen() uint64 { return s.pluginsGen.Load() }
+
+// closeSubscribers closes every Subscribe channel (their range loops
+// end) and keeps no more: Close's, the Slick is done. Their goroutines
+// kept it, and the App they repainted, reachable for good (ci-speed-3).
+func (s *Slick) closeSubscribers() {
+	s.changeMu.Lock()
+	defer s.changeMu.Unlock()
+	for c := range s.changeCh {
+		close(c)
+	}
+	clear(s.changeCh)
 }
 
 func (s *Slick) changed() {

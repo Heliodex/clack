@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"gioui.org/f32"
 	"gioui.org/io/event"
@@ -27,6 +28,7 @@ import (
 	"github.com/some-du6e/clack/internal/imgcache"
 	"github.com/some-du6e/clack/internal/richtext"
 	"github.com/some-du6e/clack/internal/slack"
+	"github.com/some-du6e/clack/internal/ui/ctxclick"
 	"github.com/some-du6e/clack/internal/ui/openurl"
 	"github.com/some-du6e/clack/internal/ui/theme"
 )
@@ -42,14 +44,17 @@ import (
 // centered 27px above the bottom. The image is centered and fitted into
 // the area between header and footer (36px side margins), never upscaled.
 
-// lbItem is one viewable image of the message.
+// lbItem is one viewable image of the message, or a playable video
+// (video: img is its poster, lightbox_video.go).
 type lbItem struct {
-	img  richtext.Image
-	file *richtext.File // set for shared files
+	img   richtext.Image
+	file  *richtext.File // set for shared files
+	video bool
 }
 
 // Lightbox is the full-window image viewer.
 type Lightbox struct {
+	full image.Rectangle // the window it covers as last drawn (Rect)
 	base
 	h     Host
 	m     core.Message
@@ -73,6 +78,9 @@ type Lightbox struct {
 	prevBtn, nextBtn                          widget.Clickable
 	tips                                      [9]TipState
 	moreRect                                  image.Rectangle
+
+	// vid is the video item's player and footer (lightbox_video.go)
+	vid lbVideo
 
 	// pending is the pending file viewer (NewPendingViewer): a file not
 	// sent yet, with its title and "Edit file details" in the header.
@@ -119,7 +127,8 @@ func NewLightbox(h Host, img richtext.Image, m core.Message) *Lightbox {
 }
 
 // lbCollect appends every image in blocks (image blocks, image files with a
-// thumb, attachment images), recursively, skipping duplicates.
+// thumb, attachment images) and every playable video file, in order,
+// recursively, skipping duplicates: Slack's queue of a message's media.
 func lbCollect(blocks []richtext.Block, out *[]lbItem) {
 	add := func(it lbItem) {
 		if it.img.URL == "" {
@@ -140,7 +149,9 @@ func lbCollect(blocks []richtext.Block, out *[]lbItem) {
 				add(lbItem{img: *b.Image})
 			}
 		case richtext.FileBlock:
-			if f := b.File; f != nil && f.IsImage && f.Thumb != nil {
+			if f := b.File; f != nil && f.IsVideo && f.URL != "" {
+				add(lbVideoItem(f))
+			} else if f != nil && f.IsImage && f.Thumb != nil {
 				im := *f.Thumb
 				if im.Title == "" {
 					im.Title = f.Title
@@ -291,6 +302,10 @@ func (lb *Lightbox) wheel(dy float32) {
 	lb.setZoom(lb.zoom * f)
 }
 
+// Rect is the window it covers as last drawn (window coords): the
+// lightbox's backdrop is its card.
+func (lb *Lightbox) Rect() image.Rectangle { return lb.full }
+
 // Layout draws the viewer.
 func (lb *Lightbox) Layout(gtx layout.Context) layout.Dimensions {
 	drain()
@@ -310,6 +325,14 @@ func (lb *Lightbox) Layout(gtx layout.Context) layout.Dimensions {
 	if lb.done {
 		return layout.Dimensions{}
 	}
+	now := gtx.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if lb.cur().video {
+		lb.videoKeys(gtx)
+		lb.videoInput(gtx, now)
+	}
 	lb.clicks(gtx)
 	if lb.done {
 		return layout.Dimensions{}
@@ -321,6 +344,7 @@ func (lb *Lightbox) Layout(gtx layout.Context) layout.Dimensions {
 	}
 
 	full := image.Rectangle{Max: win}
+	lb.full = full
 	fill(gtx, full, cl.Backdrop)
 	m28 := dp(gtx, 28)
 	panel := full.Inset(m28)
@@ -343,6 +367,17 @@ func (lb *Lightbox) Layout(gtx layout.Context) layout.Dimensions {
 	}
 	fill(gtx, panel, theme.Mix(under, rgb(0x000000), .7))
 
+	if lb.cur().video {
+		lb.videoItem(gtx, th, panel, now)
+		pc.Pop()
+		if lb.cur().video {
+			lb.videoChrome(gtx, th, panel, now)
+			return layout.Dimensions{Size: win}
+		}
+		pc = clipRRect(gtx, panel, rad) // the end moved on to an image
+	} else {
+		lb.closeVideo()
+	}
 	headH, footH := dp(gtx, 85), dp(gtx, 85)
 	side := dp(gtx, 36)
 	area := image.Rect(panel.Min.X+side, panel.Min.Y+headH, panel.Max.X-side, panel.Max.Y-footH)
@@ -395,11 +430,11 @@ func (lb *Lightbox) keys(gtx layout.Context, top bool) {
 		case key.NameRightArrow:
 			lb.go2(lb.idx + 1)
 		case "+", "=":
-			if lb.cur().hosted() {
+			if lb.cur().hosted() && !lb.cur().video {
 				lb.setZoom(lb.zoom + 0.5)
 			}
 		case "-":
-			if lb.cur().hosted() {
+			if lb.cur().hosted() && !lb.cur().video {
 				lb.setZoom(lb.zoom - 0.5)
 			}
 		case "0":
@@ -439,6 +474,10 @@ func (lb *Lightbox) clicks(gtx layout.Context) {
 	if lb.dlBtn.Clicked(gtx) {
 		lb.download()
 	}
+	if lb.vid.dockBtn.Clicked(gtx) {
+		lb.dock()
+		return
+	}
 	if lb.threadBtn.Clicked(gtx) {
 		if lb.m.Channel == "" || lb.m.TS == "" {
 			h.Toast("This image isn't part of a conversation")
@@ -456,6 +495,12 @@ func (lb *Lightbox) clicks(gtx layout.Context) {
 		lbOpen(h, lb.cur().windowURL())
 	}
 	if lb.moreBtn.Clicked(gtx) {
+		if lb.cur().video {
+			// a video's: the file's actions, Download among them (the
+			// viewer's FileViewerActions with showDownloadMenuItem)
+			h.ShowOverlay(NewVideoActionsMenu(h, lb.moreRect, lb.m, lb.cur().file, false))
+			return
+		}
 		it := lb.cur()
 		link := it.linkURL()
 		items := []MenuItem{
@@ -503,6 +548,10 @@ func (lb *Lightbox) pointerEvents(gtx layout.Context) bool {
 		}
 		switch pe.Kind {
 		case pointer.Press:
+			if ctxclick.Press(pe) {
+				lb.imageMenu(image.Pt(int(pe.Position.X), int(pe.Position.Y)))
+				continue
+			}
 			lb.dragging = true
 			lb.dragFrom, lb.panFrom = pe.Position, lb.pan
 		case pointer.Drag:
@@ -580,21 +629,34 @@ func lbGradient(gtx layout.Context, r image.Rectangle, top bool) {
 	paint.PaintOp{}.Add(gtx.Ops)
 }
 
+// lbShown is what the viewer shows for it: the original (displayURL) once
+// it's decoded, and the file's largest Slack thumbnail (it.img) while it
+// loads — or in its place for good, when the original can't be shown (it
+// needs more decode memory than an image may have, or doesn't decode): so
+// that's no error. ok is false while neither is ready, msg then the
+// placeholder's text ("This image couldn't be loaded" only once neither
+// can be).
+func lbShown(imgs *imgcache.Cache, it lbItem) (paint.ImageOp, bool, string) {
+	u := it.displayURL()
+	img, ok := imgs.Get(u, 0)
+	if !ok && u != it.img.URL {
+		img, ok = imgs.Get(it.img.URL, 0) // the thumb while the original loads, or in its place
+	}
+	if ok {
+		return img, true, ""
+	}
+	if imgs.Failed(u, 0) && (u == it.img.URL || imgs.Failed(it.img.URL, 0)) {
+		return paint.ImageOp{}, false, "This image couldn't be loaded"
+	}
+	return paint.ImageOp{}, false, "Loading…"
+}
+
 // drawImage fits the current image into area (contain, at most natural
 // size at zoom 1), applies zoom/rotation/pan and registers the drag area.
 func (lb *Lightbox) drawImage(gtx layout.Context, th *theme.Theme, panel, area image.Rectangle) {
 	it := lb.cur()
-	imgs := lb.h.Images()
-	u := it.displayURL()
-	img, ok := imgs.Get(u, 0)
-	if !ok && u != it.img.URL {
-		img, ok = imgs.Get(it.img.URL, 0) // the thumb while the original loads
-	}
+	img, ok, msg := lbShown(lb.h.Images(), it)
 	if !ok {
-		msg := "Loading…"
-		if imgs.Failed(u, 0) && (u == it.img.URL || imgs.Failed(it.img.URL, 0)) {
-			msg = "This image couldn't be loaded"
-		}
 		tw := textW(gtx, th, 15, theme.Regular, msg)
 		at(gtx, image.Pt(area.Min.X+(area.Dx()-tw)/2, area.Min.Y+area.Dy()/2-dp(gtx, 11)), func(gtx layout.Context) layout.Dimensions {
 			return text(gtx, th, 15, theme.Regular, rgba(0xffffff, .8), msg)
@@ -921,9 +983,10 @@ func lbSlackHost(raw string) bool {
 }
 
 // lbGet downloads a public (non-Slack) image with no credentials:
-// imgcache.PublicFetchLimit refuses non-https, userinfo and private
-// addresses, then loads it through Slack's image proxy, so saving an unfurl
-// image doesn't reveal your IP address to its host. At most core.MaxFetch.
+// imgcache.PublicFetchLimit refuses anything but http(s), userinfo and
+// private addresses, then loads it through Slack's image proxy, so saving
+// an unfurl image doesn't reveal your IP address to its host. At most
+// core.MaxFetch.
 func lbGet(ctx context.Context, raw string) ([]byte, error) {
 	return imgcache.PublicFetchLimit(ctx, raw, core.MaxFetch)
 }
@@ -1091,4 +1154,31 @@ func lbClampF(v, lo, hi float32) float32 {
 		return hi
 	}
 	return v
+}
+
+// imageMenu is a right-click on the image: ImageViewer's <img
+// class="p-image_viewer__image"> (boot-shared sMCK, in FileViewer's
+// renderImageViewer and the media viewer) has no context menu of its own,
+// so it is the desktop shell's image menu: Copy Image copies what the
+// viewer shows, Copy Image URL the <img>'s src (a file's image; for an
+// image that isn't a file, image.src through Slack's image proxy).
+// Videos have their own player.
+func (lb *Lightbox) imageMenu(at image.Point) {
+	it := lb.cur()
+	if it.file != nil && it.file.IsVideo {
+		return
+	}
+	shown := it.displayURL()
+	if shown == "" {
+		return
+	}
+	src := shown
+	if !it.hosted() {
+		src = it.windowURL()
+	}
+	alt := "" // the thumbnail the viewer shows when the original can't be
+	if it.img.URL != shown {
+		alt = it.img.URL
+	}
+	lb.h.ShowOverlay(NewImageMenuFrom(lb.h, at, shown, src, alt, it.hosted()))
 }

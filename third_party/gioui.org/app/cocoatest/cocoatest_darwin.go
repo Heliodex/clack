@@ -6,7 +6,7 @@ package cocoatest
 
 /*
 #cgo CFLAGS: -Werror -Wno-deprecated-declarations -fobjc-arc -x objective-c
-#cgo LDFLAGS: -framework AppKit
+#cgo LDFLAGS: -framework AppKit -framework Carbon -framework QuartzCore -framework Metal
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -28,6 +28,7 @@ typedef struct {
 	int visible, zoomed, miniaturized, fullScreen, key, appActive;
 	char title[256];
 	cocoatest_rect screenFrame;
+	int occlusionVisible;
 } cocoatest_window;
 
 void cocoatest_state(uintptr_t view, cocoatest_window *s);
@@ -38,6 +39,7 @@ void cocoatest_order_front(uintptr_t view);
 void cocoatest_set_double_click(const char *v);
 int cocoatest_reopen(int visible, int *handled);
 void cocoatest_post_did_become_active(void);
+void cocoatest_terminate(void);
 int cocoatest_key_equivalent(const char *key, int mods);
 void cocoatest_on_main(uintptr_t h);
 void cocoatest_track(uintptr_t view);
@@ -46,6 +48,17 @@ void cocoatest_toggle_full_screen(uintptr_t view);
 int cocoatest_screens(cocoatest_rect *frames, cocoatest_rect *visible, int limit);
 void cocoatest_set_top_left(uintptr_t view, CGFloat x, CGFloat y);
 void cocoatest_zoom(uintptr_t view);
+void cocoatest_post_key(uintptr_t view, int code, int mods, int direct, char *chars, char *ign, int n);
+void cocoatest_trace_keys(uintptr_t view);
+char *cocoatest_key_trace(void);
+void cocoatest_keyboard_layout(char *out, int n);
+void cocoatest_cover(void);
+void cocoatest_uncover(void);
+void cocoatest_post_workspace(int note);
+int cocoatest_drawable_timeout(uintptr_t view);
+void cocoatest_hold_drawables(void);
+void cocoatest_release_drawables(void);
+int cocoatest_held_calls(void);
 */
 import "C"
 
@@ -94,6 +107,10 @@ type Window struct {
 	// coordinates: points from the primary screen's top left, y down
 	// (Clack patch, CLACK_PATCHES.md §25).
 	ScreenFrame Rect
+	// OcclusionVisible: the window's occlusionState has
+	// NSWindowOcclusionStateVisible, some of it on a screen (Clack patch,
+	// CLACK_PATCHES.md §32).
+	OcclusionVisible bool
 }
 
 func rect(r C.cocoatest_rect) Rect {
@@ -123,6 +140,7 @@ func State(view uintptr) Window {
 		AppActive:           s.appActive != 0,
 		Title:               C.GoString(&s.title[0]),
 		ScreenFrame:         rect(s.screenFrame),
+		OcclusionVisible:    s.occlusionVisible != 0,
 	}
 	for i := range w.Buttons {
 		w.ButtonsHidden[i] = s.buttonsHidden[i] != 0
@@ -189,6 +207,14 @@ func Reopen(hasVisibleWindows bool) (ret, handled bool) {
 	return r != 0, h != 0
 }
 
+// Terminate sends NSApp terminate:, as the Dock's Quit, log out, restart
+// and a quit Apple Event do, from the main run loop (a perform the main
+// queue schedules, so the main queue stays free while terminate: waits),
+// and returns at once: while the app delegate answers NSTerminateLater
+// (Gio patch 58) AppKit's terminate: doesn't return until the app
+// replies. Any goroutine.
+func Terminate() { C.cocoatest_terminate() }
+
 // PostDidBecomeActive posts NSApplicationDidBecomeActiveNotification, as
 // AppKit does when the app comes to the front (⌘Tab, the Dock). Main
 // thread.
@@ -209,6 +235,77 @@ func KeyEquivalent(key string, mods int) bool {
 	cs := C.CString(key)
 	defer C.free(unsafe.Pointer(cs))
 	return C.cocoatest_key_equivalent(cs, C.int(mods)) != 0
+}
+
+// Key codes (Carbon's kVK_ANSI_* and kVK_*: where the key is, not what it
+// types) for PostKey.
+const (
+	KeyA      = 0x00
+	KeyD      = 0x02
+	KeyF      = 0x03
+	KeyX      = 0x07
+	KeyC      = 0x08
+	KeyB      = 0x0B
+	KeyEscape = 0x35
+	KeyLeft   = 0x7B
+	KeyRight  = 0x7C
+	KeyDown   = 0x7D
+	KeyUp     = 0x7E
+)
+
+// PostKey queues one press of the key at code (KeyA, …) with mods (Cmd,
+// Shift, Opt, Ctrl) held, as a keyboard makes it: a flagsChanged for
+// each modifier going down (⌃, ⌥, ⇧, then ⌘), the key's down and up, then
+// the modifiers going up. The key's characters are what the current
+// keyboard layout types for it (UCKeyTranslate, as the window server
+// fills them in: ⌥⇧D is "Î", ⌃D is U+0004), and its characters ignoring
+// modifiers what it types with Shift alone; the arrows are AppKit's
+// function-key characters, with the function and numeric-pad flags a
+// real arrow key sets. The run loop delivers the events through NSApp
+// sendEvent:: the key window's and the main menu's performKeyEquivalent:
+// first when ⌘ is down, then the key window's first responder. It
+// returns the key's characters and characters ignoring modifiers. Main
+// thread.
+func PostKey(view uintptr, code, mods int) (chars, ignoring string) {
+	return postKey(view, code, mods, false)
+}
+
+// SendKey is PostKey without NSApp: the events go straight to the view's
+// flagsChanged:, keyDown: and keyUp:, so no menu key equivalent can take
+// them. Main thread.
+func SendKey(view uintptr, code, mods int) (chars, ignoring string) {
+	return postKey(view, code, mods, true)
+}
+
+func postKey(view uintptr, code, mods int, direct bool) (string, string) {
+	var chars, ign [64]C.char
+	C.cocoatest_post_key(C.uintptr_t(view), C.int(code), C.int(mods), cint(direct), &chars[0], &ign[0], C.int(len(chars)))
+	return C.GoString(&chars[0]), C.GoString(&ign[0])
+}
+
+// KeyboardLayout is the current keyboard layout's input source id
+// ("com.apple.keylayout.US"), which PostKey types with. Main thread.
+func KeyboardLayout() string {
+	var b [256]C.char
+	C.cocoatest_keyboard_layout(&b[0], C.int(len(b)))
+	return C.GoString(&b[0])
+}
+
+// TraceKeys records what the view's class gets of the key events from
+// now on (keyDown:, keyUp:, flagsChanged:, and what its
+// interpretKeyEvents: makes of them: doCommandBySelector:, insertText:),
+// for KeyTrace. Once per view class. Main thread.
+func TraceKeys(view uintptr) { C.cocoatest_trace_keys(C.uintptr_t(view)) }
+
+// KeyTrace returns the calls TraceKeys recorded since the last KeyTrace,
+// one per line, and forgets them. Main thread.
+func KeyTrace() string {
+	s := C.cocoatest_key_trace()
+	if s == nil {
+		return ""
+	}
+	defer C.free(unsafe.Pointer(s))
+	return C.GoString(s)
 }
 
 // Screen is a screen's frame and visible frame (its work area), in
@@ -241,6 +338,50 @@ func ZoomWindow(view uintptr) { C.cocoatest_zoom(C.uintptr_t(view)) }
 // ToggleFullScreen sends the window toggleFullScreen:, as the green
 // button and View > Toggle Full Screen do. Main thread.
 func ToggleFullScreen(view uintptr) { C.cocoatest_toggle_full_screen(C.uintptr_t(view)) }
+
+// Cover puts an opaque window over every screen, above normal windows,
+// so AppKit reports the windows under it occluded (Clack patch,
+// CLACK_PATCHES.md §32). Uncover takes it away. Main thread.
+func Cover()   { C.cocoatest_cover() }
+func Uncover() { C.cocoatest_uncover() }
+
+// WorkspaceNote is one of NSWorkspace's sleep and wake notifications.
+type WorkspaceNote int
+
+const (
+	WillSleep       WorkspaceNote = iota // NSWorkspaceWillSleepNotification
+	DidWake                              // NSWorkspaceDidWakeNotification
+	ScreensDidSleep                      // NSWorkspaceScreensDidSleepNotification
+	ScreensDidWake                       // NSWorkspaceScreensDidWakeNotification
+)
+
+// PostWorkspace posts n on NSWorkspace's notification center, as macOS
+// does when the computer or its screens sleep and wake. Main thread.
+func PostWorkspace(n WorkspaceNote) { C.cocoatest_post_workspace(C.int(n)) }
+
+// DrawableTimeout is the view's CAMetalLayer's allowsNextDrawableTimeout
+// (metal false: the layer isn't a CAMetalLayer). Main thread.
+func DrawableTimeout(view uintptr) (timeout, metal bool) {
+	r := C.cocoatest_drawable_timeout(C.uintptr_t(view))
+	return r == 1, r >= 0
+}
+
+// HoldDrawables makes every CAMetalLayer answer nextDrawable as it does
+// when the compositor keeps all its drawables (a sleeping display keeps
+// them; a waking one hands them back late): with allowsNextDrawableTimeout
+// the call waits a second and gives nil, without it the call waits until
+// ReleaseDrawables, and then gets a drawable. A layer's own drawables don't
+// run out on a desktop that shows them: on the macOS 26 runner one gave 8
+// unpresented drawables, their textures taken, without waiting. Main
+// thread.
+func HoldDrawables() { C.cocoatest_hold_drawables() }
+
+// ReleaseDrawables ends HoldDrawables, waiting calls included. Any thread.
+func ReleaseDrawables() { C.cocoatest_release_drawables() }
+
+// HeldCalls is how many nextDrawable calls HoldDrawables has answered
+// since it began. Any thread.
+func HeldCalls() int { return int(C.cocoatest_held_calls()) }
 
 // Track keeps weak references to view and its window, for Alive. Main
 // thread.

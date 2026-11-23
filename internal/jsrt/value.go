@@ -41,16 +41,63 @@ type cleanupArg struct {
 	h uint32
 }
 
-// releaseLater frees a handle whose Go Value was garbage collected.
+// releaseLater frees a handle whose Go Value was garbage collected. The
+// collector runs these cleanups by the thousand right after a cycle, on
+// its cleanup goroutine. Each used to queue a task of its own, so a burst
+// took the queue's lock thousands of times while the UI goroutine's posts
+// (a plugin row's Render) waited behind it, and the JS thread ran a
+// microtask checkpoint per handle: a ~220 ms frame after every collection
+// once JS kept up with the rows. Now handles join the batch whose task is
+// queued, one task for the whole burst.
+//
+// A handle only joins while that batch's task is still the last one
+// queued: a task queued since might use a handle a cleanup frees after it
+// (a raw handle captured without its Value), and freeing it in an earlier
+// batch would free it first. Then a new batch starts, so a burst
+// interleaved with other posts makes a few tasks, never one per handle.
 func (r *Runtime) releaseLater(h uint32) {
 	if r.closed.Load() {
 		return
 	}
-	r.enqueue(func() {
-		if r.eng != nil {
-			r.eng.release(h)
-		}
-	})
+	r.relMu.Lock()
+	if b := r.relOpen; b != nil && r.relSeq != 0 && r.relSeq == r.enqN.Load() {
+		b.hs = append(b.hs, h)
+		r.relMu.Unlock()
+		return
+	}
+	b := &relBatch{hs: append(make([]uint32, 0, 256), h)}
+	r.relOpen, r.relSeq = b, 0
+	r.relMu.Unlock()
+	n := r.enqueue(task{kind: "release", f: func() { r.releaseBatch(b) }})
+	r.relMu.Lock()
+	if r.relOpen == b {
+		r.relSeq = n
+	}
+	r.relMu.Unlock()
+}
+
+// relBatch is handles to release in one task (hs: relMu).
+type relBatch struct{ hs []uint32 }
+
+// releaseBatch frees b's handles (JS thread). From here on nothing joins b.
+func (r *Runtime) releaseBatch(b *relBatch) {
+	r.relMu.Lock()
+	hs := b.hs
+	b.hs = nil
+	if r.relOpen == b {
+		r.relOpen = nil
+	}
+	r.relMu.Unlock()
+	if r.eng == nil {
+		return
+	}
+	for _, h := range hs {
+		r.eng.release(h)
+	}
+	r.released.Add(uint64(len(hs)))
+	if f := r.relSeen.Load(); f != nil {
+		(*f)(hs)
+	}
 }
 
 // asRemote marks v, on the JS thread and about to be handed to another
@@ -470,11 +517,17 @@ func (c *Ctx) NewPromise() (p Value, resolve func(any), reject func(error)) {
 	p = c.r.wrap(ph)
 	resV, rejV := c.r.wrap(rs), c.r.wrap(rj)
 	var once onceFlag
+	// it settles on the lane of the task that made it: a user-blocking
+	// task's await of a Go function continues ahead of the queue
+	var root lane
+	if c.r.onJSThread() {
+		root = c.r.chainLane()
+	}
 	resolve = func(x any) {
 		if !once.take() {
 			return
 		}
-		c.r.Post(func(js *Ctx) {
+		c.r.postChain(root, func(js *Ctx) {
 			if _, err := resV.Call(x); err != nil {
 				_, _ = rejV.Call(js.NewError(err))
 			}
@@ -486,7 +539,7 @@ func (c *Ctx) NewPromise() (p Value, resolve func(any), reject func(error)) {
 		if !once.take() {
 			return
 		}
-		c.r.Post(func(js *Ctx) {
+		c.r.postChain(root, func(js *Ctx) {
 			_, _ = rejV.Call(js.NewError(err))
 			resV.Free()
 			rejV.Free()

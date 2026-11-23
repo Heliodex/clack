@@ -46,7 +46,7 @@ type commentStore struct {
 	next    int
 }
 
-var commentStores sync.Map // *Server -> *commentStore
+var commentStores = newPerServer() // *Server -> *commentStore
 
 func (s *Server) comments() *commentStore {
 	if v, ok := commentStores.Load(s); ok {
@@ -58,6 +58,21 @@ func (s *Server) comments() *commentStore {
 	}
 	v, _ := commentStores.LoadOrStore(s, cs)
 	return v.(*commentStore)
+}
+
+// commentAt is the comment (a root or a reply) ts of file channel ch, as
+// messages.list finds it by id.
+func (s *Server) commentAt(ch, ts string) (slack.Message, bool) {
+	cs := s.comments()
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	for _, m := range cs.msgs[ch] {
+		if m.TS == ts {
+			m.Channel = ch
+			return m, true
+		}
+	}
+	return slack.Message{}, false
 }
 
 func commentRoot(ts, user, editor, thread, text string, replies []slack.Message, resolved bool, seen string) []slack.Message {

@@ -3,6 +3,7 @@ package popups
 import (
 	"image"
 	"image/color"
+	"slices"
 	"time"
 
 	"gioui.org/io/event"
@@ -108,6 +109,24 @@ type MenuItem struct {
 	// onContextMenuCapture under channel_tab_overflow_right_click). The
 	// menu stays open and the row stays highlighted.
 	Context func(at image.Point)
+
+	// Action is a message menu row's Slack action id (lq1n: "copy_link",
+	// "mark_unread", "organize_actions_menu"; an app shortcut's action id),
+	// its id in MAMenu's actions (actions_mamenu.go); without one a row is
+	// known by its key under its parent.
+	Action string
+	// QA is the row's data-qa in MAMenu's actions where it isn't Slack's
+	// for the action id (an app shortcut's app_action_<id>).
+	QA string
+	// Class is the classes on the row's button besides
+	// c-menu_item__button (MAMenu's p-message_actions_menu__<id> and a
+	// descriptor's className), which plugin CSS selects: a row whose li
+	// that CSS makes an inline box with a width is laid out beside its
+	// neighbours (rowBoxes; Better Message Menu's big buttons).
+	Class string
+
+	maid  string // MAMenu's id for a row without an Action (newMAMenu)
+	maSub string // the message actions submenu component its submenu renders (Organize, Connect to apps)
 }
 
 // Sep is a separator row.
@@ -138,6 +157,15 @@ type MenuOpts struct {
 	// (header kebab menus).
 	AlignRight bool
 	OnClose    func()
+	// ScrimAfter holds the window-wide scrim (the layer a click outside
+	// the menu hits, closing it) down for that long from the menu's first
+	// frame: until then a press outside the card reaches what's under it,
+	// and the menu stays. The composer's + menu does this as Slack does
+	// (ShortcutsMenuTriggerButton sets its overlay's height to 0 for
+	// 250 ms) so a double click's second click lands on the button. A
+	// press that began meanwhile keeps the scrim down until it comes up,
+	// so a slow second click still completes on the button.
+	ScrimAfter time.Duration
 
 	// Raw skips the MenuFromTemplate boundary: the items already came out
 	// of a MenuFromTemplate a plugin rendered (slackc/kit's MenuTrigger).
@@ -151,8 +179,15 @@ type MenuOpts struct {
 	// channel menu is ChannelContextMenu{id} >
 	// ContextMenuTriggerWithKeyboardFocus{getTemplate}).
 	Wraps []MenuWrap
-	// MenuClass is Slack's Menu menuClassNames.
+	// MenuClass is Slack's Menu menuClassNames, on the card (c-menu).
 	MenuClass string
+	// MAMenu, set on message menus, is Slack's MAMenu boundary inside
+	// Within (actions_mamenu.go): its props (MessageActionsProps), the
+	// rows going to JS as its actions.
+	MAMenu slackc.Props
+	// Trigger is what the menu opened from, window px: its targetBounds
+	// (Slack's DOMRect of the trigger, in CSS px); empty is Anchor.
+	Trigger image.Rectangle
 }
 
 // MenuWrap is a Slack component a menu is rendered inside.
@@ -197,6 +232,17 @@ type Menu struct {
 	ctxDone bool           // asked a patched getTemplate
 
 	rowCtx int // the right-click area's tag (MenuItem.Context)
+
+	shownAt time.Time // the root's first frame (ScrimAfter)
+	// held are the pointers pressed while ScrimAfter held the scrim down
+	// that haven't come up (scrimUp), seen through heldTag's pass-through
+	// area over the window
+	held    []pointer.ID
+	heldTag int
+
+	ma    *maMenu           // Slack's MAMenu (MenuOpts.MAMenu)
+	boxes []image.Rectangle // rowBoxes' boxes, reused
+	tiles []menuTile        // rowBoxes' inline rows
 }
 
 // NewMenu opens a menu with its top-left corner at anchor (flipping at the
@@ -213,6 +259,16 @@ func NewMenuOpts(h Host, items []MenuItem, o MenuOpts) *Menu {
 	m.wraps = o.Wraps
 	if o.Within != "" {
 		m.wraps = append(m.wraps[:len(m.wraps):len(m.wraps)], MenuWrap{Name: o.Within, Props: o.WithinProps})
+	}
+	if o.MAMenu != nil {
+		target := o.Trigger
+		if target == (image.Rectangle{}) {
+			target = o.Anchor
+		}
+		m.ma = newMAMenu(o.MAMenu, items, target)
+		if m.opts.MenuClass == "" {
+			m.opts.MenuClass = "p-message_actions_menu" // MAMenu's menuClassNames
+		}
 	}
 	return m
 }
@@ -386,6 +442,14 @@ func (m *Menu) openSub(i int, kbd bool) {
 		m.items[i].Tag = nil
 	}
 	s := &Menu{h: m.h, items: it.Sub, opts: MenuOpts{Width: m.opts.Width}, sel: -1, subIdx: -1, parent: m, kbd: kbd}
+	if r := m.root(); r.ma != nil {
+		s.opts.MenuClass = r.opts.MenuClass // a message menu's submenus render MAMenu too
+		if it.maSub != "" {
+			s.key = r.key + ":" + it.maSub
+			s.ma = newSubMAMenu(r.ma, it)
+			s.orig = it.Sub // its Menu's children (menuProps)
+		}
+	}
 	s.clicks = make([]widget.Clickable, len(it.Sub))
 	if kbd {
 		s.move(1)
@@ -399,6 +463,19 @@ func (m *Menu) closeSub() {
 
 func (m *Menu) keys(gtx layout.Context) {
 	filters := m.keyFilters()
+	held := m.ma != nil && m.ma.held
+	if !held && m.ma != nil && len(m.ma.queued) > 0 {
+		// the keys pressed while the card waited for the plugin's layout
+		// (maHold) go to the rows it laid out, as Slack's menu, drawn from
+		// the patched MAMenu at once, would have had them
+		q := m.ma.queued
+		m.ma.queued = nil
+		for _, ke := range q {
+			if m.onKey(gtx, ke) {
+				return
+			}
+		}
+	}
 	for {
 		e, ok := gtx.Event(filters...)
 		if !ok {
@@ -408,63 +485,78 @@ func (m *Menu) keys(gtx layout.Context) {
 		if !ok || ke.State != key.Press {
 			continue
 		}
-		a := m.active()
-		nav := ke.Modifiers == 0
-		switch name := ke.Name; {
-		case !nav:
-			// ⌘↑ isn't navigation, but may be an item shortcut
-		case name == key.NameUpArrow:
-			a.typeBuf = ""
-			a.move(-1)
-		case name == key.NameDownArrow:
-			a.typeBuf = ""
-			a.move(1)
-		case name == key.NameHome:
-			a.typeBuf = ""
-			a.sel = -1
-			a.move(1)
-		case name == key.NameEnd:
-			a.typeBuf = ""
-			a.sel = -1
-			a.move(-1)
-		case name == key.NameRightArrow:
-			if a.sel >= 0 && len(a.items[a.sel].Sub) > 0 {
-				a.openSub(a.sel, true)
-			}
-		case name == key.NameLeftArrow:
-			if a.parent != nil {
-				a.parent.closeSub()
-			}
-		case name == key.NameReturn, name == key.NameEnter, name == key.NameSpace:
-			a.activate(gtx, a.sel)
-		case name == key.NameEscape:
-			if a.parent != nil {
-				a.parent.closeSub()
-			} else {
-				m.closeAll()
-			}
-		default:
-			nav = false
-		}
-		if m.done {
-			return
-		}
-		// Slack's onMenuKeyDown: an item shortcut runs after navigation
-		// (a key can't be both: nav keys carry no shortcut ids here).
-		if i := a.shortcutMatch(ke); i >= 0 {
-			a.runShortcut(gtx, i)
-			if m.done {
-				return
-			}
+		if held && !(ke.Name == key.NameEscape && ke.Modifiers == 0) {
+			m.ma.queued = append(m.ma.queued, ke)
 			continue
 		}
-		if MenuTypeAhead && !nav {
-			a.typeAhead(gtx, ke)
-			if m.done {
-				return
-			}
+		if m.onKey(gtx, ke) {
+			return
 		}
 	}
+}
+
+// onKey handles one key press; it reports whether the menu is done with
+// this frame's keys (closed, or a message menu's submenu key ran).
+func (m *Menu) onKey(gtx layout.Context, ke key.Event) bool {
+	a := m.active()
+	nav := ke.Modifiers == 0
+	switch name := ke.Name; {
+	case !nav:
+		// ⌘↑ isn't navigation, but may be an item shortcut
+	case name == key.NameUpArrow:
+		a.typeBuf = ""
+		a.move(-1)
+	case name == key.NameDownArrow:
+		a.typeBuf = ""
+		a.move(1)
+	case name == key.NameHome:
+		a.typeBuf = ""
+		a.sel = -1
+		a.move(1)
+	case name == key.NameEnd:
+		a.typeBuf = ""
+		a.sel = -1
+		a.move(-1)
+	case name == key.NameRightArrow:
+		if a.sel >= 0 && len(a.items[a.sel].Sub) > 0 {
+			a.openSub(a.sel, true)
+		}
+	case name == key.NameLeftArrow:
+		if a.parent != nil {
+			a.parent.closeSub()
+		}
+	case name == key.NameReturn, name == key.NameEnter, name == key.NameSpace:
+		a.activate(gtx, a.sel)
+	case name == key.NameEscape:
+		if a.parent != nil {
+			a.parent.closeSub()
+		} else {
+			m.closeAll()
+		}
+	default:
+		nav = false
+	}
+	if m.done {
+		return true
+	}
+	// Slack's onMenuKeyDown: an item shortcut runs after navigation
+	// (a key can't be both: nav keys carry no shortcut ids here).
+	if i := a.shortcutMatch(ke); i >= 0 {
+		a.runShortcut(gtx, i)
+		return m.done
+	}
+	// a message menu's submenu action keys (Organize's Pin P), after
+	// the rows' own (MessageActionsMenu's onMenuKeyDown)
+	if a == m && m.maSubKey(gtx, ke) {
+		return true
+	}
+	if MenuTypeAhead && !nav {
+		a.typeAhead(gtx, ke)
+		if m.done {
+			return true
+		}
+	}
+	return false
 }
 
 // Labels lists the menu's rows for tests and diagnostics: each item's
@@ -501,11 +593,16 @@ func (m *Menu) Layout(gtx layout.Context) layout.Dimensions {
 			gtx.Execute(key.FocusCmd{Tag: m})
 			m.focus = true
 		}
+		if m.ma != nil {
+			// a card waiting for the plugin's layout holds its keys too (the
+			// root's, or an open message actions submenu's)
+			m.ma.held = m.ma.holding(gtx) || (m.sub != nil && m.sub.ma != nil && m.sub.ma.waiting(frameNow(gtx)))
+		}
 		m.keys(gtx)
 		if m.done {
 			return layout.Dimensions{}
 		}
-		if !m.opts.Peek && m.scrim.Layout(gtx) {
+		if !m.opts.Peek && m.scrimUp(gtx) && m.scrim.Layout(gtx) {
 			m.closeAll()
 			return layout.Dimensions{}
 		}
@@ -525,6 +622,58 @@ func (m *Menu) Layout(gtx layout.Context) layout.Dimensions {
 	return layout.Dimensions{Size: win}
 }
 
+// scrimUp reports whether the root lays its scrim out this frame: always,
+// unless MenuOpts.ScrimAfter holds it down that long from the menu's
+// first frame, and after that while a press that began meanwhile is
+// still held. Otherwise the scrim would come up under that press (the
+// composer's +, a double click's second press): the router's next frame
+// moves the pressed pointer off its widget, whose release is then a
+// cancel. The frame the delay ends in is asked of the window, not with an
+// op.InvalidateCmd here: the rows read their events after this, and for
+// a command mid-frame the router replays the events no handler has read
+// yet, which lost clicks while the composer's + asked for its turn's
+// frames that way.
+func (m *Menu) scrimUp(gtx layout.Context) bool {
+	d := m.opts.ScrimAfter
+	if d <= 0 {
+		return true
+	}
+	now := frameNow(gtx)
+	if m.shownAt.IsZero() {
+		m.shownAt = now
+		time.AfterFunc(d, m.h.Invalidate)
+	}
+	for {
+		ev, ok := gtx.Event(pointer.Filter{Target: &m.heldTag, Kinds: pointer.Press | pointer.Release | pointer.Cancel})
+		if !ok {
+			break
+		}
+		e, ok := ev.(pointer.Event)
+		if !ok {
+			continue
+		}
+		switch e.Kind {
+		case pointer.Press:
+			if !slices.Contains(m.held, e.PointerID) {
+				m.held = append(m.held, e.PointerID)
+			}
+		case pointer.Release:
+			m.held = slices.DeleteFunc(m.held, func(id pointer.ID) bool { return id == e.PointerID })
+		case pointer.Cancel:
+			m.held = m.held[:0]
+		}
+	}
+	if !now.Before(m.shownAt.Add(d)) && len(m.held) == 0 {
+		return true
+	}
+	// down: every press reaches what's under the menu, and this area sees
+	// it go by
+	defer pointer.PassOp{}.Push(gtx.Ops).Pop()
+	defer clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops).Pop()
+	event.Op(gtx.Ops, &m.heldTag)
+	return false
+}
+
 func (m *Menu) layoutCard(gtx layout.Context, win image.Point) {
 	th := m.h.Theme()
 	cl := colorsOf(th)
@@ -534,12 +683,10 @@ func (m *Menu) layoutCard(gtx layout.Context, win image.Point) {
 	}
 	w := dp(gtx, wdp)
 	pad := dp(gtx, 12)
-	hs := make([]int, len(m.items))
-	h := 2 * pad
-	for i := range m.items {
-		hs[i] = m.rowHeight(gtx, th, i, w)
-		h += hs[i]
-	}
+	// the card first: its rows' boxes depend on the CSS under it
+	st := menuClass.EnterClass(gtx, 0, 0, m.opts.MenuClass)
+	boxes, contentH := m.rowBoxes(gtx, th, w)
+	h := 2*pad + contentH
 	maxH := win.Y - 2*dp(gtx, 8)
 	if h > maxH {
 		h = maxH
@@ -573,22 +720,32 @@ func (m *Menu) layoutCard(gtx layout.Context, win image.Point) {
 	if len(m.rows) != len(m.items) {
 		m.rows = make([]image.Rectangle, len(m.items))
 	}
-	st := menuClass.Enter(gtx, 0, 0)
 	if st.Hidden() {
 		st.Leave()
 		return
 	}
 	styledCard(gtx, st, cl, pos, sz, dp(gtx, 4), false, func(gtx layout.Context) {
-		m.layoutBody(gtx, th, cl, pos, w, hs)
+		m.layoutBody(gtx, th, cl, pos, boxes)
 	})
+	slackc.InspectCard(gtx, m.rect) // the inspect tool: the card is the menu's box
 	st.Leave()
 	if m.sub != nil && !m.done {
-		m.sub.layoutCard(gtx, win)
+		// a layer of its own for the inspect tool (a pick in it reports the
+		// submenu), with its own card
+		var sub, sm slackc.InspectMark
+		if slackc.Inspecting() {
+			sub = slackc.InspectOverlay("submenu (popups.Menu)")
+			sm = slackc.InspectAs("Menu") // the root menu's rows report theirs (its Menu boundary)
+		}
+		m.sub.layoutSub(gtx, win)
+		sm.EndCard(gtx)
+		sub.EndCard(gtx)
 	}
 }
 
-// layoutBody draws the card at the origin (pos is its window position).
-func (m *Menu) layoutBody(gtx layout.Context, th *theme.Theme, cl *Colors, pos image.Point, w int, hs []int) {
+// layoutBody draws the card at the origin (pos is its window position),
+// each row in its box (rowBoxes, under the top padding).
+func (m *Menu) layoutBody(gtx layout.Context, th *theme.Theme, cl *Colors, pos image.Point, boxes []image.Rectangle) {
 	local := image.Rectangle{Max: m.rect.Size()}
 	rad := dp(gtx, 4)
 	m.block.Layout(gtx, local)
@@ -623,18 +780,15 @@ func (m *Menu) layoutBody(gtx layout.Context, th *theme.Theme, cl *Colors, pos i
 
 	cs := clipRRect(gtx, local, rad)
 	pad := dp(gtx, 12)
-	y := pad
 	for i := range m.items {
-		r := image.Rect(0, y, w, y+hs[i])
+		r := boxes[i].Add(image.Pt(0, pad))
 		m.rows[i] = r.Add(pos)
-		if y > local.Max.Y {
-			y += hs[i]
+		if r.Min.Y > local.Max.Y {
 			continue
 		}
 		at(gtx, r.Min, func(gtx layout.Context) layout.Dimensions {
-			return m.row(gtx, th, cl, i, image.Pt(w, hs[i]))
+			return m.row(gtx, th, cl, i, r.Size())
 		})
-		y += hs[i]
 	}
 	cs.Pop()
 	m.rowContext(gtx, pos, local) // above the rows, passing their presses on
@@ -681,7 +835,7 @@ func (m *Menu) row(gtx layout.Context, th *theme.Theme, cl *Colors, i int, sz im
 	switch {
 	case it.Separator:
 		st := menuSepClass.Enter(gtx, 0, 0)
-		defer st.Leave()
+		defer leaveRow(gtx, st, sz)
 		if st.Hidden() {
 			return layout.Dimensions{Size: sz}
 		}
@@ -692,7 +846,7 @@ func (m *Menu) row(gtx layout.Context, th *theme.Theme, cl *Colors, i int, sz im
 		})
 	case it.Header != "":
 		st := menuHdrClass.Enter(gtx, 0, 0)
-		defer st.Leave()
+		defer leaveRow(gtx, st, sz)
 		if st.Hidden() {
 			return layout.Dimensions{Size: sz}
 		}
@@ -722,10 +876,20 @@ func (m *Menu) row(gtx layout.Context, th *theme.Theme, cl *Colors, i int, sz im
 	if it.Disabled {
 		state, mods = state|css.StateDisabled, mods|4
 	}
-	st := menuItemClass.Enter(gtx, state, mods)
-	defer st.Leave()
+	def := menuItemClass
+	if it.Class != "" {
+		def = menuRowDefsFor(it.Class).li
+	}
+	st := def.Enter(gtx, state, mods)
+	defer leaveRow(gtx, st, sz)
 	if st.Hidden() {
 		return layout.Dimensions{Size: sz}
+	}
+	if i < len(m.tiles) && m.tiles[i].on && it.Widget == nil {
+		gtx.Constraints = layout.Exact(sz)
+		return st.Wrap(gtx, func(gtx layout.Context) layout.Dimensions {
+			return m.tileRow(gtx, th, cl, st, i, sz, hl)
+		})
 	}
 	if it.Widget != nil {
 		// widgets get the row width as Max only (Min zero), so nested text
@@ -744,6 +908,13 @@ func (m *Menu) row(gtx layout.Context, th *theme.Theme, cl *Colors, i int, sz im
 	return st.Wrap(gtx, func(gtx layout.Context) layout.Dimensions {
 		return m.itemRow(gtx, th, cl, st, i, sz, hl)
 	})
+}
+
+// leaveRow leaves a row's element, giving it its box for the inspect tool
+// first (a popup's own: slackc.InspectAreaInLayer).
+func leaveRow(gtx layout.Context, st slackc.Styled, sz image.Point) {
+	slackc.InspectAreaInLayer(gtx, image.Rectangle{Max: sz})
+	st.Leave()
 }
 
 // itemRow draws a plain item row (label, icon, hints, check, chevron).

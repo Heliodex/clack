@@ -121,6 +121,16 @@ type prefs struct {
 	// insets by component, slackc/reserve.go): the next start keeps that
 	// space free until the plugin renders, so its first tree moves nothing.
 	PluginSlots map[string]slackc.Insets `json:"plugin_slots,omitempty"`
+	// PluginPatched and PluginStyled are what the plugins enabled last
+	// session showed once they ran: the components they patched
+	// (slackc.PatchedNames) and whether they added CSS of their own
+	// (api.setStyle, a page's style tags). A warm start waits for the
+	// plugins (up to the reveal's cap) when its first frame draws one of
+	// those components outside a reserved slot, or when they styled the
+	// page, and starts them after its first real frame when they showed
+	// nothing (reveal.go, backend.go).
+	PluginPatched []string `json:"plugin_patched,omitempty"`
+	PluginStyled  bool     `json:"plugin_styled,omitempty"`
 	// SpellLanguages are Language & region's spellcheck languages on
 	// Windows and Linux (the desktop app keeps them in Electron's session,
 	// per device): nil is the OS locale's language.
@@ -167,8 +177,15 @@ type prefs struct {
 	// files_open.go).
 	OpenFiles map[string]openFilesPrefs `json:"open_files,omitempty"`
 	// InspectTool turns on the inspect tool's shortcut (inspect_wire.go),
-	// like CLACK_INSPECT=1: a developer setting with no UI, set by hand.
+	// like CLACK_INSPECT=1: a developer setting with no UI. The Konami
+	// code sets and clears it; by hand only with Clack quit, since Clack
+	// writes ui.json from what it read at launch.
 	InspectTool bool `json:"inspect_tool,omitempty"`
+	// FlightRecorder is the execution trace flight recorder (flightrec.go):
+	// off unless true, as CLACK_FLIGHT_RECORDER=1 turns it on (it slows
+	// every frame). A diagnostic with no UI, set by hand with Clack quit
+	// (as InspectTool).
+	FlightRecorder *bool `json:"flight_recorder,omitempty"`
 	// MainWindow is Slack's mainWindowSettings: where the main window was
 	// (its frame in Gio patch 25's screen coordinates: physical pixels on
 	// Windows, points on macOS; on Linux its size in dp), and whether it

@@ -29,8 +29,14 @@ func init() {
 	// SvgIcons as the inline y8g2 font icon, size inherit)
 	reg("plus-small", s("M10 6.5 V13.5 M6.5 10 H13.5"))
 	// U+E294 icon_times_small (c-icon--times-small): AttachmentDeleteButton's
-	// rail-style remove button left of classic and Block Kit unfurls.
+	// rail-style remove button left of classic and Block Kit unfurls, and
+	// AudioPopover's Cancel recording.
 	reg("times-small", s("M7.25 7.25 L12.75 12.75 M12.75 7.25 L7.25 12.75"))
+	// U+E319 icon_check_large_bold (c-icon--check-large-bold): AudioPopover's
+	// Stop recording (boot-shared VIJ/). The outline is a 2.5-unit round
+	// stroke; these are its centrelines (the caps' centres and the round
+	// join's).
+	reg("check-large-bold", sw(2.5, "M3.6 10.4 L6.99 15.24 L16.4 4.13"))
 
 	// The Activity rows' Slack Connect Ignore flow (rPCk IgnoreForkedModal,
 	// IgnoreForkedModalButton: the y8g2 font icons times-circle-medium,
@@ -54,6 +60,22 @@ func init() {
 	// (its check a hole).
 	reg("real-checkbox-empty", s("M6.1 1.75 H13.9 C16.45 1.75 18.25 3.56 18.25 6.1 V13.9 C18.25 16.45 16.45 18.25 13.9 18.25 H6.1 C3.56 18.25 1.75 16.45 1.75 13.9 V6.1 C1.75 3.56 3.56 1.75 6.1 1.75 Z"))
 	reg("real-checkbox-checked", f("M6.1 1C3.14 1 1 3.14 1 6.1V13.9C1 16.86 3.14 19 6.1 19H13.9C16.86 19 19 16.86 19 13.9V6.1C19 3.14 16.86 1 13.9 1ZM13.99 7.4C13.99 7.63 13.92 7.85 13.76 8.03L9.17 13.46C8.97 13.7 8.7 13.82 8.41 13.82C8.07 13.82 7.78 13.66 7.58 13.38L6.03 11.17C5.91 10.99 5.85 10.79 5.85 10.58C5.85 10.23 6 9.95 6.28 9.77C6.45 9.66 6.64 9.6 6.85 9.6C7.18 9.6 7.47 9.76 7.66 10.02L8.49 11.19L12.23 6.75C12.43 6.52 12.69 6.4 12.98 6.4C13.23 6.4 13.44 6.47 13.63 6.62C13.87 6.81 13.99 7.1 13.99 7.4Z"))
+	// U+E148 icon_vertical_ellipsis (c-icon--vertical-ellipsis): the
+	// channel details roster rows' "More options" (ia-details-popover-members
+	// IaDetailsPopoverMemberItemActionsMenu: a c-button--icon outline
+	// Button, type "vertical-ellipsis", 16px)
+	reg("vertical-ellipsis", disc(10, 3.5, 1.75), disc(10, 10, 1.75), disc(10, 16.5, 1.75))
+	// The call card's icon without an app icon (PlatformCallSubtype's
+	// renderCallIcon, boot-shared 9CtN, a y8g2 font icon): phone-flat
+	// once the call ended, call-missed and call-declined for a DM call
+	// the viewer missed or declined. Each handset is its 1.5-unit outline's
+	// centreline (the outer and inner contours averaged point by point).
+	// U+E122 icon_phone_flat
+	reg("phone-flat", s("M4.05 13.25 C5.29 13.25 6.72 13.05 7.07 12.7 C7.57 12.21 7.4 10.79 7.71 10.05 C8.17 9.85 9.09 9.75 10 9.75 C10.93 9.75 11.86 9.86 12.29 10.05 C12.59 10.75 12.43 12.21 12.92 12.7 C13.25 13.04 14.71 13.25 15.96 13.25 C16.84 13.25 17.61 13.14 17.86 12.89 C18.13 12.62 18.25 12.06 18.25 11.42 C18.25 10.34 17.91 8.92 17.41 8.38 C16.1 6.96 13.04 6.25 10 6.25 C6.94 6.25 3.91 6.95 2.6 8.36 C2.07 8.93 1.75 10.31 1.75 11.41 C1.75 12.06 1.87 12.64 2.13 12.9 C2.38 13.14 3.17 13.25 4.05 13.25 Z"))
+	// U+E168 icon_call_missed: the handset and three dots
+	reg("call-missed-font", s("M13.74 17.25 C15.11 17.25 17.25 15.35 17.25 14.4 C17.25 13.59 14.46 11.04 13.62 11.04 C12.91 11.04 12.16 12.04 11.41 12.35 C10.41 11.92 7.95 9.46 7.63 8.57 C7.92 7.88 8.95 7.08 8.95 6.38 C8.95 5.58 6.45 2.75 5.59 2.75 C4.54 2.75 2.75 4.99 2.75 6.23 C2.75 9.9 9.98 17.25 13.74 17.25 Z"), disc(12.62, 4, 0.875), disc(15.87, 4, 0.875), disc(19.12, 4, 0.875))
+	// U+E167 icon_call_declined: the handset and a cross
+	reg("call-declined-font", s("M13.74 17.25 C15.11 17.25 17.25 15.35 17.25 14.4 C17.25 13.59 14.46 11.04 13.62 11.04 C12.91 11.04 12.16 12.04 11.41 12.35 C10.41 11.92 7.95 9.46 7.63 8.57 C7.92 7.88 8.95 7.08 8.95 6.38 C8.95 5.58 6.45 2.75 5.59 2.75 C4.54 2.75 2.75 4.99 2.75 6.23 C2.75 9.9 9.98 17.25 13.74 17.25 Z"), s("M13.25 6.75 L18.75 1.25 M13.25 1.25 L18.75 6.75"))
 	// U+E706 icon_form_checkbox_dash (c-menu_item__checkbox_dash): an
 	// indeterminate menu row's mark (the Move to… menu over several
 	// conversations).
@@ -85,4 +107,10 @@ func init() {
 	reg("cloud-offline", s("M2.75 16.05 A3 3 0 0 1 3.55 11 C2.8 8.6 4.56 6.16 6.88 6.26 A5 5 0 0 1 13.7 3.65"),
 		s("M16.6 7.2 C16.95 8.05 17.05 8.85 16.95 9.55 A4.5 4.5 0 0 1 13.75 16.75 H8.1"),
 		s("M17 3.5 L4 18"))
+	// Slack's cloud-offline-filled SvgIcon (the composer's NotificationBar:
+	// "Slack is trying to connect." while not recently online): its three
+	// solid parts (the cloud's two halves and the slash between them),
+	// each run 0.06 inside its edge (a plain fill read 11% heavy in dark
+	// at 1x) and simplified to 0.015.
+	reg("cloud-offline-filled", f("M14.26 17.42 L14.76 17.34 L15.25 17.22 L15.73 17.05 L16.19 16.83 L16.62 16.57 L17.03 16.27 L17.41 15.93 L17.75 15.55 L18.06 15.15 L18.32 14.71 L18.54 14.25 L18.71 13.78 L18.84 13.29 L18.91 12.78 L18.94 12.28 L18.92 11.77 L18.85 11.27 L18.73 10.77 L18.56 10.30 L18.34 9.83 L18.09 9.40 L17.79 8.99 L17.43 8.59 L17.44 8.17 L17.40 7.65 L17.32 7.15 L17.19 6.64 L7.59 17.44 L13.75 17.44 Z M17.43 2.96 L17.19 2.83 L16.96 2.81 L16.70 2.88 L16.52 3.01 L3.49 17.54 L3.35 17.77 L3.31 18.04 L3.38 18.30 L3.54 18.51 L3.77 18.65 L4.04 18.69 L4.30 18.62 L4.52 18.46 L17.51 3.96 L17.65 3.73 L17.69 3.46 L17.62 3.20 L17.55 3.09 Z M11.50 2.57 L10.99 2.61 L10.24 2.76 L9.52 3.01 L8.84 3.36 L8.22 3.79 L7.65 4.30 L7.16 4.89 L6.74 5.56 L6.22 5.60 L5.75 5.69 L5.31 5.83 L4.89 6.02 L4.50 6.26 L4.13 6.53 L3.80 6.85 L3.50 7.19 L3.23 7.56 L3.01 7.96 L2.83 8.38 L2.70 8.82 L2.61 9.27 L2.57 9.73 L2.59 10.19 L2.67 10.70 L2.14 11.14 L1.85 11.47 L1.60 11.83 L1.39 12.21 L1.23 12.63 L1.09 13.29 L1.06 13.75 L1.08 14.14 L1.14 14.53 L1.29 15.03 L1.44 15.39 L1.70 15.84 L1.94 16.15 L2.26 16.48 L14.15 3.10 L13.50 2.84 L12.88 2.68 L12.24 2.58 Z"))
 }

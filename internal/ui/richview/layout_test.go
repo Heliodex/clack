@@ -638,7 +638,7 @@ func TestToAlphaToRoman(t *testing.T) {
 			t.Errorf("toAlpha(%d) = %q, want %q", n, got, want)
 		}
 	}
-	roman := map[int]string{0: "", 1: "i", 3: "iii", 4: "iv", 5: "v", 9: "ix", 14: "xiv", 40: "xl", 90: "xc", 400: "cd", 1994: "mcmxciv", 3999: "mmmcmxcix"}
+	roman := map[int]string{0: "0", 1: "i", 3: "iii", 4: "iv", 5: "v", 9: "ix", 14: "xiv", 40: "xl", 90: "xc", 400: "cd", 1994: "mcmxciv", 3999: "mmmcmxcix", 4000: "4000", 2147483647: "2147483647"}
 	for n, want := range roman {
 		if got := toRoman(n); got != want {
 			t.Errorf("toRoman(%d) = %q, want %q", n, got, want)
@@ -1565,8 +1565,8 @@ func TestPlainTextSelection(t *testing.T) {
 	if v.SelectedText() != "second line" {
 		t.Errorf("selectLine(14) = %q", v.SelectedText())
 	}
-	v.selectLine(3)
-	if v.SelectedText() != "hello world" {
+	v.selectLine(3) // the paragraph and its break, as Blink's triple click (kParagraph)
+	if v.SelectedText() != "hello world\n" {
 		t.Errorf("selectLine(3) = %q", v.SelectedText())
 	}
 
@@ -2021,11 +2021,13 @@ func TestColorSwatch(t *testing.T) {
 	if sw == nil {
 		t.Fatalf("no swatch box: %+v", v.d.boxes)
 	}
-	if sw.r.Dx() != 12 || sw.r.Dy() != 12 {
-		t.Errorf("swatch %v, want 12x12", sw.r)
+	// Slack's Color element (boot-shared d7OQ): the value, then
+	// div.c-mrkdwn__hex, 13px plus its 1px border, 2px after it
+	if sw.r.Dx() != 15 || sw.r.Dy() != 15 {
+		t.Errorf("swatch %v, want 15x15", sw.r)
 	}
-	if f := findFrag(t, &v.d, "#1D9BD1"); f.x < float32(sw.r.Max.X) {
-		t.Errorf("hex text at %.1f overlaps swatch %v", f.x, sw.r)
+	if f := findFrag(t, &v.d, "#1D9BD1"); f.x+f.w > float32(sw.r.Min.X) {
+		t.Errorf("hex text ends at %.1f, past the swatch %v after it", f.x+f.w, sw.r)
 	}
 }
 

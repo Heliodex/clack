@@ -53,7 +53,13 @@ type gifPanel struct {
 	err     string
 	items   []Gif
 	cursor  string // next page cursor ("" = no more)
-	tiles   []widget.Clickable
+	// tiles are the GIFs' buttons, kept by GIF (gifKey) as Slack keys its
+	// GifListItem elements: a tile pressed while the next page lands (the
+	// grid growing) or a new search's results land (the items under the
+	// tiles changing) keeps its press and its GIF. By index, the slice's
+	// growth moved every Clickable (Gio routes a press by its handler's
+	// address) and a new search put another GIF under a held one.
+	tiles map[string]*widget.Clickable
 
 	list  layout.List
 	rowFn layout.ListElement
@@ -86,6 +92,9 @@ func (p *EmojiPicker) setGifMode(on bool) {
 		return
 	}
 	p.gifMode = on
+	if !on { // the GIF tab hid: its animations' memory comes back
+		gifAnimReleaseAll()
+	}
 	p.hover, p.press, p.pressed, p.ptrIn = epNoCell, epNoCell, false, false
 	p.toneUI.open = false
 	p.prevID = -1
@@ -98,6 +107,17 @@ func (p *EmojiPicker) setGifMode(on bool) {
 			g.rowFn = p.gifRow
 		}
 	}
+}
+
+// Dismiss closes the picker (base.Dismiss), letting its GIF tab's
+// animations go once it has shown them: their frames' decode memory comes
+// back at once. (A picker its owner stops drawing without closing it has
+// them let go by gifAnimSweep.)
+func (p *EmojiPicker) Dismiss() {
+	if p.gif.rowFn != nil { // its GIF tab was opened
+		gifAnimReleaseAll()
+	}
+	p.base.Dismiss()
 }
 
 // gifFetch loads the first page for q, or (more) the next page of the
@@ -148,10 +168,46 @@ func (p *EmojiPicker) gifFetch(q string, more bool) {
 		if len(r.gifs) == 0 {
 			g.cursor = ""
 		}
-		for len(g.tiles) < len(g.items) {
-			g.tiles = append(g.tiles, widget.Clickable{})
-		}
+		g.pruneTiles()
 	})
+}
+
+// gifKey is what a tile is kept by: the GIF's id, else its URL.
+func gifKey(gf Gif) string {
+	if gf.ID != "" {
+		return gf.ID
+	}
+	return gf.URL
+}
+
+// tile is gf's button, made on its first draw.
+func (g *gifPanel) tile(gf Gif) *widget.Clickable {
+	k := gifKey(gf)
+	b := g.tiles[k]
+	if b == nil {
+		if g.tiles == nil {
+			g.tiles = map[string]*widget.Clickable{}
+		}
+		b = new(widget.Clickable)
+		g.tiles[k] = b
+	}
+	return b
+}
+
+// pruneTiles lets the buttons of GIFs no longer in the results go.
+func (g *gifPanel) pruneTiles() {
+	if len(g.tiles) <= len(g.items) {
+		return
+	}
+	keep := make(map[string]bool, len(g.items))
+	for _, gf := range g.items {
+		keep[gifKey(gf)] = true
+	}
+	for k := range g.tiles {
+		if !keep[k] {
+			delete(g.tiles, k)
+		}
+	}
 }
 
 // pickGif hands g to the GIF handler, sends it to the target, or explains.
@@ -309,11 +365,8 @@ func (p *EmojiPicker) gifRow(gtx layout.Context, i int) layout.Dimensions {
 			}
 			continue
 		}
-		if k >= len(g.tiles) {
-			continue
-		}
 		gf := g.items[k]
-		if g.tiles[k].Clicked(gtx) {
+		if g.tile(gf).Clicked(gtx) {
 			p.pickGif(gf)
 			if p.done {
 				return layout.Dimensions{Size: image.Pt(w, h)}
@@ -334,7 +387,8 @@ func (p *EmojiPicker) gifTile(gtx layout.Context, cl *Colors, gf Gif, k, t, rad 
 	g := &p.gif
 	th := p.h.Theme()
 	im := p.h.Images()
-	return clickBox(gtx, &g.tiles[k], nil, func(gtx layout.Context) layout.Dimensions {
+	btn := g.tile(gf)
+	return clickBox(gtx, btn, nil, func(gtx layout.Context) layout.Dimensions {
 		sz := image.Pt(t, t)
 		// Accessibility > "Allow animations" (a11y_animations) off: stills.
 		var an *gifAnim
@@ -351,7 +405,7 @@ func (p *EmojiPicker) gifTile(gtx layout.Context, cl *Colors, gf Gif, k, t, rad 
 		} else {
 			th.Placeholder(gtx, sz, rad)
 		}
-		if g.tiles[k].Hovered() {
+		if btn.Hovered() {
 			rrect(gtx, image.Rectangle{Max: sz}, rad, rgba(0x000000, .12))
 		}
 		stroke(gtx, image.Rectangle{Max: sz}, rad, border1(gtx), cl.Ring)

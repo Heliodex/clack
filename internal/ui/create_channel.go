@@ -11,6 +11,7 @@ import (
 
 	"github.com/some-du6e/clack/internal/ui/ctxclick"
 	"github.com/some-du6e/clack/internal/ui/huddleui"
+	"github.com/some-du6e/clack/internal/ui/openurl"
 	"github.com/some-du6e/clack/internal/ui/popups"
 	"github.com/some-du6e/clack/internal/ui/shortcut"
 )
@@ -53,12 +54,13 @@ func (a *App) openCreateChannel(section string) {
 	a.ShowOverlay(mkCreateChannel(a, section))
 }
 
-func (a *App) menuAt(anchor image.Rectangle, side int, width float32, items []MenuItem) {
+func (a *App) menuAt(anchor image.Rectangle, side int, width float32, items []MenuItem) Overlay {
 	if mkMenuAt != nil {
-		a.ShowOverlay(mkMenuAt(a, anchor, side, width, items))
-		return
+		o := mkMenuAt(a, anchor, side, width, items)
+		a.ShowOverlay(o)
+		return o
 	}
-	a.menu(anchor.Min, items)
+	return a.menu(anchor.Min, items)
 }
 
 // openAddChannelsMenu is the Channels footer's "Add channels" menu.
@@ -81,8 +83,10 @@ func (a *App) openAddChannelsMenu(anchor image.Point) {
 //   - Canvas (add-channel-canvas; "Create and share content", Ctrl+Shift+N
 //     on paid teams): createAndOpenDocInNewWindow, a standalone canvas.
 //   - List (lists; "Track and manage projects"; lists enabled).
-//   - Workflow (play; "Automate everyday tasks"; who may build workflows):
-//     Workflow Builder.
+//   - Workflow (play; "Automate everyday tasks"; canUserCreateWorkflows,
+//     of which Clack reads the workflow_builder_enabled team pref):
+//     onWorkflowClick, the Workflow Builder's create_empty route
+//     (openWorkflowBuilder, boot-shared ThpL, build 1359418bd580).
 //   - Notes (microphone; "Record meeting notes"; meeting_assistant, off for
 //     the test account).
 //   - a separator, then "Invite people" (user-add) for users who may
@@ -90,9 +94,8 @@ func (a *App) openAddChannelsMenu(anchor image.Point) {
 //     source sidebar_create_new_invite_people); "Workspace" only on SPF
 //     non-work workspaces.
 //
-// Clack draws every row the account has. Workflow Builder and meeting
-// notes have no Clack screens yet, so those rows say so in a toast, like
-// Clack's other unavailable features, instead of doing nothing.
+// Clack draws every row the account has. Meeting notes have no Clack
+// screen yet, so that row says so in a toast instead of doing nothing.
 func (a *App) openCreateMenu(anchor image.Rectangle) {
 	unavailable := func(what string) func() {
 		return func() { a.Toast(what + " in " + AppName + " yet") }
@@ -104,7 +107,9 @@ func (a *App) openCreateMenu(anchor image.Rectangle) {
 		{Key: "start_huddle", Label: "Huddle", Icon: "headphones", Subtitle: "Start a video or audio chat", Do: a.openHuddleStart},
 		{Key: "create_canvas", Label: "Canvas", Icon: "add-channel-canvas", Subtitle: "Create and share content", Hint: shortcut.Format("Mod+Shift+N"), Do: a.CreateCanvas},
 		{Key: "create_list", Label: "List", Icon: "lists", Subtitle: "Track and manage projects", Do: a.CreateList},
-		{Key: "create-workflow", Label: "Workflow", Icon: "play", Subtitle: "Automate everyday tasks", Do: unavailable("Workflow Builder isn’t available")},
+	}
+	if a.workflowBuilderEnabled() {
+		items = append(items, MenuItem{Key: "create-workflow", Label: "Workflow", Icon: "play", Subtitle: "Automate everyday tasks", Do: a.openWorkflowBuilder})
 	}
 	if a.exp("meeting_assistant") == "on" {
 		items = append(items, MenuItem{Key: "create-notes", Label: "Notes", Icon: "microphone", Subtitle: "Record meeting notes",
@@ -114,7 +119,20 @@ func (a *App) openCreateMenu(anchor image.Rectangle) {
 		items = append(items, MenuItem{Divider: true},
 			MenuItem{Key: "invite", Label: "Invite people", Icon: "user-add", Do: func() { popups.OpenInviteModal(a, popups.InviteFromCreateMenu) }})
 	}
-	a.menuAt(anchor, 2, 360, items)
+	a.createStrip().menu = a.menuAt(anchor, 2, 360, items) // the + button's --active while it shows
+}
+
+// openWorkflowBuilder is the Create menu's Workflow: ThpL opens
+// /workflow-builder/{team}/workflow/create-empty on app.slack.com in a
+// window of its own (the Workflows tab's Build from scratch opens the same
+// page, workflows_tab.go).
+func (a *App) openWorkflowBuilder() {
+	c := a.Core()
+	if c == nil || c.Interactive().TeamID() == "" {
+		return
+	}
+	u := "https://app.slack.com/workflow-builder/" + c.Interactive().TeamID() + "/workflow/create-empty"
+	go func() { _ = openurl.Open(u) }()
 }
 
 // openHuddleStart is the Create menu's Huddle: "Start a Huddle" picks the

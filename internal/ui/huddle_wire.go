@@ -11,6 +11,10 @@ import (
 	"github.com/some-du6e/clack/internal/ui/popups"
 )
 
+// The huddle windows run the inspect tool (inspect_wire.go's InspectOn
+// and the rest).
+var _ huddleui.InspectHost = (*App)(nil)
+
 // huddles is the native huddle controller (internal/ui/huddleui): the
 // sidebar huddle bar, the header's huddle button and the huddle window.
 func (a *App) huddles() *huddleui.Controller {
@@ -113,7 +117,7 @@ func (a *App) OpenHuddleStartWith(entry, channel, member string) {
 	cands := a.sidebarConvs()
 	pick := channel
 	if member != "" {
-		for _, c := range a.Core().Snapshot().Convs {
+		for _, c := range a.Core().RecentSnapshot().Convs { // UI goroutine: never waits for boot
 			if c.Kind == "im" && c.User == member {
 				pick = c.ID
 				break

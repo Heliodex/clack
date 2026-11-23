@@ -80,8 +80,11 @@ type Span struct {
 	Parts *SpanParts
 
 	// ChannelTab (tabslug.go): the channel's icon before its name ("" for
-	// "#name") and the channel's name.
+	// "#name") and the channel's name. MessageMention (msgmention.go):
+	// Chan is the linked message's conversation id (ID its ts), ThreadTS
+	// its thread_ts; Slack's MessageMention jumps with the three.
 	ChIcon, Chan string
+	ThreadTS     string
 
 	// Hidden (User): a member the viewer hid, in a rollup or a system
 	// message's text (RollupName, boot-shared quVX): Text is "Name hidden"
@@ -95,7 +98,54 @@ type Span struct {
 	// it as a RichTextSlug (Pc7Q) chip with the "link" icon around the
 	// link, data-qa rich_text_truncated_link_element.
 	Truncated bool
+
+	// Br (Break) is how a rich_text newline draws (BrKind). Every "\n"
+	// stays one Break whatever its Br, so plain text, copy and the
+	// newline budgets count the newlines the message has.
+	Br BrKind
+
+	// Pending (User, Channel, Usergroup in a canvas): the store can't
+	// name the mention yet (its lookup is out). Slack's canvas draws such
+	// a control as Quip's slack-control-missing-content skeleton, never
+	// its id (core NameCanvasMention, richview canvasMissing).
+	Pending bool
 }
+
+// BrKind says how a Break draws. A rich_text text element's newlines go
+// through Slack's BaseText (boot-shared kWQh, insertTextBreakPlaceholders):
+//
+//   - a run of k ≥ 2 newlines, with only spaces, tabs and no-break spaces
+//     between them (/(?:\n[ \t ]*)+\n/g), becomes k-1 <span
+//     class="c-mrkdwn__br">: .c-mrkdwn__br{height:8px;display:block}
+//     (22px as a direct child of .c-mrkdwn__quote[data-stringify-border=
+//     "1"]); the spaces between them are dropped;
+//   - every other newline is a <br>;
+//   - the first element of a section (isFirstElementInSection: index 0
+//     of a rich_text_section, a rich_text_quote or a list item) that
+//     starts with "\n" gets one more "\n" first, so "\nx" is an 8px
+//     block, not a <br>;
+//   - the first element of the block's first section
+//     (isFirstElementInFirstSection) is trimStart-ed (lodash h5n5,
+//     /^\s+/) before that;
+//   - rich_text_preformatted text (rawLineBreaks) is left as it is.
+//
+// A run's k newlines are one BrNone and k-1 BrPara; a leading run that
+// got the extra "\n" is k BrPara; a trimmed leading newline is BrNone.
+type BrKind uint8
+
+const (
+	// BrPlain is a line break that isn't rich_text's (mrkdwn, plain_text,
+	// preformatted): an empty line between two is an 8px line.
+	BrPlain BrKind = iota
+	// BrLine is rich_text's <br>: it ends the line, and an empty line
+	// it ends is a full line box.
+	BrLine
+	// BrPara is a c-mrkdwn__br: it ends the line if anything is on it,
+	// then adds its 8px block.
+	BrPara
+	// BrNone draws nothing (a newline Slack's placeholders swallow).
+	BrNone
+)
 
 // BlockKind says what a block is.
 type BlockKind uint8
@@ -128,14 +178,45 @@ const (
 	// viewer's uploads finish (PendingFilesMetaTextWrapper,
 	// c-message_kit__file__meta): Spans holds "Uploading…" and the like.
 	FileStatus
+	// CallBlock is a call block (call.go): Call holds what Slack's
+	// PlatformCallSubtype card shows.
+	CallBlock
+	// AlertBlock is an alert block (kitcards.go): Slack's c-alert box,
+	// Tone its level, Children the text.
+	AlertBlock
+	// CalloutBlock is a callout block: a tinted box (Tone the colour)
+	// around its child blocks (Children).
+	CalloutBlock
+	// LoadingBlock is a loading block: the jumbo spinner.
+	LoadingBlock
+	// RichHeader is a rich_text_header (Slack's RichTextHeader, h1–h3 by
+	// Level, p-rich_text_header--level_N); First marks the rich_text
+	// block's first element, which loses its top margin.
+	RichHeader
+	// RichDivider is a rich_text_divider: .p-rich_text_divider's rule.
+	RichDivider
+	// ContainerBlock is a container block (kitcards.go): Container holds
+	// its header, Children its child blocks.
+	ContainerBlock
+	// ShortcutBlock is a share_shortcut block (shortcut.go): Shortcut
+	// holds the workflow card.
+	ShortcutBlock
+	// CardBlock is a card block (card.go): Card holds its parts.
+	CardBlock
 )
 
 // Block is one vertical unit of a document.
 type Block struct {
-	Kind       BlockKind
-	Spans      []Span   // inline content (Paragraph, Preformatted, Quote, Header, Context, Section text, Tombstone)
-	Items      [][]Span // List items
-	Ordered    bool     // List
+	Kind    BlockKind
+	Spans   []Span   // inline content (Paragraph, Preformatted, Quote, Header, Context, Section text, Tombstone)
+	Items   [][]Span // List items
+	Ordered bool     // List
+	// Check: a check list (N8wa BS: checklist true or style "check");
+	// Checked is each item's state (its checked, else the list's). Slack
+	// draws its checkboxes only where the rich_text renderable allows them
+	// (richview Options.CheckLists), bullets elsewhere.
+	Check      bool     // List
+	Checked    []bool   // List
 	Indent     int      // List
 	Offset     int      // List
 	Border     bool     // List (also Quote/Preformatted from rich_text border)
@@ -162,6 +243,36 @@ type Block struct {
 	// Level is a header block's level (1–4, 0 for none): Slack's Header
 	// (/WQN) classes its text p-header_block--level_1/2/3 (4 draws as 3).
 	Level int
+	// Call is a CallBlock's call (call.go).
+	Call *CallCard
+	// Tone is an AlertBlock's level (default, info, success, warning,
+	// error) or a CalloutBlock's background colour (kitcards.go).
+	Tone string
+	// First: a RichHeader that is its rich_text block's first element.
+	First bool
+	// Container is a ContainerBlock's header and options (kitcards.go).
+	Container *Container
+	// Shortcut is a ShortcutBlock's workflow card (shortcut.go).
+	Shortcut *ShortcutCard
+	// Card is a CardBlock's parts (card.go).
+	Card *Card
+}
+
+// Container is a container block's header and options (Slack's
+// ContainerBlock, boot-shared yWQF).
+type Container struct {
+	Title, Subtitle []Span // one line each
+	Icon            string // 36px image ("" none)
+	// Width is narrow, standard, wide or full (the max-width class).
+	Width string
+	// Collapsible: the header toggles the content, which starts hidden
+	// with DefaultCollapsed. HeaderDivider draws a rule under a fixed
+	// header.
+	Collapsible, DefaultCollapsed, HeaderDivider bool
+	// Key names the container within its message across rebuilds: its
+	// block_id, else "#n", its place among the message's containers
+	// (richview keeps the collapse state by it).
+	Key string
 }
 
 // Image is a remote image reference.
@@ -183,6 +294,13 @@ type Button struct {
 	Value    string
 	BlockID  string
 	Kind     string // addition: "button", "overflow", "select", "datepicker", "timepicker", "datetimepicker", "input", "checkboxes", "radio_buttons"
+	// Invisible: an Actions block's element whose visible_to_user_ids
+	// leave the viewer out (blocks.go actionHidden). It isn't drawn, but
+	// it keeps its place: Slack's Actions block counts it for "+ N more"
+	// and for the five shown before it. A hidden icon_button keeps its
+	// empty action box (X2Vm hides only itself); a button or checkboxes
+	// leaves none (maybeRenderActionsElement).
+	Invisible bool
 }
 
 // Attachment is a legacy attachment, link unfurl or shared/forwarded message.
@@ -214,6 +332,9 @@ type Attachment struct {
 	AuthorSubname  string // e.g. "@handle" next to the author name in unfurls
 	ShareChannelID string // shared message's channel id
 	VideoURL       string // video block: the playable/embeddable URL
+	// AppUnfurlURL is app_unfurl_url: an app's unfurl, the link
+	// getExternalSourceUrl falls back to after title_link and original_url.
+	AppUnfurlURL string
 
 	// MsgCard is a message permalink unfurl (is_msg_unfurl) drawn as
 	// Slack's MessageAttachmentSlackMessageCard: 36px avatar, author,
@@ -237,8 +358,12 @@ type Attachment struct {
 	// Hidden is attachment.hidden.
 	// Legacy: made from a message's attachments array (not a video or
 	// call block, a huddle card or a file).
-	Legacy      bool
-	ID          string
+	Legacy bool
+	ID     string
+	// Index is the attachment's place in the message's attachments array
+	// (the search answer's order: core.AttachmentKey keys an attachment
+	// without an id by it).
+	Index       int
 	OriginalURL string
 	ServiceURL  string
 	VideoHTML   bool
@@ -300,7 +425,7 @@ type File struct {
 	Size                                    int64
 	URL, Download, Permalink                string
 	Thumb                                   *Image // best thumb for images/videos/pdfs
-	IsImage, IsVideo, IsAudio, IsSnippet    bool
+	IsImage, IsVideo, IsAudio, IsSnippet    bool   // IsVideo: Slack's fileIsPlayableVideo
 	Preview                                 string
 	Lines                                   int
 	DurationMS                              int
@@ -319,6 +444,27 @@ type File struct {
 	// FileActions' Expand need.
 	Still     *Image
 	Deanimate bool
+	// A playable video's (IsVideo; URL is its progressive source, mp4 ||
+	// url_private, and Thumb its poster, thumb_video_ts ?? thumb_video):
+	// where the viewer stopped watching it (media_progress.offset_ms) and
+	// whether they watched it to the end (media_watched), which make the
+	// player start there or at 0 (xnwb).
+	MediaOffsetMS int
+	MediaWatched  bool
+	// A playable audio file's (IsAudio, Slack's fileIsPlayableAudio):
+	// MediaURL is its aac rendition, which FileAudio plays first
+	// (getMediaURL's aac || url_private; a build that can't decode AAC
+	// plays URL, the upload, as do Download, Open in new tab and the
+	// plugins' url_private). Transcript is its transcription's status ("",
+	// none, processing, complete, failed, fatal), TranscriptRegion
+	// is_transcription_region_supported and VTT its captions' URL
+	// (MediaTranscriptPopoverButton).
+	MediaURL         string
+	Transcript       string
+	TranscriptRegion bool
+	VTT              string
+	// Salesforce is is_salesforce_file: its progress is never sent (9NKl)
+	Salesforce bool
 	// Pending: the viewer's own upload, not finished yet (drawn at .5
 	// with a spinner, c-pending_files__thumbnail--pending); Percent is its
 	// percentComplete.
@@ -355,6 +501,50 @@ type File struct {
 	Expanded, Expanding bool
 	Content             *CodeMirror
 	ContentTruncated    bool
+
+	// Email is an email file's message (mode "email"; email.go), nil for
+	// any other file.
+	Email *Email
+}
+
+// Email is an email file as Slack's FileEmailV2 and EmailFileDetails
+// draw it (new_email_rendering): who sent it and to whom, the subject (the
+// file's title), the body (HTML is its preview's HTML, PlainText the
+// plain text whose length sizes the inline body), the files it carried,
+// the sender's DMARC check, and the email app that brought it in.
+type Email struct {
+	From, To, Cc []EmailAddress
+	Subject      string
+	HTML         string
+	PlainText    string
+	// Preview is preview_plain_text: the legacy FileEmail's (new_email_
+	// rendering off) collapsed view shows it.
+	Preview     string
+	Attachments []EmailAttachment
+	// Removed is how many of the email's attachments Slack dropped
+	// (original_attachment_count less the attachments and the inline
+	// ones): the legacy FileEmail says so.
+	Removed int
+	// Unverified: email_security.has_valid_dmarc is false (FileEmailV2's
+	// "Heads up" under From). An absent check counts as valid.
+	Unverified bool
+	// Timestamp is the email's own time (the file's timestamp).
+	Timestamp int64
+	// AppID and AppName are the app that posted it (renderEmailMetaText's
+	// "Email from {appName}").
+	AppID, AppName string
+}
+
+// EmailAddress is one of an email's senders or recipients: UserID is the
+// member who it is (slack_user_id), when Slack knows.
+type EmailAddress struct {
+	Name, Address, UserID string
+}
+
+// EmailAttachment is a file an email carried (FileID: its Slack file).
+type EmailAttachment struct {
+	Name, Mime, URL, FileID string
+	Size                    int64
 }
 
 // Doc is a whole message body.

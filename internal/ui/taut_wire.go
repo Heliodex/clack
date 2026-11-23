@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/some-du6e/clack/internal/jsrt"
@@ -48,14 +49,25 @@ var (
 	documentTap func(body []byte)
 )
 
+// tautOwner is the bridge of the runtime the UI attached last: Attached's
+// post binds it to slackc and detachTaut clears it. Only the owner's
+// patched names reach slackc, so the patches a detached runtime publishes
+// as its plugins stop (sign-out, an account switch) can't leave the next
+// session's components on the patched path, its message menus holding for
+// a tree that never comes. It isn't read off slackc's bridge: whoever
+// wraps that bridge (the plugin bench, the perf plugins job and the
+// plugin-gap tests count calls through countingBridge once the runtime is
+// up) still talks to this runtime, and its plugins must still patch.
+var tautOwner atomic.Pointer[taut.Bridge]
+
 // startTaut connects Taut plugins (internal/taut) to the native UI
 // through slackc. taut.New reads the plugin config only; no JS engine
 // starts unless a plugin is enabled.
 func (b *backend) startTaut(a *App) {
-	if b.core == nil || b.taut != nil {
+	if b.core == nil || b.taut != nil || a.inert {
 		return
 	}
-	t, s := b.buildTaut(a, a.th.Dark, b.teamID, a.router.Current().Channel())
+	t, s := b.buildTaut(a, a.th.Dark, b.teamID, a.router.Current().Channel(), false)
 	b.installTaut(a, t, s)
 }
 
@@ -64,8 +76,8 @@ func (b *backend) startTaut(a *App) {
 // convert the Slick theme's CSS, so they run on a goroutine and only the
 // install is posted to the UI goroutine.
 func (b *backend) startTautAsync(a *App) {
-	if b.core == nil || b.taut != nil || b.tautStarting {
-		return
+	if b.core == nil || b.taut != nil || b.tautStarting || a.inert {
+		return // inert: the preview renderer never runs plugins (intro_preview_child.go)
 	}
 	b.tautStarting = true
 	team := b.teamID
@@ -73,9 +85,10 @@ func (b *backend) startTautAsync(a *App) {
 		team = b.core.C.Creds.Team
 	}
 	dark, ch := a.th.Dark, a.router.Current().Channel()
+	deferJS := b.tautDeferJS // the plugins start later (startDeferredTaut)
 	go func() {
 		t0 := time.Now()
-		t, s := b.buildTaut(a, dark, team, ch)
+		t, s := b.buildTaut(a, dark, team, ch, deferJS)
 		go func() { // the plugins enabled at start started (reveal.go's slots)
 			if t != nil {
 				<-t.StartDone()
@@ -97,19 +110,39 @@ func (b *backend) startTautAsync(a *App) {
 				return
 			}
 			b.installTaut(a, t, s)
+			if deferJS && !b.tautDeferJS {
+				startRuntimes(t, s) // the launch's first real frame came while they were being made
+			}
 		})
 	}()
 }
 
+// inertPluginDir is name inside the preview renderer's own folder ("" for
+// a normal App, whose plugin folders are Taut's and Slick's defaults).
+// The renderer never starts plugins (startTaut); this keeps it off the
+// user's folders even if something did.
+func (a *App) inertPluginDir(name string) string {
+	if !a.inert || a.opts.ConfigDir == "" {
+		return ""
+	}
+	return filepath.Join(a.opts.ConfigDir, name)
+}
+
 // buildTaut makes the plugin runtimes (any goroutine). nil on error.
-func (b *backend) buildTaut(a *App, dark bool, team, channel string) (*taut.Taut, *slick.Slick) {
+func (b *backend) buildTaut(a *App, dark bool, team, channel string, deferJS bool) (*taut.Taut, *slick.Slick) {
 	t0 := time.Now()
 	// The runtime's patched names, kept so the reset Attached posts can't
 	// lose them: a plugin may register its patches (SetPatched) before the
 	// UI goroutine runs that reset, and JS only resends the set on change.
 	var patchMu sync.Mutex
 	var patchedNow []string
+	// the bridge the UI goroutine bound for this runtime (Attached): its
+	// patched names reach slackc only while it's tautOwner
+	var bound atomic.Pointer[taut.Bridge]
 	t, err := taut.New(taut.Options{
+		DeferStart:     deferJS,
+		Dir:            a.inertPluginDir("taut"), // "": Taut's own (clackHome)
+		CredsPath:      a.inertPluginDir("creds.json"),
 		App:            b.core,
 		OpenURL:        openURL,
 		ClipboardWrite: func(s string) error { a.Post(func() { a.copyText(s) }); return nil },
@@ -126,6 +159,8 @@ func (b *backend) buildTaut(a *App, dark bool, team, channel string) (*taut.Taut
 				a.Post(func() {
 					slackc.Reset()
 					slackc.SetBridge(br)
+					bound.Store(br)
+					tautOwner.Store(br)
 					patchMu.Lock()
 					slackc.SetPatched(patchedNow)
 					patchMu.Unlock()
@@ -145,7 +180,9 @@ func (b *backend) buildTaut(a *App, dark bool, team, channel string) (*taut.Taut
 			SetPatched: func(names []string) {
 				patchMu.Lock()
 				patchedNow = names
-				slackc.SetPatched(names)
+				if br := bound.Load(); br != nil && tautOwner.Load() == br {
+					slackc.SetPatched(names)
+				}
 				patchMu.Unlock()
 			},
 			ThreadPane: messages.ThreadPane, // api.threads.usePane (safe off the UI goroutine)
@@ -153,6 +190,9 @@ func (b *backend) buildTaut(a *App, dark bool, team, channel string) (*taut.Taut
 			SetStyle: func(key, src string) {
 				if f := styleTap; f != nil {
 					f(key, src)
+				}
+				if key != "user" && !strings.HasPrefix(key, "slick:") {
+					b.pluginStyled.Store(true) // a plugin's own CSS, not the user's or Slick's theme (prefs.PluginStyled)
 				}
 				slackc.SetStyle(key, src)
 			},
@@ -186,6 +226,9 @@ func (b *backend) buildTaut(a *App, dark bool, team, channel string) (*taut.Taut
 				if f := documentTap; f != nil {
 					f(body)
 				}
+				if len(css) > 0 {
+					b.pluginStyled.Store(true) // a page's style tags (prefs.PluginStyled)
+				}
 				if err := slackc.SetDocument(body, css); err != nil {
 					log.Printf("slackc: document: %v", err)
 				}
@@ -206,7 +249,7 @@ func (b *backend) buildTaut(a *App, dark bool, team, channel string) (*taut.Taut
 	if envFlag("TIMING") {
 		log.Printf("timing: taut.New %v (js runtime started: %v)", time.Since(t0).Round(10*time.Microsecond), t.Started())
 	}
-	return t, b.buildSlick(a, t, dark, team, channel)
+	return t, b.buildSlick(a, t, dark, team, channel, deferJS)
 }
 
 // installTaut hooks the runtimes into the UI (UI goroutine).
@@ -260,6 +303,7 @@ func (b *backend) detachTaut() {
 		composer.SetTaut(nil)
 		richview.SetMemberLabel(nil)
 		b.taut = nil
+		tautOwner.Store(nil)
 		slackc.SetBridge(nil)
 		slackc.Reset()
 	}
@@ -273,6 +317,7 @@ func closeTaut(s *slick.Slick, t *taut.Taut) {
 	}
 	if t != nil {
 		_ = t.Close()
+		composer.ForgetTaut(t) // composer's mark that it extended t
 	}
 }
 
@@ -287,6 +332,9 @@ func (a *App) switchAccount(c slack.Creds) {
 		a.showLogin()
 		return
 	}
+	a.closeInspectSession() // its records are the account's views
+	a.closeVideos()         // and its videos (video.go)
+	composer.CloseClips()   // a recording in progress goes, never into the next account
 	if a.data != nil {
 		_ = a.data.stop()
 		a.data = nil
@@ -325,6 +373,9 @@ func (a *App) SignedOut() bool {
 
 // showLogin returns to the sign-in screen without deleting credentials.
 func (a *App) showLogin() {
+	a.closeInspectSession() // inspect_wire.go
+	a.closeVideos()         // nothing plays on behind the sign-in screen (video.go)
+	composer.CloseClips()   // nor records: a clip recording goes, never into the next session
 	if a.data != nil {
 		_ = a.data.stop()
 		a.data = nil
@@ -423,16 +474,17 @@ func argStr(args map[string]any, k string) string {
 // slick.New reads settings.json, themes and cached plugin metadata only;
 // with no plugin on, no JS starts (themes and custom CSS are converted in
 // Go).
-func (b *backend) buildSlick(a *App, t *taut.Taut, dark bool, team, channel string) *slick.Slick {
+func (b *backend) buildSlick(a *App, t *taut.Taut, dark bool, team, channel string, deferJS bool) *slick.Slick {
 	t0 := time.Now()
-	s, err := slick.New(slick.Options{Taut: t, OpenURL: openURL, OpenFile: a.openFilePath,
-		SlackCSS: slackc.NativeTransitionsCSS, SlackCSSHref: slackc.SlackCSSHref, SpellChecker: a.setSessionSpellChecker})
+	s, err := slick.New(slick.Options{Dir: a.inertPluginDir("slick"), Taut: t, OpenURL: openURL, OpenFile: a.openFilePath,
+		SlackCSS: slackc.NativeTransitionsCSS, SlackCSSHref: slackc.SlackCSSHref, SpellChecker: a.setSessionSpellChecker,
+		DeferStart: deferJS, Dark: dark})
 	if err != nil {
 		log.Printf("slick: %v", err)
 		return nil
 	}
 	s.SetDark(dark)
-	s.SetRoute(team, channel)
+	s.SetRoute(team, channel, "")
 	if envFlag("TIMING") {
 		log.Printf("timing: slick.New %v (js runtime started: %v)", time.Since(t0).Round(10*time.Microsecond), t.Started())
 	}
@@ -483,7 +535,7 @@ func (a *App) Slick() *slick.Slick {
 // getCurrentChannelId, workspace restrictions).
 func (a *App) slickRoute(r Route) {
 	if s := a.Slick(); s != nil {
-		s.SetRoute(a.data.teamID, r.Channel())
+		s.SetRoute(a.data.teamID, r.Channel(), r.Thread())
 	}
 }
 
@@ -542,6 +594,40 @@ func deepLinkRoute(uri string) (route, user string, ok bool) {
 		return "home", "", true
 	}
 	return "", "", false
+}
+
+// deepLinkMessage is handleParsedDeepLink's "channel" command with a
+// message or a thread (slack://channel?team=T&id=C&message=ts
+// [&thread_ts=ts]; boot-render VxbD, build 2c0d02ca130f): jumpToMessage
+// ({channelId, ts: message, threadTs: thread_ts}), which finds the
+// thread when only the message is named; a thread alone is toThread
+// with highlightRoot; message "latest" with a thread is its latest reply
+// (cdTA Mz, jumpLatest). Both in formatMessageTimestamp's forms. ok is
+// false for any other link, and for an id or a timestamp that doesn't
+// look like Slack's (the channel alone goes to deepLinkRoute).
+func deepLinkMessage(uri string) (ch, ts, thread string, latest, ok bool) {
+	u, err := url.Parse(uri)
+	if err != nil || u.Scheme != "slack" || u.Host != "channel" {
+		return "", "", "", false, false
+	}
+	q := u.Query()
+	ch = q.Get("id")
+	if !slackIDRE.MatchString(ch) || !strings.ContainsAny(ch[:1], "CDG") {
+		return "", "", "", false, false
+	}
+	m := q.Get("message")
+	if m != "" && m != "latest" {
+		if ts = slackTimestamp(m); ts == "" {
+			return "", "", "", false, false
+		}
+	}
+	if t := q.Get("thread_ts"); t != "" {
+		if thread = slackTimestamp(t); thread == "" {
+			return "", "", "", false, false
+		}
+	}
+	latest = m == "latest" && thread != ""
+	return ch, ts, thread, latest, ts != "" || thread != ""
 }
 
 var (

@@ -15,7 +15,9 @@ cp go.sum "$stock/go.sum"
 go get -modfile="$stock/go.mod" gioui.org@v0.10.3
 for p in "${pkgs[@]}"; do
 	# stockgio: theme's patch-12 calls (letter spacing) become no-ops
-	if "$@" go test -modfile="$stock/go.mod" -tags stockgio -count=1 -v -run "$tests" "$p" > "$stock/out" 2>&1; then
+	# XF_OFF: this run must really fail, so a proof run's expect_fail
+	# wrapper (tools/expectfail) stays out of it
+	if XF_OFF=1 "$@" go test -modfile="$stock/go.mod" -tags stockgio -count=1 -v -run "$tests" "$p" > "$stock/out" 2>&1; then
 		cat "$stock/out"
 		echo "::error::$p: the regression test passed on stock Gio v0.10.3"
 		exit 1
@@ -27,3 +29,7 @@ for p in "${pkgs[@]}"; do
 	fi
 	echo "$p on stock Gio v0.10.3: $(grep -m1 'panic: runtime error' "$stock/out")"
 done
+# internal/media's calls into patches 35 and 51 are behind its
+# gio_patch51*.go pair: it and its tests build on stock Gio too
+go vet -modfile="$stock/go.mod" -tags stockgio ./internal/media
+echo "internal/media builds on stock Gio v0.10.3"

@@ -44,20 +44,36 @@ type entry struct {
 }
 
 var (
-	entries []entry
-	regOnce sync.Once
+	entries  []entry
+	elements []elementEntry
+	regOnce  sync.Once
 )
+
+type elementEntry struct {
+	el    slackc.HostElement
+	names []string
+}
 
 // add queues a component for Register; component files call it from init.
 func add(fn slackc.HostComponent, names ...string) {
 	entries = append(entries, entry{fn: fn, names: names})
 }
 
+// addElement queues the DOM element Slack's component renders, for
+// Register (slackc.RegisterHostElement).
+func addElement(el slackc.HostElement, names ...string) {
+	elements = append(elements, elementEntry{el: el, names: names})
+}
+
 // Register registers every kit component with slackc under the names the
-// JS side uses (Slack's component names plus the api.elements aliases).
+// JS side uses (Slack's component names plus the api.elements aliases),
+// with the element each one is in Slack's DOM where CSS needs it.
 // Safe to call more than once.
 func Register() {
 	regOnce.Do(func() {
+		for _, e := range elements {
+			slackc.RegisterHostElement(e.el, e.names...)
+		}
 		for _, e := range entries {
 			slackc.RegisterHost(e.fn, e.names...)
 		}
@@ -254,15 +270,17 @@ func init() {
 	// Gio blends in linear light; pre-adjust translucent tokens so they
 	// read like CSS over the card background (as popups does).
 	for _, p := range []struct {
-		c  *colors
-		bg color.NRGBA
-	}{{&lightColors, rgb(0xffffff)}, {&darkColors, rgb(0x222529)}} {
+		c    *colors
+		bg   color.NRGBA
+		pane color.NRGBA // the message pane: what a modal's scrim covers
+	}{{&lightColors, rgb(0xffffff), rgb(0xffffff)}, {&darkColors, rgb(0x222529), rgb(0x1a1d21)}} {
 		c := p.c
-		for _, f := range []*color.NRGBA{&c.Ring, &c.Divider, &c.Shadow, &c.ModalShadow, &c.Backdrop,
+		for _, f := range []*color.NRGBA{&c.Ring, &c.Divider, &c.Shadow, &c.ModalShadow,
 			&c.BtnBorder, &c.GhostHover, &c.FocusRing, &c.InputBorder, &c.InputBorderHover, &c.CheckBorder,
 			&c.PillActiveBg, &c.TagBg, &c.InfoBg} {
 			*f = theme.LinearAlpha(*f, p.bg)
 		}
+		c.Backdrop = theme.LinearAlpha(c.Backdrop, p.pane) // as popups' (style.go)
 	}
 }
 
@@ -363,6 +381,8 @@ func themedKitColors(th *theme.Theme) *colors {
 		case x.p.A == 0xff:
 		case x.p == &c.Bg:
 			*x.p = theme.Over(*x.p, th.C.Bg)
+		case x.p == &c.Backdrop: // the scrim covers the app: its alpha holds over the pane
+			*x.p = theme.LinearAlpha(*x.p, th.C.Bg)
 		case x.lin:
 			*x.p = theme.LinearAlpha(*x.p, c.Bg)
 		default:
@@ -543,12 +563,15 @@ func (o *origin) toWin(p image.Point) image.Point { return p.Add(o.pt) }
 
 // layer draws content above everything (op.Defer) at a window position,
 // for Popover, Tooltip-like and menu content that stays part of the host
-// tree. With modal it catches presses outside the content and Escape, and
-// learns the host's window origin from pointer moves anywhere in the
-// window (the host may never be hovered).
+// tree. With modal it catches presses outside the content and Escape,
+// takes the focus as it opens (open), and learns the host's window origin
+// from pointer moves anywhere in the window (the host may never be
+// hovered). A modal layer is one of its window's overlay layers
+// (slackc.OpenLayer): its content area is l.focus's, so an Escape from
+// anything in it comes to it.
 type layer struct {
 	scrim, block, focus int
-	focused             bool
+	opened              bool // the focus taken; the popover closing forgets it
 }
 
 const far = 1 << 16
@@ -583,8 +606,15 @@ func (l *layer) float(gtx layout.Context, org *origin, win image.Point, call op.
 				org.learn(pe.Position.X+float32(off.X), pe.Position.Y+float32(off.Y))
 			}
 		}
+		// its Escape: the window's overlay stack's where it routes them
+		// (slackc layers.go: once, and the focused element's listeners
+		// first), else its own
+		filters := []event.Filter{key.FocusFilter{Target: &l.focus}}
+		if !slackc.EscapeRouted(gtx) {
+			filters = append(filters, key.Filter{Focus: &l.focus, Name: key.NameEscape})
+		}
 		for {
-			e, ok := gtx.Event(key.FocusFilter{Target: &l.focus}, key.Filter{Focus: &l.focus, Name: key.NameEscape})
+			e, ok := gtx.Event(filters...)
 			if !ok {
 				break
 			}
@@ -604,27 +634,42 @@ func (l *layer) float(gtx layout.Context, org *origin, win image.Point, call op.
 		bs := clip.Rect{Max: sz}.Push(gtx.Ops)
 		event.Op(gtx.Ops, &l.block)
 		bs.Pop()
+		// the content area: the content is drawn inside it (here, in the
+		// deferred ops, which run from the root), so a focus in the
+		// content is in the layer (slackc's Escape and focus). Unbounded:
+		// it nests the content's handlers and clips none of its paint (a
+		// card's shadow)
+		ks := clip.Rect{Min: image.Pt(-far, -far), Max: image.Pt(far, far)}.Push(gtx.Ops)
 		ps := pointer.PassOp{}.Push(gtx.Ops)
-		ks := clip.Rect{Max: sz}.Push(gtx.Ops)
 		event.Op(gtx.Ops, &l.focus)
-		ks.Pop()
 		ps.Pop()
+		call.Add(gtx.Ops)
+		ks.Pop()
+	} else {
+		call.Add(gtx.Ops)
 	}
-	call.Add(gtx.Ops)
 	off.Pop()
 	op.Defer(gtx.Ops, m.Stop())
-	if modal && !l.focused {
-		gtx.Execute(key.FocusCmd{Tag: &l.focus})
-		l.focused = true
-	}
-	if !modal {
-		l.focused = false
-	}
 	return outside, esc
 }
 
-// reset forgets focus so the next open grabs it again.
-func (l *layer) reset() { l.focused = false }
+// open says a modal layer is open this frame, lay being its overlay layer
+// in the window's stack (slackc.OpenLayer: on every pass, before the
+// content, so its first live pass records the focus the popover gives
+// back when it closes), and takes the focus as it opens. Before the
+// content lays out:
+// a field in it that takes the focus as it lays out (FormTextInput's or
+// an <input>'s autoFocus) then keeps it, as a browser's autofocus inside a
+// popover does. Gio's last FocusCmd wins: the layer's, run after the
+// content, took the caret from the field (no caret, typing went nowhere).
+func (l *layer) open(gtx layout.Context, lay slackc.Layer) {
+	// a plugin's layer; its Escape asks JS to close it (onClose)
+	slackc.OpenLayer(gtx, lay, slackc.LayerSpec{Area: &l.focus, Home: &l.focus, Plugin: true, Async: true})
+	if !l.opened && gtx.Source.Enabled() { // a measure pass's FocusCmd goes nowhere
+		gtx.Execute(key.FocusCmd{Tag: &l.focus})
+		l.opened = true
+	}
+}
 
 // place positions a box of size sz next to anchor in a window of size win
 // (margin m), preferring side and flipping when there is no room.
@@ -769,6 +814,20 @@ func keyEvent(typ, name string, mods key.Modifiers, value string) slackc.Props {
 		"repeat": false, "isComposing": false, "target": t, "currentTarget": t,
 		"nativeEvent": slackc.Props{"isComposing": false}, "defaultPrevented": false,
 	}
+}
+
+// liveFocus is whether tag has the key focus: Gio's answer in a pass that
+// delivers input, else was (the last live answer). Kit components are
+// natives in plugins' trees, which slackc also lays out in measure passes
+// (gtx.Disabled()) where Gio reports nothing focused: there a focused
+// Button or FormTextInput sent onBlur then onFocus on every relayout, and
+// a TimePicker being typed in committed the half-typed time and replaced
+// the text with it.
+func liveFocus(gtx layout.Context, tag any, was bool) bool {
+	if !gtx.Source.Enabled() {
+		return was
+	}
+	return gtx.Focused(tag)
 }
 
 // focusEvent is a focus/blur event object.

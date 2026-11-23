@@ -53,6 +53,63 @@ var (
 			Mods("c-presence--active", "c-presence--away")
 )
 
+// The chrome's elements as the inspect tool sees them (slackc
+// ClassDef.Inspect: recorded for the picker alone, so no selector matches
+// them and nothing draws differently): Slack's classes and data-qa for
+// what Clack draws without a component around it, so the picker reaches
+// the header's title, a tab's title or the Activity button the way a
+// browser's inspector reaches any element (gantry boot-shared and
+// boot-render, build 7879320ed1f9; the header's actions and topic
+// container from the live DOM).
+var (
+	insHdrTitle   = slackc.Class("c-button-unstyled p-view_header__big_button p-view_header__big_button--channel").Tag("button")
+	insHdrName    = slackc.Class("p-view_header__channel_title").Tag("span")
+	insHdrIcon    = slackc.Class("p-view_header__channel_title_icon").Tag("span")
+	insHdrTopic   = slackc.Class("p-view_header__topic_container")
+	insHdrActions = slackc.Class("p-view_header__actions")
+	insTabMenu    = slackc.Class("c-tabs__tab_menu", "role", "tablist")
+	insTab        = slackc.Class("c-button-unstyled c-tabs__tab", "role", "tab").Tag("button").Mods("c-tabs__tab--active")
+	insTabIcon    = slackc.Class("c-tabs__tab_icon--left").Tag("span")
+	insTabLabel   = slackc.Class("c-tabs__tab_content").Tag("span")
+	insRail       = slackc.Class("p-tab_rail", "role", "tablist")
+	insRailIcon   = slackc.Class("p-tab_rail__button__icon")
+	insRailLabel  = slackc.Class("p-tab_rail__button__label")
+	insRailMe     = slackc.Class("p-ia__nav__user__button", "data-qa", "user-button").Tag("button")
+	insSearch     = slackc.Class("c-button-unstyled p-top_nav__search", "data-qa", "top_nav_search").Tag("button")
+	insSearchText = slackc.Class("p-top_nav__search__text").Tag("span")
+	insNavButton  = slackc.Class("c-button-unstyled p-ia4_history_buttons__button").Tag("button").
+			Mods("p-ia4_history_buttons__button-back", "p-ia4_history_buttons__button-forward")
+	insNavHistory = slackc.Class("c-button-unstyled p-ia4_history_menu_button").Tag("button")
+)
+
+// insRailButton is a tab rail button (TabRail's tabs: c-tabs__tab with
+// p-tab_rail__button, --active while its view shows), with the data-qa
+// Slack gives the tabs it names (ed.sp.TAB_RAIL_*_BUTTON).
+var insRailButton = func() map[string]*slackc.ClassDef {
+	m := map[string]*slackc.ClassDef{}
+	for _, k := range []string{"home", "dms", "activity", "later", "files", "browse"} {
+		m[k] = slackc.Class("c-button-unstyled c-tabs__tab p-tab_rail__button", "role", "tab", "data-qa", "tab_rail_"+k+"_button").
+			Tag("button").Mods("p-tab_rail__button--active")
+	}
+	m[""] = slackc.Class("c-button-unstyled c-tabs__tab p-tab_rail__button", "role", "tab").Tag("button").Mods("p-tab_rail__button--active")
+	return m
+}()
+
+func insRailButtonFor(key string) *slackc.ClassDef {
+	if d := insRailButton[key]; d != nil {
+		return d
+	}
+	return insRailButton[""]
+}
+
+// insMod is mods bit 0 when on.
+func insMod(on bool) uint64 {
+	if on {
+		return 1
+	}
+	return 0
+}
+
 // clsSbChannel is .p-channel_sidebar__channel per channel type and
 // selection (static attributes); the channel id is EnterAttr's.
 var clsSbChannel = func() (t [5][2]*slackc.ClassDef) {
@@ -341,17 +398,20 @@ func (e sbEntity) layout(gtx layout.Context, p slackc.Props) layout.Dimensions {
 		// badge in the icon's place (BaseChannelPrefixPresence)
 		s := gtx.Dp(10)
 		at(gtx, image.Pt((gtx.Dp(16)-s)/2, (rowH-s)/2), image.Pt(gtx.Dp(120), s), func(gtx layout.Context) layout.Dimensions {
-			return slackc.Component(gtx, "BasePresence", sbPresence{a: a, active: conv.Active, sel: e.sel, self: conv.Self, key: conv.ID}, sbPresence.props, sbPresence.layout)
+			return slackc.Component(gtx, "BasePresence", sbPresence{a: a, active: conv.Active, sel: e.sel, self: conv.Self, system: sbSystemUser(conv.User), key: conv.ID}, sbPresence.props, sbPresence.layout)
 		})
 	} else if kind == "im" || kind == "app" {
 		at(gtx, image.Pt(0, iy), image.Pt(gtx.Dp(16), gtx.Dp(16)), func(gtx layout.Context) layout.Dimensions {
 			return a.avatar(gtx, conv.Avatar, conv.Name, gtx.Dp(16), gtx.Dp(4))
 		})
-		if kind == "im" && !conv.Bot {
+		// BaseAvatar (YN+Y) badges presence only when showPresence &&
+		// !isSystemUser, and ConnectedBaseAvatar (+JEQ) passes isSystemUser
+		// for USLACKBOT and USLACK: their avatars carry no badge
+		if kind == "im" && !conv.Bot && !sbSystemUser(conv.User) {
 			s := gtx.Dp(10)
 			ctr := image.Pt(gtx.Dp(15), iy+gtx.Dp(14))
 			at(gtx, ctr.Sub(image.Pt(s/2, s/2)), image.Pt(gtx.Dp(120), s), func(gtx layout.Context) layout.Dimensions {
-				return slackc.Component(gtx, "BasePresence", sbPresence{a: a, active: conv.Active, sel: e.sel, self: conv.Self, key: conv.ID}, sbPresence.props, sbPresence.layout)
+				return slackc.Component(gtx, "BasePresence", sbPresence{a: a, active: conv.Active, sel: e.sel, self: conv.Self, system: sbSystemUser(conv.User), key: conv.ID}, sbPresence.props, sbPresence.layout)
 			})
 		}
 	} else if conv.Code != nil {
@@ -447,9 +507,9 @@ func (e sbEntity) layout(gtx layout.Context, p slackc.Props) layout.Dimensions {
 		nw += es + gtx.Dp(6)
 	}
 	if e.suffix != "" && nw+gtx.Dp(8) < tw {
-		sc := theme.Over(theme.WithAlpha(a.th.C.SidebarText, 0xa3), a.sbBase) // rgba(249,237,255,.6)
+		sc := theme.Over(a.th.C.SidebarTextTer, a.sbBase) // .p-channel_sidebar__member_label: theme-content-inv-ter
 		if e.sel {
-			sc = theme.Over(theme.WithAlpha(c.SidebarActiveText, 0x99), c.SidebarActive)
+			sc = c.SidebarActiveText // --selected's theme-content-hgl-1, opaque
 		}
 		at(gtx, image.Pt(tx+nw+gtx.Dp(6), gtx.Dp(1)), image.Pt(tw-nw-gtx.Dp(6), rowH), func(gtx layout.Context) layout.Dimensions {
 			return vcenter(gtx, rowH, func(gtx layout.Context) layout.Dimensions {
@@ -465,8 +525,15 @@ func (e sbEntity) layout(gtx layout.Context, p slackc.Props) layout.Dimensions {
 type sbPresence struct {
 	a                 *App
 	active, sel, self bool
-	key               string
+	// system: the partner is Slackbot or the Slack system user
+	// (ConnectedPresence, client-boot Bh6F: isSystemUser for USLACKBOT and
+	// USLACK), whose BasePresence (MSOq) is the status-slackbot-filled heart
+	system bool
+	key    string
 }
+
+// sbSystemUser is ConnectedPresence's isSystemUser for a DM partner.
+func sbSystemUser(user string) bool { return user == "USLACKBOT" || user == "USLACK" }
 
 // props: Slack's BasePresence shape (props.md).
 func (s sbPresence) props() slackc.Props {
@@ -476,7 +543,7 @@ func (s sbPresence) props() slackc.Props {
 		"isActive":        s.active,
 		"isDnd":           false,
 		"isSelf":          s.self,
-		"isSystemUser":    false,
+		"isSystemUser":    s.system,
 		"userType":        "member",
 		"inline":          false,
 		"inheritIconSize": false,
@@ -505,14 +572,22 @@ func (s sbPresence) layout(gtx layout.Context, p slackc.Props) layout.Dimensions
 	if st.Hidden() {
 		return layout.Dimensions{}
 	}
+	system := s.system
+	if p != nil && p.Has("isSystemUser") {
+		system = p.Bool("isSystemUser")
+	}
 	d := gtx.Dp(10)
 	return st.Wrap(gtx, func(gtx layout.Context) layout.Dimensions {
-		a.presenceDot(gtx, image.Pt(d/2, d/2), active, s.sel)
+		if system {
+			a.presenceHeart(gtx, d, active, s.sel)
+		} else {
+			a.presenceDot(gtx, image.Pt(d/2, d/2), active, s.sel)
+		}
 		if !text {
 			return layout.Dimensions{Size: image.Pt(d, d)}
 		}
 		t := "Away"
-		if active {
+		if active || system { // getPresenceText (MSOq): a system user is "Active"
 			t = "Active"
 		}
 		fg := st.Color(a.sbPal.SidebarText)

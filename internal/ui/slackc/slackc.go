@@ -24,6 +24,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"gioui.org/layout"
 
@@ -76,6 +77,11 @@ type Env struct {
 	OpenURL func(url string)
 	// Navigate follows a Clack route ("c/<id>", …) for Slack-internal links.
 	Navigate func(route string)
+	// FollowLink is Slack's Link click for a plugin-drawn href: a slack:
+	// link to handleDeepLink, a link to a message or a conversation
+	// through openPermalink (jumpToMessage: a reply opens in its thread);
+	// false for any other link (the browser's).
+	FollowLink func(href string) bool
 	// Core is the in-process Slack service (users, channels, emoji).
 	Core *core.App
 	// PointerWin is the last pointer position in window coordinates
@@ -96,6 +102,9 @@ var (
 	envVal Env
 
 	bridgeVal atomic.Pointer[Bridge]
+	// bridgeGen counts SetBridge calls: a new bridge is a JS runtime that
+	// hasn't heard the window's viewport yet (Frame).
+	bridgeGen atomic.Uint64
 
 	// patched is nil until a plugin patches something: the fast path is
 	// one atomic load and a nil check.
@@ -127,6 +136,7 @@ func invalidate() {
 
 // SetBridge installs (or with nil removes) the JS side.
 func SetBridge(b Bridge) {
+	bridgeGen.Add(1)
 	if b == nil {
 		bridgeVal.Store(nil)
 		return
@@ -190,7 +200,7 @@ func Patched(name string) bool {
 // value passed here is heap-allocated on every call. Hot widgets use
 // Component, which is allocation-free when unpatched.
 func Render(gtx layout.Context, name string, props Props, native Native) layout.Dimensions {
-	if patched.Load() == nil && !inspecting.Load() { // inlined: two atomic loads
+	if patched.Load() == nil && expected.Load() == nil && !inspecting.Load() { // inlined: three atomic loads
 		return native(gtx, props)
 	}
 	return renderSlow(gtx, name, props, native)
@@ -207,15 +217,18 @@ func renderSlow(gtx layout.Context, name string, props Props, native Native) lay
 }
 
 func renderSlow0(gtx layout.Context, name string, props Props, native Native) layout.Dimensions {
-	if m := patched.Load(); m == nil || !(*m)[name] {
+	if m := patched.Load(); m == nil || !(*m)[name] || unpatched > 0 {
+		if unpatched == 0 {
+			noteExpected(name, false) // a launch's expected patch drawn native (expect.go)
+		}
 		return native(gtx, props)
 	}
-	return renderPatched(gtx, name, props, native)
+	return renderPatched(gtx, name, props, props, native)
 }
 
 // RenderLazy is Render with props built only when name is patched.
 func RenderLazy(gtx layout.Context, name string, props func() Props, native Native) layout.Dimensions {
-	if patched.Load() == nil && !inspecting.Load() {
+	if patched.Load() == nil && expected.Load() == nil && !inspecting.Load() {
 		return native(gtx, nil)
 	}
 	return renderLazySlow(gtx, name, props, native)
@@ -234,10 +247,13 @@ func renderLazySlow(gtx layout.Context, name string, props func() Props, native 
 }
 
 func renderLazySlow0(gtx layout.Context, name string, props func() Props, native Native) layout.Dimensions {
-	if m := patched.Load(); m == nil || !(*m)[name] {
+	if m := patched.Load(); m == nil || !(*m)[name] || unpatched > 0 {
+		if unpatched == 0 {
+			noteExpected(name, false) // expect.go
+		}
 		return native(gtx, nil)
 	}
-	return renderPatched(gtx, name, props(), native)
+	return renderPatched(gtx, name, props(), nil, native)
 }
 
 // Component is the allocation-free form of Render for hot widgets: with
@@ -249,44 +265,63 @@ func renderLazySlow0(gtx layout.Context, name string, props func() Props, native
 // props may be nil (no props). native's Props argument is nil when
 // unpatched.
 func Component[T any](gtx layout.Context, name string, recv T, props func(T) Props, native func(T, layout.Context, Props) layout.Dimensions) layout.Dimensions {
-	if patched.Load() == nil && reserved.Load() == nil && !inspecting.Load() { // inlined: the native becomes a direct call
+	if patched.Load() == nil && reserved.Load() == nil && expected.Load() == nil && !inspecting.Load() { // inlined: the native becomes a direct call
 		return native(recv, gtx, nil)
 	}
-	return componentSlow(gtx, name, recv, props, native)
+	return componentSlow(gtx, name, recv, props, native, false)
 }
 
-func componentSlow[T any](gtx layout.Context, name string, recv T, props func(T) Props, native func(T, layout.Context, Props) layout.Dimensions) layout.Dimensions {
+// ComponentBox is Component for a native that draws its element's box
+// itself, as ChildBox is Child for one (Slot.OwnBox): patched, the root
+// "@" box its tree renders it as leaves the fill, ring, borders and
+// padding a rule gives the element to the native, which paints them
+// once and round. The reaction pill's UnstyledButton under an
+// UnstyledButton patch that adds a class: painted by the "@" box as well,
+// the class's ring was a square one round the round one.
+func ComponentBox[T any](gtx layout.Context, name string, recv T, props func(T) Props, native func(T, layout.Context, Props) layout.Dimensions) layout.Dimensions {
+	if patched.Load() == nil && reserved.Load() == nil && expected.Load() == nil && !inspecting.Load() {
+		return native(recv, gtx, nil)
+	}
+	return componentSlow(gtx, name, recv, props, native, true)
+}
+
+func componentSlow[T any](gtx layout.Context, name string, recv T, props func(T) Props, native func(T, layout.Context, Props) layout.Dimensions, own bool) layout.Dimensions {
 	if f := CurrentInspectFrame(); f != nil { // the inspect tool (inspect.go)
 		var pf func() Props
 		if props != nil {
 			pf = func() Props { return props(recv) }
 		}
 		i := f.beginComponent(name, pf)
-		d := componentSlow0(gtx, name, recv, props, native)
+		d := componentSlow0(gtx, name, recv, props, native, own)
 		f.endComponent(gtx, i, d)
 		return d
 	}
-	return componentSlow0(gtx, name, recv, props, native)
+	return componentSlow0(gtx, name, recv, props, native, own)
 }
 
-func componentSlow0[T any](gtx layout.Context, name string, recv T, props func(T) Props, native func(T, layout.Context, Props) layout.Dimensions) layout.Dimensions {
-	if m := patched.Load(); m == nil || !(*m)[name] {
-		if ins, ok := reservedFor(name); ok { // a plugin's slot kept free until it renders (reserve.go)
-			return drawReserved(gtx, ins, func(g layout.Context) layout.Dimensions { return native(recv, g, nil) })
-		}
+func componentSlow0[T any](gtx layout.Context, name string, recv T, props func(T) Props, native func(T, layout.Context, Props) layout.Dimensions, own bool) layout.Dimensions {
+	if unpatched > 0 { // drawn without plugins (guard.go)
 		return native(recv, gtx, nil)
 	}
-	return componentPatched(gtx, name, recv, props, native)
+	if m := patched.Load(); m == nil || !(*m)[name] {
+		if ins, ok := reservedFor(name); ok { // a plugin's slot kept free until it renders (reserve.go)
+			noteExpected(name, reserveCovers(gtx)) // expect.go
+			return drawReserved(gtx, ins, func(g layout.Context) layout.Dimensions { return native(recv, g, nil) })
+		}
+		noteExpected(name, false) // expect.go
+		return native(recv, gtx, nil)
+	}
+	return componentPatched(gtx, name, recv, props, native, own)
 }
 
-func componentPatched[T any](gtx layout.Context, name string, recv T, props func(T) Props, native func(T, layout.Context, Props) layout.Dimensions) layout.Dimensions {
+func componentPatched[T any](gtx layout.Context, name string, recv T, props func(T) Props, native func(T, layout.Context, Props) layout.Dimensions, own bool) layout.Dimensions {
 	var p Props
 	if props != nil {
 		p = props(recv)
 	}
-	return renderPatched(gtx, name, p, func(gtx layout.Context, p Props) layout.Dimensions {
+	return renderPatchedBox(gtx, name, p, nil, func(gtx layout.Context, p Props) layout.Dimensions {
 		return native(recv, gtx, p)
-	})
+	}, own)
 }
 
 // --- patched instances (UI goroutine) ---
@@ -297,6 +332,67 @@ type instKey struct {
 	hash    uint64
 	parent  uint64 // enclosing patched root (0 = top level)
 	parentK int64  // the "@" node in it whose native drew this one
+	// the pane that drew it (Pane) and that pane's window: "" and nil
+	// outside a pane
+	pane string
+	win  *frameClock
+}
+
+// curPane is the pane being drawn ("" outside one; UI goroutine, frame
+// lock).
+var curPane string
+
+// Pane keys the patched component instances drawn until EndPane by the
+// pane id and by the window drawing the pane: each pane gets roots of its
+// own, even where two of them draw the same component with the same
+// "$key", as each of Slack's panes is a React subtree with components of
+// its own. A reply also sent to the channel is drawn by the channel's
+// list and by its thread pane (Slack: BaseMessageList's MessageWrapper
+// and ThreadsFlexpane's ThreadReply, two components): sharing one root,
+// the two panes sent JS their own props in turn and the root rendered
+// again every frame. The inner of nested panes keys. One assignment, so
+// free when nothing is patched:
+//
+//	defer slackc.EndPane(slackc.Pane(id))
+func Pane(id string) (outer string) {
+	outer, curPane = curPane, id
+	return outer
+}
+
+// EndPane ends the pane Pane started; outer is what Pane returned.
+func EndPane(outer string) { curPane = outer }
+
+// CurrentPane is the pane being drawn ("" outside one): what the
+// instances drawn now are keyed by (RemountKeyedIn). UI goroutine.
+func CurrentPane() string { return curPane }
+
+// ResultBridge is implemented by bridges that report what JS did with an
+// event: done gets, on any goroutine, whether a listener stopped its
+// propagation. A focused plugin element's Escape keydown goes on to the
+// window's overlay layers only when none did (dispatchKey), as a DOM
+// keydown bubbles up to react-modal's content. Without it the keydown
+// goes on at once.
+type ResultBridge interface {
+	DispatchResult(target int64, event []byte, done func(propagationStopped bool))
+}
+
+// EventBridge is implemented by bridges that call a JS function prop with
+// a DOM event JS makes React's synthetic one (args carry {"$event":
+// fields}: the handler can call stopPropagation and preventDefault) and
+// tell done, on any goroutine, whether the handler stopped it
+// (JSFunc.CallEvent). In order with Dispatch's events.
+type EventBridge interface {
+	CallEvent(fn int64, args []byte, done func(stopped bool))
+}
+
+// TruthyBridge is implemented by bridges that call a JS function prop the
+// way Slack calls a handler whose return value decides what runs next
+// (MAMenu's dispatchMessageAction: `onSelectAction(…) || native(…)`):
+// done hears, on any goroutine, whether it returned something truthy as
+// JS sees it, right away (a returned Promise is truthy and isn't awaited),
+// or threw; err when no runtime answered (none, or it went away first).
+type TruthyBridge interface {
+	CallTruthy(fn int64, args []byte, done func(truthy, threw bool, err error))
 }
 
 // NestedBridge is implemented by bridges that can mount a root inside
@@ -312,14 +408,23 @@ type inst struct {
 	root  uint64
 	name  string
 	key   instKey
-	sent  uint64 // hash of the props last sent to JS
-	used  time.Time
+	sent  uint64    // hash of the props last sent to JS
+	draws []drawRec // each window's latest draw (frame.go)
 	slots map[string]int64
 	view  *View
 	tree  atomic.Pointer[[]*Node]
 	raw   []byte // the last tree delivered, as JS sent it (rootsMu)
 	fn    bool   // a RenderFn root
 	sub   *Sub
+
+	// what an unchanged frame skips (UI goroutine): every path leading to
+	// a Go func slot (refreshSlots), and the hash of the props' "msg" term
+	// while it's the same map (propsHash)
+	prefixes map[string]bool
+	prefN    int
+	pbuf     []byte // refreshSlots' path buffer
+	hmsg     Props
+	hmsgH    uint64
 }
 
 var (
@@ -330,8 +435,7 @@ var (
 	roots   = map[uint64]*inst{}
 
 	// insts is the UI goroutine's lookup by component identity.
-	insts     = map[instKey]*inst{}
-	lastSweep time.Time
+	insts = map[instKey]*inst{}
 )
 
 func newRoot() uint64 { return rootSeq.Add(1) &^ (1 << 63) }
@@ -343,17 +447,35 @@ func now(gtx layout.Context) time.Time {
 	return time.Now()
 }
 
-func renderPatched(gtx layout.Context, name string, props Props, native Native) layout.Dimensions {
+// renderPatched draws component name through its plugin's host tree. Until
+// the first tree arrives, and with no bridge, native draws as it would
+// unpatched: with pre, which is props for Render and nil for Component and
+// RenderLazy, whose natives take non-nil props for <Original>'s. Handed
+// the props built for JS there, the composer's natives looked in them for
+// the host nodes of their parts, found Go's slots and drew nothing: the
+// message box was gone until JS answered, and for good when it didn't.
+// In a reserved slot (reserve.go) the native still gets props: drawn
+// inside the insets, ClientPrimaryView learns its origin from the pointer
+// as under a patch.
+func renderPatched(gtx layout.Context, name string, props, pre Props, native Native) layout.Dimensions {
+	return renderPatchedBox(gtx, name, props, pre, native, false)
+}
+
+// renderPatchedBox is renderPatched; own: the native draws its element's
+// box itself (ComponentBox).
+func renderPatchedBox(gtx layout.Context, name string, props, pre Props, native Native, own bool) layout.Dimensions {
 	b := bridge()
 	if b == nil {
-		return native(gtx, props)
+		noteExpected(name, false) // expect.go
+		return native(gtx, pre)
 	}
 	pump()
 	t := now(gtx)
-	sweep(t)
 
-	h := hashProps(props)
 	k := instKey{name: name}
+	if curPane != "" {
+		k.pane, k.win = curPane, curClock
+	}
 	// Drawn by a native inside another patched component's tree (a row's
 	// <Original> calling MessageText): the child root belongs under that
 	// "@" node, so JS can mount it inside the parent's React tree and
@@ -361,21 +483,32 @@ func renderPatched(gtx layout.Context, name string, props Props, native Native) 
 	if c := curRender; c != nil && c.view != nil && c.n != nil {
 		k.parent, k.parentK = c.view.root, c.n.K
 	}
-	if id, ok := props["$key"]; ok {
+	var h uint64
+	id, keyed := props["$key"]
+	if keyed {
 		k.key = keyString(id)
 	} else {
+		h = hashProps(props)
 		k.hash = h
 	}
 	in := insts[k]
-	if in == nil {
-		in = &inst{root: newRoot(), name: name, key: k, sent: h ^ 1, slots: map[string]int64{}}
+	created := in == nil
+	if created {
+		in = &inst{root: newRoot(), name: name, key: k, slots: map[string]int64{}}
 		in.view = NewView(in.root)
+		in.view.ownRoot = own
 		insts[k] = in
 		rootsMu.Lock()
 		roots[in.root] = in
 		rootsMu.Unlock()
 	}
-	in.used = t
+	if keyed {
+		h = in.propsHash(props)
+	}
+	if created {
+		in.sent = h ^ 1 // the first frame always renders
+	}
+	in.drawn(t)
 	if h != in.sent {
 		in.sent = h
 		if nb, ok := b.(NestedBridge); ok && k.parent != 0 {
@@ -384,16 +517,18 @@ func renderPatched(gtx layout.Context, name string, props Props, native Native) 
 			b.Render(in.root, name, encodeProps(props, in.slots))
 		}
 	} else if len(in.slots) > 0 {
-		refreshFns(props, in.slots, "")
+		in.refreshSlots(props)
 	}
 	nodes := in.tree.Load()
 	if nodes == nil {
 		if ins, ok := reservedFor(name); ok { // its slot stays free until the tree arrives (reserve.go)
+			noteExpected(name, reserveCovers(gtx)) // expect.go
 			return drawReserved(gtx, ins, func(g layout.Context) layout.Dimensions {
 				return probeNative(name, func() layout.Dimensions { return native(g, props) })
 			})
 		}
-		return probeNative(name, func() layout.Dimensions { return native(gtx, props) })
+		noteExpected(name, false) // expect.go
+		return probeNative(name, func() layout.Dimensions { return native(gtx, pre) })
 	}
 	unreserve(name)
 	learn := in.view.learnPending
@@ -405,36 +540,96 @@ func renderPatched(gtx layout.Context, name string, props Props, native Native) 
 	return d
 }
 
-// refreshFns points each Go-func slot at this frame's closure.
-func refreshFns(v any, slots map[string]int64, path string) {
-	switch v := v.(type) {
+// refreshSlots points each Go-func slot at this frame's closure (the
+// props are rebuilt every frame, the ids stay). It walks only the paths
+// that lead to a slot, building them in a buffer: walking all the props,
+// a message's blocks and reactions included, with a new string per key,
+// cost a patched row more than hashing them did.
+func (in *inst) refreshSlots(p Props) {
+	if in.prefN != len(in.slots) { // slots only grow (encodeProps)
+		in.prefixes = make(map[string]bool, 2*len(in.slots))
+		for path := range in.slots {
+			for i := 1; i < len(path); i++ {
+				if path[i] == '.' {
+					in.prefixes[path[:i]] = true
+				}
+			}
+			in.prefixes[path] = true
+		}
+		in.prefN = len(in.slots)
+	}
+	if in.pbuf == nil {
+		in.pbuf = make([]byte, 0, 96)
+	}
+	gofns.Lock()
+	in.refresh(p, in.pbuf[:0])
+	gofns.Unlock()
+}
+
+// refresh is refreshSlots under v at path (gofns held). The paths are the
+// ones encodeProps gave the slots: ".key", ".index", ".p" for a Slot's
+// props.
+func (in *inst) refresh(v any, path []byte) {
+	switch x := v.(type) {
 	case Props:
-		for k, x := range v {
-			refreshFns(x, slots, path+"."+k)
+		for k, c := range x {
+			if q := append(append(path, '.'), k...); in.prefixes[string(q)] {
+				in.refresh(c, q)
+			}
 		}
 	case map[string]any:
-		for k, x := range v {
-			refreshFns(x, slots, path+"."+k)
+		for k, c := range x {
+			if q := append(append(path, '.'), k...); in.prefixes[string(q)] {
+				in.refresh(c, q)
+			}
 		}
 	case []any:
-		for i, x := range v {
-			refreshFns(x, slots, path+"."+strconv.Itoa(i))
+		for i, c := range x {
+			if q := strconv.AppendInt(append(path, '.'), int64(i), 10); in.prefixes[string(q)] {
+				in.refresh(c, q)
+			}
 		}
 	case Slot:
-		if id, ok := slots[path]; ok {
-			gofns.Lock()
-			gofns.m[id] = v
-			gofns.Unlock()
+		if id, ok := in.slots[string(path)]; ok {
+			gofns.m[id] = v // the interface it came in (x would be boxed again)
 		}
-		refreshFns(v.Props, slots, path+".p")
+		if q := append(path, ".p"...); in.prefixes[string(q)] {
+			in.refresh(x.Props, q)
+		}
 	case nil, string, bool, float64, int, int64, JSFunc, Element:
 	default:
-		if id, ok := slots[path]; ok && isFunc(v) {
-			gofns.Lock()
+		if id, ok := in.slots[string(path)]; ok && isFunc(v) {
 			gofns.m[id] = v
-			gofns.Unlock()
 		}
 	}
+}
+
+// propsHash is hashProps(p), keeping the "msg" term while it's the same
+// map: rows build their message props once per revision of the message,
+// and hashing its blocks, files and reactions again for each of a row's
+// patched components every frame was most of their hashing. The memo
+// holds the map, so its address can't come back as another message.
+func (in *inst) propsHash(p Props) uint64 {
+	var h uint64
+	for k, v := range p {
+		if k == "$key" {
+			continue
+		}
+		if m, ok := v.(Props); ok && k == "msg" && m != nil {
+			if in.hmsg == nil || !sameMap(in.hmsg, m) {
+				in.hmsg, in.hmsgH = m, mix(hashValue(hstr(fnvOff, k), v))
+			}
+			h += in.hmsgH
+			continue
+		}
+		h += mix(hashValue(hstr(fnvOff, k), v))
+	}
+	return mix(h ^ uint64(len(p)))
+}
+
+// sameMap reports whether a and b are the same map (not equal contents).
+func sameMap(a, b Props) bool {
+	return *(*unsafe.Pointer)(unsafe.Pointer(&a)) == *(*unsafe.Pointer)(unsafe.Pointer(&b))
 }
 
 func keyString(v any) string {
@@ -449,21 +644,6 @@ func keyString(v any) string {
 		return strconv.FormatFloat(v, 'g', -1, 64)
 	}
 	return string(appendValue(nil, v, nil, ""))
-}
-
-// sweep unmounts instances not drawn for a while (scrolled away, closed).
-func sweep(t time.Time) {
-	if t.Sub(lastSweep) < 2*time.Second {
-		return
-	}
-	lastSweep = t
-	b := bridge()
-	for k, in := range insts {
-		if t.Sub(in.used) > 5*time.Second {
-			delete(insts, k)
-			dropRoot(in, b)
-		}
-	}
 }
 
 func dropRoot(in *inst, b Bridge) {
@@ -580,17 +760,27 @@ func Reset() {
 // positioning and SetViewport).
 var windowSize image.Point
 
+// lastViewport is what Frame last reported to JS, and to which bridge
+// (bridgeGen): a runtime started after it (plugins turned off and on
+// again) is told the viewport at its first frame, rather than keeping
+// its document's defaults (1280x800 at 1x, light: <body> without
+// sk-client-theme--dark) until the window changes.
 var lastViewport struct {
 	size image.Point
 	dpr  float32
 	dark bool
+	gen  uint64
 }
 
 // Frame is the ui root's per-frame hook, called before laying out the
-// shell: it records the window size (vw/vh, fixed positioning), runs
-// queued JS→Go calls and reports viewport changes to JS. Free when no
-// plugin runtime is attached.
+// shell: it starts the main window's frame (its patched roots the last
+// frames left undrawn unmount: frame.go), records the window size (vw/vh,
+// fixed positioning), runs queued JS→Go calls and reports viewport
+// changes to JS. Free when no plugin runtime is attached.
 func Frame(gtx layout.Context) {
+	curClock, curPane = &mainClock, ""
+	mainClock.begin(now(gtx))
+	mainClock.layers.begin(gtx)
 	windowSize = gtx.Constraints.Max
 	pushDocument()
 	b := bridge()
@@ -599,8 +789,9 @@ func Frame(gtx layout.Context) {
 	}
 	pump()
 	dark := env().Theme != nil && env().Theme.Dark
-	if windowSize != lastViewport.size || gtx.Metric.PxPerDp != lastViewport.dpr || dark != lastViewport.dark {
-		lastViewport.size, lastViewport.dpr, lastViewport.dark = windowSize, gtx.Metric.PxPerDp, dark
+	gen := bridgeGen.Load()
+	if windowSize != lastViewport.size || gtx.Metric.PxPerDp != lastViewport.dpr || dark != lastViewport.dark || gen != lastViewport.gen {
+		lastViewport.size, lastViewport.dpr, lastViewport.dark, lastViewport.gen = windowSize, gtx.Metric.PxPerDp, dark, gen
 		s := gtx.Metric.PxPerDp
 		if s == 0 {
 			s = 1

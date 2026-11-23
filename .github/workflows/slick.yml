@@ -27,15 +27,30 @@ on:
 
 # Slick is third-party code (GPLv3) built and run here: by default CI uses the
 # reviewed commit SLICK_PIN; dispatch with ref=main (or any ref) to test upstream.
+# b6392ab (2026-11-17, Slick #473 and #472) reviewed from f52d55d: new npm
+# registry deps only (lockfile integrity hashes, installed with
+# --ignore-scripts), the build's new step runs `git tag` / `git show` on the
+# clone (scripts/lib/changelog.ts), and the new main halves run in Clack's
+# MainCtx, which has no node:http, child_process or fs writes: SlickMCP's
+# local HTTP server can't start there (its main half fails, and says so),
+# and SelfCare's badge and audio muting are accepted and change nothing.
 env:
-  SLICK_PIN: f52d55dbd458feb0d6cd77136c6ab07c4a727a5a
+  SLICK_PIN: b6392ababb7ad5206ed0f9e44feebfe729d0aa8e
 
 permissions:
   contents: read
 
+# A newer run for the same branch, tag or PR cancels this one while it is
+# queued or running, so stale pushes don't pile up in the shared queue.
+# A dispatch with other inputs gets its own group.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.ref }}-${{ inputs.run }}
+  cancel-in-progress: true
+
 jobs:
   plugins:
     runs-on: ubuntu-latest
+    timeout-minutes: 15 # budget: 1.5 x p95 (2.8 min) + 3, docs/CI-SPEED.md
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -92,10 +107,10 @@ jobs:
           RUN: ${{ inputs.run }}
         run: |
           set -o pipefail
-          go test -count=1 -timeout 20m -v ${RUN:+-run "$RUN"} ./internal/slick/... 2>&1 | tee dist/slick-test.log
+          go test -count=1 -timeout 10m -v ${RUN:+-run "$RUN"} ./internal/slick/... 2>&1 | tee dist/slick-test.log
       - name: acceptance summary
         if: ${{ !cancelled() }}
         run: |
           grep -E '^\s*--- (PASS|FAIL|SKIP)|^(ok|FAIL)\b|ACCEPT' dist/slick-test.log | tail -150 || true
       - name: taut tests still green (shared runtime)
-        run: go test -count=1 -timeout 15m ./internal/taut/...
+        run: go test -count=1 -timeout 9m ./internal/taut/...

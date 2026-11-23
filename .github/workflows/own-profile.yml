@@ -3,7 +3,10 @@ name: own-profile
 # users.profile.getSections, light and dark: render tests, the plain-text
 # emoji tofu scan (theme, richview, slackc and the pane), and screenshots;
 # the Edit profile modal and the section editor (popups/profile_edit.go)
-# on fakeslack's profile writes (core/profile_write.go), with their shots;
+# on fakeslack's profile writes (core/profile_write.go), with their shots,
+# and the photo upload's requests, prepared image (its hosts, EXIF and GIF
+# sizes), retries, loading buttons and logged failures
+# (core/profile_photo_test.go, popups/profile_photo_test.go);
 # the User Group pane's editor actions (popups/usergroup_edit.go) on
 # fakeslack's editable and locked groups, for an editor and a viewer.
 # Synthetic only: nothing here talks to Slack.
@@ -21,13 +24,20 @@ on:
       - "internal/ui/theme/embolden.go"
       - "internal/core/profile_sections*.go"
       - "internal/core/profile_write*.go"
+      - "internal/core/profile_photo*.go"
       - "internal/core/profile_grants*.go"
       - "internal/ui/popups/slick.go"
       - "internal/fakeslack/profile.go"
+      - "internal/fakeslack/photo.go"
+      - "internal/exif/**"
+      - "internal/ui/popups/loading_button.go"
       - "internal/fakeslack/usergroups.go"
       - "internal/core/usergroup_members*.go"
       - "internal/core/usergroup_edit*.go"
       - "internal/ui/popups/usergroup_*.go"
+      - "internal/ui/popups/modal_focus.go"
+      - "internal/ui/popups/add_agent_channels.go"
+      - "internal/ui/files_filters_esc_test.go"
       - ".github/workflows/own-profile.yml"
   workflow_dispatch:
 
@@ -37,9 +47,16 @@ env:
 permissions:
   contents: read
 
+# A newer run for the same branch, tag or PR cancels this one while it is
+# queued or running, so stale pushes don't pile up in the shared queue.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   own-profile:
     runs-on: ubuntu-latest
+    timeout-minutes: 15 # budget: 1.5 x p95 (2.1 min) + 3, docs/CI-SPEED.md
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -59,9 +76,11 @@ jobs:
         run: |
           mkdir -p "$PROFILE_SHOTS_DIR"
           go test -count=1 -v -run 'TestEmoji' ./internal/ui/theme
-          go test -count=1 -v -run 'TestProfileSections|TestPeopleBrowseCustomFields|TestProfileActionCalls|TestVIPError|TestValidateProfileFieldLikeSlack|TestPhotoCropLikeSlack|TestCheckPhoto|TestSaveProfileForm|TestSetProfileSectionLikeSlack|TestProfilePhotoLikeSlack|TestUsergroupMembersByKind|TestProfileGrantsLikeSlack|TestUsergroupRightsLikeSlack|TestUsergroupWritesLikeSlack' ./internal/core
+          go test -count=1 -v -run 'TestProfileSections|TestPeopleBrowseCustomFields|TestProfileActionCalls|TestVIPError|TestValidateProfileFieldLikeSlack|TestPhotoCropLikeSlack|TestCheckPhoto|TestSaveProfileForm|TestSetProfileSectionLikeSlack|TestProfilePhoto|TestUsergroupMembersByKind|TestProfileGrantsLikeSlack|TestUsergroupRightsLikeSlack|TestUsergroupWritesLikeSlack' ./internal/core
           go test -count=1 -v -run 'TestEmojiTofu' ./internal/ui/richview ./internal/ui/slackc
-          xvfb-run -a go test -count=1 -v -run 'TestOwnProfilePane|TestOtherProfilePane|TestProfileNameIsRealName|TestProfileMoreMenu|TestProfilePresenceColor|TestProfileDate|TestProfileVIPToggle|TestProfileMenuViewFiles|TestProfileFieldLink|TestProfileOpenFullWithoutHooks|TestProfileViewAs|TestAppAddToChannel|TestUserGroupPane|TestProfilePaneBackButton|TestEditProfile' ./internal/ui/popups
+          xvfb-run -a go test -count=1 -v -run 'TestOwnProfilePane|TestOtherProfilePane|TestProfileNameIsRealName|TestProfileMoreMenu|TestProfilePresenceColor|TestProfileDate|TestProfileVIPToggle|TestProfileMenuViewFiles|TestProfileFieldLink|TestProfileOpenFullWithoutHooks|TestProfileViewAs|TestAppAddToChannel|TestUserGroupPane|TestUserGroupCreate|TestProfilePaneBackButton|TestEditProfile|TestCropImageLikeChromium' ./internal/ui/popups
+          # the user group dialogs' selects through the real shell (Escape)
+          go test -count=1 -v -run 'TestUserGroupEditEscapeThroughShell|TestUserGroupCreateEscapeThroughShell' ./internal/ui
           ls -la "$PROFILE_SHOTS_DIR"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: ${{ !cancelled() }}

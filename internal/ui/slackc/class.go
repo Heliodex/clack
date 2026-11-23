@@ -16,16 +16,25 @@ import (
 // and the user CSS box (key "user").
 var Styles = css.NewEngine()
 
-// SetStyle installs or replaces the sheet under key (any goroutine).
+// SetStyle installs or replaces the sheet under key (any goroutine). The
+// same sheet again changes nothing: no restyle, no frame.
 func SetStyle(key, src string) {
+	v := Styles.Version()
 	Styles.Set(key, src)
+	if Styles.Version() == v {
+		return
+	}
 	resetNativeStyles()
 	invalidate()
 }
 
-// RemoveStyle drops the sheet under key.
+// RemoveStyle drops the sheet under key (nothing when there is none).
 func RemoveStyle(key string) {
+	v := Styles.Version()
 	Styles.Remove(key)
+	if Styles.Version() == v {
+		return
+	}
 	resetNativeStyles()
 	invalidate()
 }
@@ -125,6 +134,42 @@ type nativeStyle struct {
 	key    uint64
 	before *css.Style
 	after  *css.Style
+	// em holds before and after computed with the element's font size set
+	// to a native's own (pseudoAt), for the last few sizes asked for (a
+	// section's 15px pills and a context block's 13px ones share one)
+	em     [2][4]emPseudo
+	emNext [2]uint8
+}
+
+// emPseudo is a pseudo-element's style computed under a parent of font
+// size fs (CSS px).
+type emPseudo struct {
+	fs float32
+	st *css.Style
+}
+
+// pseudoAt is ns's ::before (or ::after) computed as a child of ns with
+// font size fs (CSS px): what Slack's stylesheet gives the element (the
+// message text's 15px), which the cascade here doesn't know, so its em
+// lengths (MentionProfiles' 1em picture) come out as in the browser.
+func (ns *nativeStyle) pseudoAt(after bool, fs float32) *css.Style {
+	i, pe := 0, css.PseudoBefore
+	if after {
+		i, pe = 1, css.PseudoAfter
+	}
+	for k := range ns.em[i] {
+		if c := &ns.em[i][k]; c.st != nil && c.fs == fs {
+			return c.st
+		}
+	}
+	e := cssEnv()
+	c := Styles.Cascade(ns.element(), pe, nil, e)
+	parent := ns.style
+	parent.FontSize = fs
+	st := css.Compute(&c, &parent, e)
+	k := ns.emNext[i] % uint8(len(ns.em[i]))
+	ns.em[i][k], ns.emNext[i] = emPseudo{fs: fs, st: &st}, k+1
+	return &st
 }
 
 // decoProp is the text decoration an element draws on its text: its own
@@ -196,10 +241,23 @@ func (e *nativeEl) Classes() []string {
 		return e.def.classes
 	}
 	out := append([]string(nil), e.def.classes...)
-	out = append(out, e.extra...)
+	// a plugin's className usually repeats the widget's own classes
+	// (OwlMode's ReactionBar: `${props.className} taut-owl-reactions`):
+	// each is the element's once, as in Slack's DOM
+	add := func(x string) {
+		for _, y := range out {
+			if y == x {
+				return
+			}
+		}
+		out = append(out, x)
+	}
+	for _, x := range e.extra {
+		add(x)
+	}
 	for i, x := range e.def.mods {
 		if e.mods&(1<<uint(i)) != 0 {
-			out = append(out, x)
+			add(x)
 		}
 	}
 	return out
@@ -544,7 +602,7 @@ func lookupNative(k nsKey, parent *stackEntry) *nativeStyle {
 	if vs := scopeVarsOf(&ns.el, ns.style.Vars); vs != nil {
 		ns.style.Vars = vs // a theme scope's tokens (scopevars.go)
 	}
-	ns.set, ns.native = propsOf(&c), nativesOf(&c)
+	ns.set, ns.native = nativeSets(&c)
 	ns.trans = hasTransition(&c)
 	// An inherited property Slack's own rule gives the widget (its link
 	// color, its bold name) stops an ancestor's value here, for its
@@ -832,44 +890,146 @@ func (s Styled) Wrap(gtx layout.Context, w layout.Widget) layout.Dimensions {
 	return wrapNative(gtx, s.s, w)
 }
 
-// WrapOwnPseudo is Wrap for a native that lays out its box
-// pseudo-elements among its own parts (Pseudo, DrawPseudo): a mention
-// pill draws a ::before picture inside its pill, as CSS puts it inside
-// the slug's box. Text ::before/::after content is still Wrap's.
-func (s Styled) WrapOwnPseudo(gtx layout.Context, w layout.Widget) layout.Dimensions {
+// InlineFrag is one line's fragment of an inline native (WrapInline): R
+// its padding box in the native's coordinates; CutStart and CutEnd the
+// sides where the element goes on, on the line before (it isn't the
+// element's first fragment) and after (not its last; also where it goes
+// on past a line clamp), which have no border, corners or shadow there.
+type InlineFrag struct {
+	R                image.Rectangle
+	CutStart, CutEnd bool
+}
+
+// WrapInline is Wrap for an inline native laid out over line fragments:
+// a mention pill is a box on each line it runs on, and Chromium paints a
+// non-replaced inline element that way (box-decoration-break: slice,
+// which Slack never changes for pills). A rule's background, border,
+// box-shadow and outline go on each fragment, the first with the box's
+// start edge (its left border and corners), the last with its end edge,
+// and the edges where a line broke with neither (each fragment's
+// CutStart and CutEnd say which it has: a pill that goes on past a line
+// clamp has no end edge on its last line shown). frags are in order; the
+// border lies outside their boxes. radius is the native's own corner
+// radius (Slack's pill: 3px), kept unless a rule sets border-radius.
+// Opacity and filters apply to the whole; margins, sizes and transforms
+// don't apply to an inline box. The native keeps the places of its
+// ::before and ::after and of a rule's margin and border itself (Pseudo,
+// InlineEdges) and draws the pseudo-elements there (DrawPseudoInline);
+// its content isn't moved. With the zero Styled it is exactly w(gtx).
+func (s Styled) WrapInline(gtx layout.Context, frags []InlineFrag, radius unit.Dp, w layout.Widget) layout.Dimensions {
 	if s.s == nil || !s.Active() {
 		return w(gtx)
 	}
 	if s.s.style.Display == css.DisplayNone {
 		return layout.Dimensions{}
 	}
-	return wrapNativeX(gtx, s.s, w, true)
+	return wrapInline(gtx, s.s, frags, radius, s.Has("border-radius"), w)
 }
 
-// Pseudo is the size in px of the native's ::before (or ::after) when it
-// generates a box rather than text (content set to an empty string, with
-// a size: MentionProfiles' 1em picture), margins included; ok is false
-// when there's none.
-func (s Styled) Pseudo(gtx layout.Context, after bool) (w, h float32, ok bool) {
-	pb := s.pseudoBox(gtx, after)
-	if pb == nil {
-		return 0, 0, false
+// InlineEdges are the px a rule's margin and border take at the start and
+// the end of an inline native (a mention pill), which its inline layout
+// keeps outside its box, the start on its first line and the end on its
+// last; WrapInline draws the border there.
+func (s Styled) InlineEdges(gtx layout.Context) (start, end float32) {
+	if s.s == nil || !s.Active() || s.s.style.Display == css.DisplayNone {
+		return 0, 0
 	}
-	return pb.m[3] + pb.w + pb.m[1], pb.m[0] + pb.h + pb.m[2], true
+	v := wrapView(gtx)
+	b := wrapBox(s.s)
+	b.v = v
+	v.edges(b, float32(gtx.Constraints.Max.X))
+	ml, mr := b.m[3], b.m[1]
+	if s.s.style.Margin[3].IsAuto() {
+		ml = 0
+	}
+	if s.s.style.Margin[1].IsAuto() {
+		mr = 0
+	}
+	return ml + b.bd[3], b.bd[1] + mr
 }
 
-// DrawPseudo paints the box Pseudo measured with its margin box at x,
-// centred in a line lineH tall from y (vertical-align: middle).
-func (s Styled) DrawPseudo(gtx layout.Context, after bool, x, y, lineH float32) {
-	pb := s.pseudoBox(gtx, after)
+// Pseudo is the width in px of the native's ::before (or ::after) for its
+// inline layout to keep a place for: a box (content set to an empty
+// string, with a size or a background, an inline-block: MentionProfiles'
+// 1em picture), its margins included, or generated text in its own font.
+// box tells which, and left is a box's left margin (part of w: a line
+// clamp's "…" after the box goes that far past its margin box, as
+// Chromium places it); ok is false when there's none. em, when > 0, is
+// the native's own font size in px, which em lengths in the
+// pseudo-element follow as they do in the browser.
+func (s Styled) Pseudo(gtx layout.Context, after bool, em float32) (w, left float32, box, ok bool) {
+	st := s.pseudoStyle(gtx, after, em)
+	if st == nil {
+		return 0, 0, false, false
+	}
+	v := wrapView(gtx)
+	if st.Content != "" {
+		return word(v.face(st), st.Content).adv, 0, false, true
+	}
+	pb := wrapPseudo(v, st, float32(gtx.Constraints.Max.X))
+	if pb == nil {
+		return 0, 0, false, false
+	}
+	return pb.m[3] + pb.w + pb.m[1], pb.m[3], true, true
+}
+
+// InlineSlot is the place a native's inline layout kept for its ::before
+// (or ::after), in the native's coordinates: X is its left edge, on the
+// line whose baseline is Base and whose line box runs from Top to Bot.
+// Asc, Desc and Size are the native's text font's ascent, descent and
+// size in px (its x-height for vertical-align: middle; Size is Pseudo's
+// em).
+type InlineSlot struct {
+	X, Base, Top, Bot float32
+	Asc, Desc, Size   float32
+}
+
+// DrawPseudoInline paints the ::before (or ::after) Pseudo measured in the
+// place its inline layout kept for it. A box is aligned by its
+// vertical-align as Chromium (and slackc's own inline layout) aligns an
+// inline-block with no line boxes in it: its bottom margin edge on the
+// baseline; middle: its margin box's middle half the x-height above the
+// baseline; top and bottom: the line box's; text-top: the font's ascent;
+// sub and super: the baseline lowered by a fifth of the font size plus 1px
+// and raised by a third plus 1px (inline_box_state.cc). Text sits on the
+// baseline.
+func (s Styled) DrawPseudoInline(gtx layout.Context, after bool, at InlineSlot) {
+	st := s.pseudoStyle(gtx, after, at.Size)
+	if st == nil || st.Visibility != css.Visible {
+		return
+	}
+	v := wrapView(gtx)
+	p := painter{v: v, ops: gtx.Ops, clip: noClip}
+	if st.Content != "" {
+		p.drawWord(word(v.face(st), st.Content), at.X, at.Base, st.Color, st)
+		return
+	}
+	pb := wrapPseudo(v, st, float32(gtx.Constraints.Max.X))
 	if pb == nil {
 		return
 	}
-	p := painter{v: wrapState.v, ops: gtx.Ops, clip: noClip}
-	p.wrapPseudo(pb, x, y, lineH)
+	mh := pb.m[0] + pb.h + pb.m[2]
+	top := at.Base - mh // the margin box's top
+	switch st.VerticalAlign {
+	case css.VAMiddle:
+		top = at.Base - at.Asc*xHeightRatio/2 - mh/2
+	case css.VATop:
+		top = at.Top
+	case css.VABottom:
+		top = at.Bot - mh
+	case css.VATextTop:
+		top = at.Base - at.Asc
+	case css.VASub:
+		top += at.Size/5 + v.dp
+	case css.VASuper:
+		top -= at.Size/3 + v.dp
+	}
+	p.wrapPseudo(pb, at.X, top, mh)
 }
 
-func (s Styled) pseudoBox(gtx layout.Context, after bool) *box {
+// pseudoStyle is the native's ::before (or ::after) style when it
+// generates something, its em lengths in a font of em px when em > 0.
+func (s Styled) pseudoStyle(gtx layout.Context, after bool, em float32) *css.Style {
 	if s.s == nil {
 		return nil
 	}
@@ -877,10 +1037,18 @@ func (s Styled) pseudoBox(gtx layout.Context, after bool) *box {
 	if after {
 		st = s.s.after
 	}
-	if st == nil {
+	if st == nil || !st.HasContent || st.Display == css.DisplayNone {
 		return nil
 	}
-	return wrapPseudo(wrapView(gtx), st, float32(gtx.Constraints.Max.X))
+	if em > 0 {
+		if fs := em / wrapView(gtx).sp; fs != s.s.style.FontSize { // CSS px are sp for type
+			st = s.s.pseudoAt(after, fs)
+			if !st.HasContent || st.Display == css.DisplayNone {
+				return nil
+			}
+		}
+	}
+	return st
 }
 
 // WrapRounded is Wrap for a native that rounds its own box (a menu, a
@@ -954,10 +1122,14 @@ func init() {
 		{[]string{"opacity"}, false},
 		{[]string{"filter"}, false},
 		{[]string{"transform", "translate", "scale", "rotate"}, false},
-		{[]string{"border", "border-width", "border-color", "border-style", "border-top", "border-right", "border-bottom", "border-left",
+		// a border's widths and styles; its colours apart, so a native that
+		// keeps its own border takes just a rule's colour (kit's Button:
+		// OwlMode's border-color on Slack's 1px outline). "border" is both.
+		{[]string{"border", "border-width", "border-style", "border-top", "border-right", "border-bottom", "border-left",
 			"border-top-width", "border-right-width", "border-bottom-width", "border-left-width",
-			"border-top-color", "border-right-color", "border-bottom-color", "border-left-color",
 			"border-top-style", "border-right-style", "border-bottom-style", "border-left-style"}, false},
+		{[]string{"border", "border-color", "border-top", "border-right", "border-bottom", "border-left",
+			"border-top-color", "border-right-color", "border-bottom-color", "border-left-color"}, false},
 		{[]string{"border-radius", "border-top-left-radius", "border-top-right-radius", "border-bottom-left-radius", "border-bottom-right-radius"}, false},
 		{[]string{"box-shadow"}, false},
 		{[]string{"background-image"}, false},
@@ -976,8 +1148,9 @@ func init() {
 	}
 }
 
-// propsOf is the properties a plugin or user rule set (Slack's own rules
-// in the base sheet, NativeValue, aren't CSS values for the native).
+// propsOf is the properties a rule set on a host node (NativeValue isn't
+// a value; Slack's own rules for the classes plugins put on their
+// elements are, as in the browser).
 func propsOf(c *css.Cascaded) propSet {
 	var s propSet
 	for _, d := range c.Decls {
@@ -988,15 +1161,23 @@ func propsOf(c *css.Cascaded) propSet {
 	return s
 }
 
-// nativesOf is the properties Slack's own rule won for the element.
-func nativesOf(c *css.Cascaded) propSet {
-	var s propSet
+// nativeSets splits a native's winning declarations: set, the properties
+// a plugin or user rule set (CSS values for the native), and native, the
+// ones Slack's own rule in the base sheet won. Those are the widget's
+// own: NativeValue, which it draws itself, and real values (the reaction
+// pill's flex layout and 12px text) that it draws itself too and keeps
+// in its computed style only for what it lays out inside it
+// (ClassDef.LayoutChildren), so they never make it Active.
+func nativeSets(c *css.Cascaded) (set, native propSet) {
 	for _, d := range c.Decls {
-		if d.Value == css.NativeValue {
-			s |= propBits[d.Prop]
+		switch {
+		case d.Base:
+			native |= propBits[d.Prop]
+		case d.Value != css.NativeValue:
+			set |= propBits[d.Prop]
 		}
 	}
-	return s
+	return set, native
 }
 
 // ExtraClass is the className a plugin passed to <Original className=…>

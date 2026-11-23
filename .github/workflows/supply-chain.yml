@@ -9,15 +9,28 @@ name: supply-chain
 # (internal/jsrt/jsrt.wasm's reproducibility is checked by jsrt.yml's wasm job.)
 on:
   push:
+    # evidence branches (-redN, -mutN, ... as expect-fail's setup.sh matches
+    # them: tools/expectfail's TestEvidenceBranchesSkipPushRuns) prove a failure: their runs are
+    # dispatched with expect_fail, and a push run would only end red
+    # (docs/CI-SPEED.md, "Proof runs")
+    branches-ignore: ["**-red", "**-red[0-9]+", "**-red[0-9]+[a-z]", "**-mut", "**-mut[0-9]+", "**-mut[0-9]+[a-z]", "**-r[0-9]+red", "**-r[0-9]+red[0-9]+", "**-r[0-9]+red[0-9]+[a-z]", "**-r[0-9]+mut", "**-r[0-9]+mut[0-9]+", "**-r[0-9]+mut[0-9]+[a-z]"]
+    tags: ["**"]
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# A newer run for the same branch, tag or PR cancels this one while it is
+# queued or running, so stale pushes don't pile up in the shared queue.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   vendor:
     runs-on: ubuntu-latest
+    timeout-minutes: 15 # budget: 1.5 x p95 (0.2 min) + 3, docs/CI-SPEED.md
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -55,6 +68,7 @@ jobs:
 
   go-modules:
     runs-on: ubuntu-latest
+    timeout-minutes: 15 # budget: 1.5 x p95 (0.5 min) + 3, docs/CI-SPEED.md
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -75,6 +89,7 @@ jobs:
     # file, except go.mod (lowered to Go 1.24) and CLACK_PATCHES.md. The
     # zip is only hashed against sum.golang.org's go.sum line and diffed.
     runs-on: ubuntu-latest
+    timeout-minutes: 15 # budget: 1.5 x p95 (0.4 min) + 3, docs/CI-SPEED.md
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -107,6 +122,7 @@ jobs:
     # module proxy (its non-test files), file for file, except the files
     # third_party/typesetting/CLACK_PATCHES.md lists as changed.
     runs-on: ubuntu-latest
+    timeout-minutes: 15 # budget: 1.5 x p95 (0.4 min) + 3, docs/CI-SPEED.md
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -125,7 +141,7 @@ jobs:
           dir=$(jq -r .Dir info.json)
           test -d "$dir" || { echo "::error::download failed"; cat info.json; exit 1; }
           cd "$GITHUB_WORKSPACE/third_party/typesetting"
-          patched='font/clack_glyf.go font/font.go font/glyphs.go font/metrics.go font/renderer.go font/variations.go font/opentype/clack_bytes.go font/opentype/reader.go fontscan/clack_mmap.go fontscan/clack_mmap_unix.go fontscan/clack_mmap_windows.go fontscan/clack_mmap_other.go fontscan/fontmap.go CLACK_PATCHES.md'
+          patched='font/clack_glyf.go font/font.go font/glyphs.go font/metrics.go font/renderer.go font/variations.go font/opentype/clack_bytes.go font/opentype/reader.go fontscan/clack_mmap.go fontscan/clack_mmap_unix.go fontscan/clack_mmap_windows.go fontscan/clack_mmap_other.go fontscan/fontmap.go harfbuzz/unicode.go CLACK_PATCHES.md'
           for f in $patched; do grep -qF "\`$f\`" CLACK_PATCHES.md || [ "$f" = CLACK_PATCHES.md ] || { echo "::error::$f is patched but CLACK_PATCHES.md doesn't name it"; exit 1; }; done
           find . -type f | sed 's#^\./##' | sort | while read -r f; do
             case " $patched " in *" $f "*) continue ;; esac
@@ -135,20 +151,43 @@ jobs:
 
   workflows:
     runs-on: ubuntu-latest
+    timeout-minutes: 15 # budget: 1.5 x p95 (0.2 min) + 3, docs/CI-SPEED.md
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+      # the repo's own actions (a .github/actions directory, by its path)
+      # come with the commit; what they use is pinned like the workflows'
       - name: every action pinned to a commit SHA
         run: |
           set -euo pipefail
-          if grep -nE '^\s*-?\s*uses:' .github/workflows/*.yml | grep -vE 'uses: *[^@ ]+@[0-9a-f]{40}( |$)'; then
+          if grep -nE '^\s*-?\s*uses:' .github/workflows/*.yml .github/actions/*/action.yml | grep -vE 'uses: *([^@ ]+@[0-9a-f]{40}|\./\.github/actions/[A-Za-z0-9_-]+)( |$)'; then
             echo "::error::unpinned actions above"; exit 1
           fi
+          for u in $(grep -hoE 'uses: *\./\.github/actions/[A-Za-z0-9_-]+' .github/workflows/*.yml | sed 's/.*\.\/\.github/.github/' | sort -u); do
+            [ -f "$u/action.yml" ] || { echo "::error::$u/action.yml: no such action"; exit 1; }
+          done
+      # every workflow that builds against Taut or Slick by its pin (reads
+      # the variable) defines that pin itself, as a full commit SHA, and
+      # every definition names the same commit: a workflow reading a pin it
+      # doesn't define checks out the default branch, and a short or named
+      # ref would follow upstream
       - name: taut/slick pins agree across workflows
         run: |
           set -euo pipefail
+          cd .github/workflows
+          shopt -s nullglob
+          wf=(*.yml *.yaml)
           for v in TAUT_PIN SLICK_PIN; do
-            n=$(grep -hoE "^\s*$v: [0-9a-f]{40}" .github/workflows/*.yml | awk '{print $2}' | sort -u | wc -l)
-            [ "$n" = 1 ] || { echo "::error::$v differs between workflows"; grep -nE "$v:" .github/workflows/*.yml; exit 1; }
+            defs=$( (grep -lE "^\s*$v:" "${wf[@]}" || true) | sort)
+            # $X, ${X}, env.X, env['X'] / env["X"]
+            uses=$( (grep -lE "(\\\$\{?$v\b|env\.$v\b|env\[['\"]$v['\"]\])" "${wf[@]}" || true) | sort)
+            [ -n "$defs" ] || { echo "::error::no workflow defines $v"; exit 1; }
+            missing=$(comm -13 <(echo "$defs") <(echo "$uses"))
+            [ -z "$missing" ] || { echo "::error::$v is read but not defined in: $missing"; exit 1; }
+            bad=$( (grep -nE "^\s*$v:" "${wf[@]}" || true) | grep -vE "^[^:]+:[0-9]+:\s*$v: [0-9a-f]{40}( +#.*)?$" || true)
+            [ -z "$bad" ] || { echo "::error::$v must be a full commit SHA"; echo "$bad"; exit 1; }
+            n=$(grep -hE "^\s*$v:" "${wf[@]}" | awk '{print $2}' | sort -u | wc -l)
+            [ "$n" = 1 ] || { echo "::error::$v differs between workflows"; grep -nE "^\s*$v:" "${wf[@]}"; exit 1; }
+            echo "$v: $(grep -hE "^\s*$v:" "${wf[@]}" | awk '{print $2}' | sort -u) in $(echo $defs)"
           done
